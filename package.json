@@ -1,0 +1,21 @@
+{
+  "name": "markset",
+  "version": "0.1.0",
+  "private": true,
+  "description": "MarkSet week-1 experiment: lasso text and image regions into one numbered selection.",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@tiptap/core": "^2.26.1",
+    "@tiptap/extension-image": "^2.26.1",
+    "@tiptap/pm": "^2.26.1",
+    "@tiptap/starter-kit": "^2.26.1"
+  },
+  "devDependencies": {
+    "vite": "^6.3.5"
+  }
+}

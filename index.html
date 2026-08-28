@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>MarkSet · 第 1 周</title>
+  </head>
+  <body>
+    <div class="app">
+      <header class="topbar">
+        <div class="brand">
+          <span class="mark">MarkSet</span>
+          <span class="week">第 1 周 · 无模型</span>
+        </div>
+        <p class="hint">
+          <kbd>Alt</kbd> 拖套索　单击补选　<kbd>Shift</kbd> 套索追加　<kbd>Esc</kbd> 清空
+        </p>
+      </header>
+
+      <div class="workspace">
+        <main class="stage">
+          <article class="page" aria-label="混排实验页">
+            <p class="kicker">作品介绍 · 就地改一处</p>
+            <div id="editor"></div>
+          </article>
+        </main>
+
+        <aside class="inspector" aria-label="当前篮子">
+          <h2>SelectionSet</h2>
+          <p class="inspector-lead">自己写死的格式。第 1 周只往篮子里装，不调 API。</p>
+          <pre id="inspector-json">{}</pre>
+        </aside>
+      </div>
+    </div>
+
+    <svg id="lasso-layer" class="lasso-layer" aria-hidden="true"></svg>
+    <div id="chrome-layer" class="chrome-layer"></div>
+    <div id="toast" class="toast" hidden></div>
+
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

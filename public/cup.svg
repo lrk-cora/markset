@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="360" height="360" viewBox="0 0 420 420" role="img" aria-label="fog-blue cup">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#efe6d6"/>
+      <stop offset="1" stop-color="#e2d5c2"/>
+    </linearGradient>
+    <linearGradient id="glaze" x1="0.2" y1="0" x2="0.9" y2="1">
+      <stop offset="0" stop-color="#9eb4c9"/>
+      <stop offset="0.45" stop-color="#7f9cb4"/>
+      <stop offset="1" stop-color="#5d7c96"/>
+    </linearGradient>
+    <linearGradient id="inner" x1="0.5" y1="0" x2="0.5" y2="1">
+      <stop offset="0" stop-color="#d7e3ec"/>
+      <stop offset="1" stop-color="#6d879c"/>
+    </linearGradient>
+    <radialGradient id="shadow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#5a4633" stop-opacity="0.28"/>
+      <stop offset="1" stop-color="#5a4633" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect width="420" height="420" fill="url(#bg)"/>
+  <ellipse cx="210" cy="338" rx="118" ry="22" fill="url(#shadow)"/>
+  <path d="M146 168c4 118 18 154 64 154s60-36 64-154" fill="url(#glaze)"/>
+  <path d="M146 168c8 8 36 14 64 14s56-6 64-14" fill="#8aa3b8"/>
+  <ellipse cx="210" cy="166" rx="66" ry="22" fill="url(#inner)"/>
+  <ellipse cx="210" cy="160" rx="52" ry="14" fill="#4e6a80" opacity="0.35"/>
+  <path d="M268 176c28 8 46 28 40 58-6 28-28 36-48 28" fill="none" stroke="#6d8aa2" stroke-width="14" stroke-linecap="round"/>
+  <path d="M268 176c28 8 46 28 40 58-6 28-28 36-48 28" fill="none" stroke="#c5d5e2" stroke-width="4" stroke-linecap="round" opacity="0.7"/>
+  <path d="M168 188c18-22 72-24 90 4" fill="none" stroke="#e8f1f6" stroke-width="6" stroke-linecap="round" opacity="0.55"/>
+</svg>
