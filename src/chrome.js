@@ -1,16 +1,32 @@
+import { insertImageAt, insertParagraphAt, newBlockId, pageRelativeRect } from './editor.js'
+import { blockRange } from './hit-test.js'
+import { tintedMaskCanvas } from './mask.js'
+import { setSubtractMode } from './overlay.js'
 import {
   appendSpans,
+  beginInsertUndo,
+  canUndoInsert,
   clearAll,
-  focusMark,
+  finishInsert,
   getSnapshot,
   hasImage,
+  hasSlot,
+  refreshImageLayout,
   removeMark,
   setAnchors,
-  setSuggest,
+  setCommandText,
+  targets,
+  toggleBackground,
+  toggleWillEdit,
+  undoLastInsert,
+  updateImageScreenRect,
+  updateTextRange,
   toSpec,
 } from './store.js'
+import { runWriteback } from './writeback.js'
 
 let toastTimer = 0
+let drag = null
 
 export function toast(message) {
   const el = document.getElementById('toast')
@@ -19,7 +35,7 @@ export function toast(message) {
   window.clearTimeout(toastTimer)
   toastTimer = window.setTimeout(() => {
     el.hidden = true
-  }, 1800)
+  }, 2200)
 }
 
 function textAnchor(view, span) {
@@ -46,6 +62,280 @@ function unionRect(rects) {
   return { x, y, w: r - x, h: b - y }
 }
 
+function suggestRect(view, item) {
+  if (item.screenRect) return item.screenRect
+  if (item.kind === 'text') {
+    try {
+      const a = view.coordsAtPos(item.from)
+      const b = view.coordsAtPos(item.to)
+      return {
+        x: a.left,
+        y: a.top,
+        w: Math.max(24, Math.abs(b.left - a.left)),
+        h: Math.max(18, a.bottom - a.top),
+      }
+    } catch {
+      return null
+    }
+  }
+  return null
+}
+
+function addMask(layer, span, boxes, anchors) {
+  if (span.maskCanvas && span.imageRect) {
+    const overlay = tintedMaskCanvas(span.maskCanvas)
+    overlay.className = 'image-mask-canvas'
+    overlay.style.left = `${span.imageRect.x}px`
+    overlay.style.top = `${span.imageRect.y}px`
+    overlay.style.width = `${span.imageRect.w}px`
+    overlay.style.height = `${span.imageRect.h}px`
+    layer.append(overlay)
+  }
+  if (!span.screenRect) return
+  boxes.push(span.screenRect)
+  anchors[span.markId] = { x: span.screenRect.x, y: span.screenRect.y }
+  if (span.mode !== 'background') addImageHandles(layer, span)
+}
+
+function addSlot(layer, span, boxes, anchors) {
+  if (!span.screenRect) return
+  const box = document.createElement('div')
+  box.className = 'slot-mask'
+  box.style.left = `${span.screenRect.x}px`
+  box.style.top = `${span.screenRect.y}px`
+  box.style.width = `${span.screenRect.w}px`
+  box.style.height = `${span.screenRect.h}px`
+  layer.append(box)
+  boxes.push(span.screenRect)
+  anchors[span.markId] = { x: span.screenRect.x, y: span.screenRect.y }
+}
+
+function addImageHandles(layer, span) {
+  const box = span.screenRect
+  if (!box) return
+  const places = {
+    nw: [box.x, box.y],
+    n: [box.x + box.w / 2, box.y],
+    ne: [box.x + box.w, box.y],
+    e: [box.x + box.w, box.y + box.h / 2],
+    se: [box.x + box.w, box.y + box.h],
+    s: [box.x + box.w / 2, box.y + box.h],
+    sw: [box.x, box.y + box.h],
+    w: [box.x, box.y + box.h / 2],
+  }
+  for (const [dir, [x, y]] of Object.entries(places)) {
+    const handle = document.createElement('button')
+    handle.type = 'button'
+    handle.className = `img-handle img-handle-${dir}`
+    handle.setAttribute('aria-label', '拖动以缩小或扩大图上选区')
+    handle.style.left = `${x}px`
+    handle.style.top = `${y}px`
+    handle.addEventListener('pointerdown', (e) => {
+      e.preventDefault()
+      e.stopPropagation()
+      drag = {
+        type: 'image',
+        markId: span.markId,
+        dir,
+        orig: { ...box },
+        startX: e.clientX,
+        startY: e.clientY,
+      }
+    })
+    layer.append(handle)
+  }
+}
+
+function resizeBox(orig, dir, dx, dy) {
+  let { x, y, w, h } = orig
+  if (dir.includes('n')) {
+    y += dy
+    h -= dy
+  }
+  if (dir.includes('s')) h += dy
+  if (dir.includes('w')) {
+    x += dx
+    w -= dx
+  }
+  if (dir.includes('e')) w += dx
+  return { x, y, w, h }
+}
+
+function addHandles(layer, view, span) {
+  try {
+    const start = view.coordsAtPos(span.from)
+    const end = view.coordsAtPos(span.to)
+    for (const [which, coords] of [
+      ['start', start],
+      ['end', end],
+    ]) {
+      const h = document.createElement('button')
+      h.type = 'button'
+      h.className = `hl-handle hl-handle-${which}`
+      h.setAttribute('aria-label', which === 'start' ? '缩短起点' : '缩短终点')
+      h.style.left = `${coords.left}px`
+      h.style.top = `${coords.top + (coords.bottom - coords.top) / 2}px`
+      h.addEventListener('pointerdown', (e) => {
+        e.preventDefault()
+        e.stopPropagation()
+        drag = { type: 'text', markId: span.markId, which }
+      })
+      layer.append(h)
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
+function runCommand(kind, editor) {
+  runWriteback(kind, editor, toast)
+}
+
+function slotTargets() {
+  return targets()
+    .filter((s) => s.kind === 'slot' && s.screenRect)
+    .sort((a, b) => b.screenRect.y - a.screenRect.y)
+}
+
+function relayoutAfterInsert(editor) {
+  requestAnimationFrame(() => {
+    refreshImageLayout(editor.view)
+    renderChrome(editor)
+  })
+}
+
+function insertText(editor) {
+  const slots = slotTargets()
+  if (!slots.length) {
+    toast('先圈页上还没有字和图的空白（不要圈照片里的桌子）')
+    return
+  }
+  const text = getSnapshot().commandText.trim()
+  if (!text) {
+    toast('在输入框里写要插入的文字')
+    return
+  }
+  const slot = [...slots].sort((a, b) => a.screenRect.y - b.screenRect.y)[0]
+  const placed = pageRelativeRect(slot.screenRect)
+  beginInsertUndo(editor)
+  const { mapping, span } = insertParagraphAt(editor, 0, text, newBlockId('p'), placed)
+  finishInsert({
+    slotId: slot.markId,
+    mapping,
+    doc: editor.view.state.doc,
+    added: [span],
+  })
+  relayoutAfterInsert(editor)
+  toast('已插到你圈的位置。Ctrl+Z 可撤销')
+}
+
+function readDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(String(reader.result))
+    reader.onerror = () => reject(reader.error)
+    reader.readAsDataURL(file)
+  })
+}
+
+function naturalSizeOf(src) {
+  return new Promise((resolve) => {
+    const image = new Image()
+    image.onload = () => resolve({ w: image.naturalWidth, h: image.naturalHeight })
+    image.onerror = () => resolve({ w: 360, h: 360 })
+    image.src = src
+  })
+}
+
+function fitInSlot(slot, nat) {
+  const maxW = Math.min(360, Math.max(96, Math.round(slot.screenRect.w)))
+  const maxH = Math.min(360, Math.max(72, Math.round(slot.screenRect.h)))
+  const scale = Math.min(maxW / Math.max(1, nat.w), maxH / Math.max(1, nat.h), 1)
+  return {
+    width: Math.max(48, Math.round(nat.w * scale)),
+    height: Math.max(48, Math.round(nat.h * scale)),
+  }
+}
+
+function insertImage(editor) {
+  const slots = slotTargets()
+  if (!slots.length) {
+    toast('先圈页上还没有字和图的空白（不要圈照片里的桌子）')
+    return
+  }
+  const slot = [...slots].sort((a, b) => a.screenRect.y - b.screenRect.y)[0]
+  const input = document.createElement('input')
+  input.type = 'file'
+  input.accept = 'image/*'
+  input.addEventListener('change', async () => {
+    const file = input.files?.[0]
+    if (!file) return
+    const current = slotTargets()
+    const target =
+      current.find((s) => s.markId === slot.markId) ||
+      [...current].sort((a, b) => a.screenRect.y - b.screenRect.y)[0]
+    if (!target) {
+      toast('空白槽已不在，请再圈一次纸面')
+      return
+    }
+    try {
+      const src = await readDataUrl(file)
+      const nat = await naturalSizeOf(src)
+      const size = fitInSlot(target, nat)
+      const placed = pageRelativeRect(target.screenRect)
+      beginInsertUndo(editor)
+      const { mapping } = insertImageAt(editor, 0, {
+        src,
+        alt: file.name.replace(/\.[^.]+$/, ''),
+        width: size.width,
+        height: size.height,
+        blockId: newBlockId('img'),
+        placed,
+      })
+      finishInsert({
+        slotId: target.markId,
+        mapping,
+        doc: editor.view.state.doc,
+      })
+      relayoutAfterInsert(editor)
+      toast('已插到你圈的位置。Ctrl+Z 可撤销')
+    } catch {
+      toast('没能读入这张图')
+    }
+  })
+  input.click()
+}
+
+function renderList() {
+  const list = document.getElementById('selection-list')
+  if (!list) return
+  list.replaceChildren()
+  const snap = getSnapshot()
+  if (!snap.spans.length) {
+    const empty = document.createElement('li')
+    empty.className = 'muted'
+    empty.textContent = '还没有选中。套索圈字、图，或页上空白。'
+    list.append(empty)
+    return
+  }
+  for (const span of snap.spans) {
+    const li = document.createElement('li')
+    const check = document.createElement('input')
+    check.type = 'checkbox'
+    check.checked = span.willEdit !== false
+    check.title = '将改'
+    check.addEventListener('change', () => toggleWillEdit(span.markId))
+    const name = document.createElement('strong')
+    name.textContent = `#${span.markId}`
+    const detail = document.createElement('span')
+    if (span.kind === 'text') detail.textContent = span.text
+    else if (span.kind === 'slot') detail.textContent = '页上空白 · 插入文字或图'
+    else detail.textContent = span.mode === 'background' ? '图 · 背景' : '图 · 像素'
+    li.append(check, name, detail)
+    list.append(li)
+  }
+}
+
 export function renderChrome(editor) {
   const layer = document.getElementById('chrome-layer')
   const inspector = document.getElementById('inspector-json')
@@ -56,25 +346,18 @@ export function renderChrome(editor) {
   layer.replaceChildren()
 
   for (const span of snap.spans) {
-    if (span.kind === 'image' && span.screenRect) {
-      const mask = document.createElement('div')
-      mask.className = 'image-mask'
-      mask.style.left = `${span.screenRect.x}px`
-      mask.style.top = `${span.screenRect.y}px`
-      mask.style.width = `${span.screenRect.w}px`
-      mask.style.height = `${span.screenRect.h}px`
-      layer.append(mask)
-      boxes.push(span.screenRect)
-      anchors[span.markId] = { x: span.screenRect.x, y: span.screenRect.y }
-    } else if (span.kind === 'text') {
+    if (span.kind === 'image') addMask(layer, span, boxes, anchors)
+    else if (span.kind === 'slot') addSlot(layer, span, boxes, anchors)
+    else {
       anchors[span.markId] = textAnchor(editor.view, span)
+      addHandles(layer, editor.view, span)
       try {
         const a = editor.view.coordsAtPos(span.from)
         const b = editor.view.coordsAtPos(span.to)
         boxes.push({
           x: Math.min(a.left, b.left),
           y: Math.min(a.top, b.top),
-          w: Math.abs(b.right - a.left) || 40,
+          w: Math.abs(b.left - a.left) || 40,
           h: Math.max(a.bottom, b.bottom) - Math.min(a.top, b.top),
         })
       } catch {
@@ -89,48 +372,53 @@ export function renderChrome(editor) {
     const anchor = anchors[span.markId]
     if (!anchor) continue
     const badge = document.createElement('div')
-    badge.className = `badge${snap.focusedMarkId === span.markId ? ' is-focused' : ''}`
+    badge.className = `badge${span.willEdit === false ? ' is-off' : ''}`
     badge.style.left = `${anchor.x}px`
     badge.style.top = `${anchor.y}px`
 
-    const tag = document.createElement('button')
-    tag.type = 'button'
+    const check = document.createElement('input')
+    check.type = 'checkbox'
+    check.checked = span.willEdit !== false
+    check.title = '将改：这次要不要改这一项。不要用 × 只去掉桌子。'
+    check.addEventListener('click', (e) => e.stopPropagation())
+    check.addEventListener('change', (e) => {
+      e.stopPropagation()
+      toggleWillEdit(span.markId)
+    })
+
+    const tag = document.createElement('span')
     tag.className = 'tag'
     tag.textContent = `#${span.markId}`
-    tag.addEventListener('click', (e) => {
-      e.stopPropagation()
-      focusMark(span.markId)
-    })
 
     const x = document.createElement('button')
     x.type = 'button'
     x.className = 'x'
-    x.setAttribute('aria-label', '踢出篮子')
+    x.setAttribute('aria-label', '从选中里去掉')
     x.textContent = '×'
     x.addEventListener('click', (e) => {
       e.stopPropagation()
       removeMark(span.markId)
     })
 
-    badge.append(tag, x)
+    badge.append(check, tag, x)
     layer.append(badge)
   }
 
-  if (snap.suggest?.screenRect) {
+  for (const item of snap.suggest) {
+    const rect = suggestRect(editor.view, item)
+    if (!rect) continue
     const s = document.createElement('div')
     s.className = 'suggest'
-    s.style.left = `${snap.suggest.screenRect.x}px`
-    s.style.top = `${snap.suggest.screenRect.y}px`
-    s.style.width = `${snap.suggest.screenRect.w}px`
-    s.style.height = `${snap.suggest.screenRect.h}px`
+    s.style.left = `${rect.x}px`
+    s.style.top = `${rect.y}px`
+    s.style.width = `${rect.w}px`
+    s.style.height = `${rect.h}px`
     const btn = document.createElement('button')
     btn.type = 'button'
     btn.textContent = '建议加入'
     btn.addEventListener('click', (e) => {
       e.stopPropagation()
-      const next = snap.suggest
-      setSuggest(null)
-      appendSpans([next])
+      appendSpans([item], editor.view.state.doc)
     })
     s.append(btn)
     layer.append(s)
@@ -140,38 +428,94 @@ export function renderChrome(editor) {
     const box = unionRect(boxes) ?? { x: 120, y: 160, w: 200, h: 40 }
     const bar = document.createElement('div')
     bar.className = 'toolbar'
-    const left = Math.min(Math.max(16, box.x), window.innerWidth - 420)
-    const top = Math.min(box.y + box.h + 12, window.innerHeight - 64)
+    const left = Math.min(Math.max(16, box.x), window.innerWidth - 520)
+    const top = Math.min(box.y + box.h + 16, window.innerHeight - 88)
     bar.style.left = `${left}px`
     bar.style.top = `${top}px`
 
-    const actions = [
-      ['改写', '第 2 周接入改字 API'],
-      ['统一风格', '第 3 周接入规划拆单'],
-      ['替换', '第 2 周接入改字 / 重绘'],
-      ['删除', '纯文字可本地删；含图要等第 2 周'],
-    ]
-    for (const [label, msg] of actions) {
+    const unify = document.createElement('button')
+    unify.type = 'button'
+    unify.className = 'primary'
+    unify.textContent = '统一风格'
+    unify.addEventListener('click', (e) => {
+      e.stopPropagation()
+      runCommand('unify', editor)
+    })
+    bar.append(unify)
+
+    for (const [label, kind] of [
+      ['改写', 'rewrite'],
+      ['替换', 'replace'],
+      ['删除', 'delete'],
+    ]) {
       const btn = document.createElement('button')
       btn.type = 'button'
       btn.textContent = label
       btn.addEventListener('click', (e) => {
         e.stopPropagation()
-        toast(msg)
+        runCommand(kind, editor)
       })
       bar.append(btn)
     }
 
     const input = document.createElement('input')
     input.type = 'text'
-    input.placeholder = snap.focusedMarkId ? `只改 #${snap.focusedMarkId}` : '命令打在整个篮子'
+    input.value = snap.commandText
+    input.placeholder = '产品名、颜色，如：海盐杯，雾蓝'
+    input.addEventListener('input', () => setCommandText(input.value))
+    input.addEventListener('pointerdown', (e) => e.stopPropagation())
     bar.append(input)
 
+    if (hasSlot()) {
+      const addText = document.createElement('button')
+      addText.type = 'button'
+      addText.textContent = '插入文字'
+      addText.title = '把输入框里的字插到圈定的纸面位置'
+      addText.addEventListener('click', (e) => {
+        e.stopPropagation()
+        insertText(editor)
+      })
+      const addImage = document.createElement('button')
+      addImage.type = 'button'
+      addImage.textContent = '插入图片'
+      addImage.title = '在圈定的纸面位置放入一张本地图片'
+      addImage.addEventListener('click', (e) => {
+        e.stopPropagation()
+        insertImage(editor)
+      })
+      bar.append(addText, addImage)
+    }
+
+    if (canUndoInsert()) {
+      const undo = document.createElement('button')
+      undo.type = 'button'
+      undo.textContent = '撤销插入'
+      undo.title = 'Ctrl+Z'
+      undo.addEventListener('click', (e) => {
+        e.stopPropagation()
+        if (undoLastInsert(editor)) toast('已撤销插入')
+      })
+      bar.append(undo)
+    }
+
     if (hasImage()) {
+      const bg = document.createElement('button')
+      bg.type = 'button'
+      bg.textContent = '改背景'
+      bg.title = '先圈物体，再点这里：mask 取反（整图减去物体）'
+      bg.addEventListener('click', (e) => {
+        e.stopPropagation()
+        const mode = toggleBackground()
+        if (!mode) toast('先圈杯子或图上的一块，再改背景')
+        else if (mode === 'background') toast('已改为背景：整图减去刚才圈的物体。再点一次改回')
+        else toast('已改回物体')
+      })
+      bar.append(bg)
+
       for (const [label, msg] of [
-        ['＋', '第 3 周接入画笔'],
-        ['－', '第 3 周接入画笔'],
-        ['色', '第 3 周接入画笔'],
+        ['＋', '第 3 周接入加笔。现在可用 Shift + 再圈来扩大'],
+        ['－', 'subtract'],
+        ['色', '第 3 周接入色笔'],
       ]) {
         const btn = document.createElement('button')
         btn.type = 'button'
@@ -179,6 +523,11 @@ export function renderChrome(editor) {
         btn.textContent = label
         btn.addEventListener('click', (e) => {
           e.stopPropagation()
+          if (msg === 'subtract') {
+            setSubtractMode(true)
+            toast('减选已开：按住 Alt 再圈不要的部分（桌子、空隙），会从选区里挖掉')
+            return
+          }
           toast(msg)
         })
         bar.append(btn)
@@ -188,13 +537,55 @@ export function renderChrome(editor) {
     layer.append(bar)
   }
 
+  renderList()
   inspector.textContent = JSON.stringify(toSpec(), null, 2)
+  const undoTop = document.getElementById('btn-undo')
+  if (undoTop) undoTop.hidden = !canUndoInsert()
 }
 
-export function bindChromeKeys() {
+export function bindChromeKeys(editor) {
   window.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') {
-      clearAll()
+    if (e.key === 'Escape') clearAll()
+    if ((e.ctrlKey || e.metaKey) && (e.key === 'z' || e.key === 'Z') && !e.shiftKey) {
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return
+      if (canUndoInsert() && undoLastInsert(editor)) {
+        e.preventDefault()
+        toast('已撤销插入')
+      }
     }
   })
+
+  window.addEventListener(
+    'pointermove',
+    (e) => {
+      if (!drag) return
+      e.preventDefault()
+      const span = getSnapshot().spans.find((s) => s.markId === drag.markId)
+      if (!span) return
+      if (drag.type === 'image') {
+        const dx = e.clientX - drag.startX
+        const dy = e.clientY - drag.startY
+        updateImageScreenRect(drag.markId, resizeBox(drag.orig, drag.dir, dx, dy))
+        return
+      }
+      if (span.kind !== 'text') return
+      const hit = editor.view.posAtCoords({ left: e.clientX, top: e.clientY })
+      if (!hit) return
+      const range = blockRange(editor.view.state.doc, span)
+      let from = span.from
+      let to = span.to
+      if (drag.which === 'start') from = Math.max(range.start, Math.min(hit.pos, to - 1))
+      else to = Math.min(range.end, Math.max(hit.pos, from + 1))
+      updateTextRange(drag.markId, from, to, editor.view.state.doc)
+    },
+    true,
+  )
+
+  window.addEventListener(
+    'pointerup',
+    () => {
+      drag = null
+    },
+    true,
+  )
 }

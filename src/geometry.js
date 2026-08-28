@@ -142,3 +142,56 @@ export function intersectBoxes(a, b) {
   if (w <= 0 || h <= 0) return null
   return { x, y, w, h }
 }
+
+/** Remaining rectangles after cutting `cut` out of `box`. */
+export function subtractBox(box, cut) {
+  const hit = intersectBoxes(box, cut)
+  if (!hit) return [box]
+  if (hit.w >= box.w - 0.5 && hit.h >= box.h - 0.5) return []
+  const out = []
+  if (hit.y > box.y + 0.5) {
+    out.push({ x: box.x, y: box.y, w: box.w, h: hit.y - box.y })
+  }
+  const boxBot = box.y + box.h
+  const hitBot = hit.y + hit.h
+  if (hitBot < boxBot - 0.5) {
+    out.push({ x: box.x, y: hitBot, w: box.w, h: boxBot - hitBot })
+  }
+  if (hit.x > box.x + 0.5) {
+    out.push({ x: box.x, y: hit.y, w: hit.x - box.x, h: hit.h })
+  }
+  const boxRight = box.x + box.w
+  const hitRight = hit.x + hit.w
+  if (hitRight < boxRight - 0.5) {
+    out.push({ x: hitRight, y: hit.y, w: boxRight - hitRight, h: hit.h })
+  }
+  return out.filter((r) => r.w >= 1 && r.h >= 1)
+}
+
+export function unionBoxes(a, b) {
+  const x = Math.min(a.x, b.x)
+  const y = Math.min(a.y, b.y)
+  const r = Math.max(a.x + a.w, b.x + b.w)
+  const bot = Math.max(a.y + a.h, b.y + b.h)
+  return { x, y, w: r - x, h: bot - y }
+}
+
+export function clampBox(box, bounds, min = 16) {
+  let x = Math.max(bounds.x, box.x)
+  let y = Math.max(bounds.y, box.y)
+  let r = Math.min(bounds.x + bounds.w, box.x + box.w)
+  let bot = Math.min(bounds.y + bounds.h, box.y + box.h)
+  if (r - x < min) {
+    if (x + min <= bounds.x + bounds.w) r = x + min
+    else x = r - min
+  }
+  if (bot - y < min) {
+    if (y + min <= bounds.y + bounds.h) bot = y + min
+    else y = bot - min
+  }
+  x = Math.max(bounds.x, x)
+  y = Math.max(bounds.y, y)
+  r = Math.min(bounds.x + bounds.w, r)
+  bot = Math.min(bounds.y + bounds.h, bot)
+  return { x, y, w: Math.max(min, r - x), h: Math.max(min, bot - y) }
+}

@@ -4,7 +4,15 @@ import {
   intersectBoxes,
   pointInPolygon,
   rectIntersectsPolygon,
+  subtractBox,
 } from './geometry.js'
+import {
+  makeMask,
+  maskBounds,
+  naturalBoxToScreen,
+  paintMask,
+  screenPolyToNatural,
+} from './mask.js'
 import { coversTextPos } from './store.js'
 
 const SMALL_AREA = 24 * 24
@@ -25,34 +33,30 @@ function blockInfo(state, pos) {
 
 function mergeCharHits(view, hits) {
   if (!hits.length) return []
-  hits.sort((a, b) => a.pos - b.pos)
-  const runs = []
-  let from = hits[0].pos
-  let to = hits[0].pos + 1
-  for (let i = 1; i < hits.length; i += 1) {
-    const pos = hits[i].pos
-    if (pos <= to) {
-      to = Math.max(to, pos + 1)
+  const byBlock = new Map()
+  for (const { pos } of hits) {
+    const info = blockInfo(view.state, pos)
+    const key = info?.blockId ?? `pos:${pos}`
+    const cur = byBlock.get(key)
+    if (!cur) {
+      byBlock.set(key, { info, from: pos, to: pos + 1 })
     } else {
-      runs.push({ from, to })
-      from = pos
-      to = pos + 1
+      cur.from = Math.min(cur.from, pos)
+      cur.to = Math.max(cur.to, pos + 1)
     }
   }
-  runs.push({ from, to })
 
-  return runs.map((run) => {
-    const info = blockInfo(view.state, run.from)
-    return {
+  return [...byBlock.values()]
+    .map((run) => ({
       kind: 'text',
-      block_id: info?.blockId ?? null,
-      start: info ? run.from - info.contentStart : run.from,
-      end: info ? run.to - info.contentStart : run.to,
+      block_id: run.info?.blockId ?? null,
+      start: run.info ? run.from - run.info.contentStart : run.from,
+      end: run.info ? run.to - run.info.contentStart : run.to,
       text: view.state.doc.textBetween(run.from, run.to),
       from: run.from,
       to: run.to,
-    }
-  })
+    }))
+    .sort((a, b) => a.from - b.from)
 }
 
 export function hitText(view, polygon, { skipCovered = false } = {}) {
@@ -89,54 +93,91 @@ export function hitText(view, polygon, { skipCovered = false } = {}) {
     }
   }
 
-  return mergeCharHits(view, hits)
+  const found = []
+  const suggest = []
+  for (const span of mergeCharHits(view, hits)) {
+    const n = span.text.replace(/\s/g, '').length
+    if (n > 0 && n <= 2) suggest.push(span)
+    else found.push(span)
+  }
+  return { found, suggest }
 }
 
-function imageNaturalBox(img, screenBox) {
+export function imageSpanFromPolygon(img, polygon) {
   const br = img.getBoundingClientRect()
+  if (!rectIntersectsPolygon(br, polygon)) return null
+  const imageRect = { x: br.left, y: br.top, w: br.width, h: br.height }
   const nw = img.naturalWidth || Number(img.getAttribute('width')) || br.width
   const nh = img.naturalHeight || Number(img.getAttribute('height')) || br.height
-  const sx = nw / br.width
-  const sy = nh / br.height
+  const naturalSize = { w: nw, h: nh }
+  const canvas = makeMask(naturalSize)
+  paintMask(canvas, screenPolyToNatural(polygon, imageRect, naturalSize), 'replace')
+  const bbox = maskBounds(canvas)
+  if (!bbox) return null
   return {
-    x: (screenBox.x - br.left) * sx,
-    y: (screenBox.y - br.top) * sy,
-    w: screenBox.w * sx,
-    h: screenBox.h * sy,
+    kind: 'image',
+    block_id: img.getAttribute('data-block-id'),
+    maskCanvas: canvas,
+    mask: { ...bbox },
+    bbox,
+    screenRect: naturalBoxToScreen(bbox, imageRect, naturalSize),
+    imageRect,
+    naturalSize,
+    mode: 'region',
+    polygon,
   }
 }
 
 function imageSpanFromClip(img, clip) {
-  const bbox = imageNaturalBox(img, clip)
-  return {
-    kind: 'image',
-    block_id: img.getAttribute('data-block-id'),
-    mask: { ...bbox },
-    bbox,
-    screenRect: { ...clip },
-  }
+  return imageSpanFromPolygon(img, [
+    { x: clip.x, y: clip.y },
+    { x: clip.x + clip.w, y: clip.y },
+    { x: clip.x + clip.w, y: clip.y + clip.h },
+    { x: clip.x, y: clip.y + clip.h },
+  ])
 }
 
 export function hitImages(view, polygon) {
   const imgs = view.dom.querySelectorAll('img[data-block-id]')
   const found = []
   const suggest = []
-  const polyBox = aabb(polygon)
 
   for (const img of imgs) {
-    const br = img.getBoundingClientRect()
-    if (!rectIntersectsPolygon(br, polygon)) continue
-    const clip = intersectBoxes(polyBox, clientRectBox(br))
-    if (!clip) continue
-    const span = imageSpanFromClip(img, clip)
-    if (clip.w * clip.h < SMALL_AREA) {
-      suggest.push(span)
-    } else {
-      found.push(span)
-    }
+    const span = imageSpanFromPolygon(img, polygon)
+    if (!span) continue
+    if (span.screenRect.w * span.screenRect.h < SMALL_AREA) suggest.push(span)
+    else found.push(span)
   }
 
   return { found, suggest }
+}
+
+export function hitPageSlot(polygon, view) {
+  const page = document.querySelector('.page')
+  if (!page) return null
+  const pageBox = clientRectBox(page.getBoundingClientRect())
+  const clip = intersectBoxes(aabb(polygon), pageBox)
+  if (!clip || clip.w < 28 || clip.h < 28) return null
+
+  const occupied = []
+  const root = view?.dom ?? page
+  for (const el of root.querySelectorAll('[data-block-id]')) {
+    occupied.push(clientRectBox(el.getBoundingClientRect()))
+  }
+
+  let pieces = [clip]
+  for (const box of occupied) {
+    pieces = pieces.flatMap((piece) => subtractBox(piece, box))
+  }
+  pieces = pieces.filter((p) => p.w >= 28 && p.h >= 28)
+  if (!pieces.length) return null
+  pieces.sort((a, b) => b.w * b.h - a.w * a.h)
+
+  return {
+    kind: 'slot',
+    screenRect: pieces[0],
+    pageBox,
+  }
 }
 
 function rangeFromPoint(x, y) {
@@ -196,6 +237,17 @@ export function hitWordAt(view, x, y) {
   }
   if (from >= to) return null
   return mergeCharHits(view, Array.from({ length: to - from }, (_, i) => ({ pos: from + i })))[0]
+}
+
+export function blockRange(doc, span) {
+  const $pos = doc.resolve(span.from)
+  for (let depth = $pos.depth; depth > 0; depth -= 1) {
+    if ($pos.node(depth).attrs?.blockId === span.block_id) {
+      const start = $pos.start(depth)
+      return { start, end: start + $pos.node(depth).content.size }
+    }
+  }
+  return { start: span.from, end: span.to }
 }
 
 export function hitImageAt(view, x, y, size = 48) {

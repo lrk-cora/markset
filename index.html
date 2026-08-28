@@ -3,31 +3,46 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>MarkSet · 第 1 周</title>
+    <title>MarkSet · 第 2 周</title>
   </head>
   <body>
     <div class="app">
       <header class="topbar">
         <div class="brand">
           <span class="mark">MarkSet</span>
-          <span class="week">第 1 周 · 无模型</span>
+          <span class="week">第 2 周 · 默认不打模型</span>
         </div>
-        <p class="hint">
-          <kbd>Alt</kbd> 拖套索　单击补选　<kbd>Shift</kbd> 套索追加　<kbd>Esc</kbd> 清空
-        </p>
+        <div class="top-actions">
+          <button type="button" id="btn-lasso" class="mode-btn" aria-pressed="false">套索</button>
+          <button type="button" id="btn-subtract" class="mode-btn" aria-pressed="false">减选</button>
+          <button type="button" id="btn-undo" class="mode-btn" hidden>撤销插入</button>
+          <button type="button" id="btn-api" class="mode-btn">检查接口</button>
+          <label class="allow-models" title="默认关闭。套索、改选区、检查接口从不消耗额度。改写/改图前还要再确认一次。">
+            <input type="checkbox" id="allow-models" />
+            允许调用云端模型
+          </label>
+          <label class="allow-models" title="默认关闭。打开后，圈图松手会调用 fal SAM 贴物体轮廓，每次消耗额度。减选仍用本地像素。">
+            <input type="checkbox" id="snap-contour" />
+            松手贴轮廓
+          </label>
+          <p class="hint">
+            <kbd>Shift</kbd> 加上　<kbd>Alt</kbd> 减选　页上空白可插入　<kbd>Ctrl</kbd>+<kbd>Z</kbd> 撤销插入　<kbd>Esc</kbd> 清空
+          </p>
+        </div>
       </header>
 
       <div class="workspace">
         <main class="stage">
           <article class="page" aria-label="混排实验页">
-            <p class="kicker">作品介绍 · 就地改一处</p>
+            <p class="kicker">商品介绍 · 就地改一处</p>
             <div id="editor"></div>
           </article>
         </main>
 
         <aside class="inspector" aria-label="当前篮子">
-          <h2>SelectionSet</h2>
-          <p class="inspector-lead">自己写死的格式。第 1 周只往篮子里装，不调 API。</p>
+          <h2>选中列表</h2>
+          <p class="inspector-lead">图里的桌子、背景是像素，圈到后可改或「改背景」。页上空白是插入槽（会避开已有字和图）；插入会放在你圈的位置。Alt 从选区挖掉不要的部分。</p>
+          <ul id="selection-list" class="selection-list"></ul>
           <pre id="inspector-json">{}</pre>
         </aside>
       </div>
