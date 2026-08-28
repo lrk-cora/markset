@@ -2,22 +2,29 @@ import './styles.css'
 import { createEditor, refreshDecorations } from './editor.js'
 import { bindChromeKeys, renderChrome, toast } from './chrome.js'
 import { fetchHealth, isClientModelGateOn, setClientModelGate } from './api.js'
-import { canSnap, setSnapOn, snapImageHits } from './contour.js'
-import { hitImageAt, hitImages, hitPageSlot, hitText, hitWordAt } from './hit-test.js'
+import { canSnap, consumePackagingHint, consumeSkipObjectSnap, peekPackagingHint, peekSkipObjectSnap, setSnapOn, snapImageHits } from './contour.js'
+import {
+  hitImageAt,
+  hitImages,
+  hitPageSlot,
+  hitText,
+  hitWordAt,
+  isTinyImageSpan,
+  looksLikePriceBleed,
+  mergeSuggests,
+} from './hit-test.js'
 import { bindLasso, isLassoMode, isSubtractMode, setLassoMode, setSubtractMode } from './overlay.js'
 import {
   appendSpans,
   coversTextPos,
   eraseImageSpan,
   eraseSlots,
-  getSnapshot,
   refreshImageLayout,
   replaceSpans,
   setSuggest,
   subscribe,
   undoLastInsert,
-  unionImageMask,
-  unionImageSpan,
+  getSnapshot,
 } from './store.js'
 
 const editor = createEditor(document.getElementById('editor'))
@@ -57,8 +64,8 @@ document.getElementById('snap-contour')?.addEventListener('change', (e) => {
   e.target.closest('label')?.classList.toggle('is-on', e.target.checked)
   toast(
     e.target.checked
-      ? '松手将贴物体轮廓。每次圈图会消耗 fal 额度；减选仍用本地像素'
-      : '已关闭贴轮廓，仍用套索像素',
+      ? '之后圈图松手会自动贴到物体（每次消耗 fal 额度）。不勾则保持鼠标圈的范围'
+      : '已关闭自动贴物体，选区保持鼠标圈的范围',
   )
 })
 
@@ -89,6 +96,23 @@ document.getElementById('btn-subtract')?.addEventListener('click', () => {
 
 let ignoreClickUntil = 0
 
+function pushSuggests(extra = []) {
+  const merged = mergeSuggests(editor.view, extra)
+  setSuggest(merged)
+  return merged.filter((s) => s.suggestReason === 'same').length
+}
+
+function hintAfterSelect(spans, sameCount) {
+  const bits = []
+  if (sameCount) bits.push(`文案里还有 ${sameCount} 处相同字，点虚线「相同文案，加入」`)
+  if (looksLikePriceBleed(spans)) bits.push('若圈到价格，拖蓝条两端缩短，或取消勾选那一段')
+  const hasText = spans.some((s) => s.kind === 'text')
+  const hasImage = spans.some((s) => s.kind === 'image')
+  if (hasText && hasImage) bits.push('只改字、图不动：取消勾选图上的 #I')
+  if (hasImage) bits.push('圈多了桌子用 Alt 减选，不要点 ×')
+  if (bits.length) toast(bits.join('。'), 4800)
+}
+
 function applyHits(textHits, imageHits, polygon, { append, subtract }) {
   const suggests = [...textHits.suggest]
   const imgs = [...imageHits.found, ...((append || subtract) ? imageHits.suggest : [])]
@@ -100,36 +124,35 @@ function applyHits(textHits, imageHits, polygon, { append, subtract }) {
       if (eraseImageSpan(img, polygon)) did = true
     }
     if (eraseSlots(polygon)) did = true
-    toast(did ? '已圈掉不要的部分' : '先圈要留的，再按住 Alt 圈不要的（桌边、空隙）')
+    toast(did ? '已圈掉不要的部分' : '先圈要留的，再按住 Alt 圈不要的（桌边、空隙）。不要点 ×')
     return
   }
 
   if (append) {
-    const leftover = []
-    let expanded = false
-    for (const img of imgs) {
-      if (img.maskCanvas && unionImageMask(img, img.maskCanvas)) expanded = true
-      else leftover.push(img)
-    }
-    const extra = [...textHits.found, ...leftover]
+    const extra = [...textHits.found, ...imgs]
     if (!imgs.length && !textHits.found.length) {
       const slot = hitPageSlot(polygon, editor.view)
       if (slot) extra.push(slot)
     }
-    if (extra.length) appendSpans(extra, editor.view.state.doc)
-    if (expanded) toast('已扩大选区')
-    else if (!extra.length) {
-      if (suggests.length) setSuggest(suggests)
-      else toast('按住 Shift 再圈可加上；Alt 圈不要的可挖掉')
-    }
-    if (suggests.length) setSuggest(suggests)
+    if (extra.length) {
+      appendSpans(extra, editor.view.state.doc)
+      const addedImg = extra.filter((s) => s.kind === 'image').length
+      if (consumePackagingHint() && addedImg) {
+        toast('已加上包装上的字（不贴物体）。再点「统一风格」或「替换」', 4200)
+      } else {
+        toast(addedImg ? '已另作编号加上这块图（一张图两件货用 Shift 再圈）' : '已加上')
+      }
+      const sameCount = pushSuggests(suggests)
+      if (sameCount) hintAfterSelect(extra, sameCount)
+    } else if (suggests.length) pushSuggests(suggests)
+    else toast('按住 Shift 再圈可加上；Alt 圈不要的可挖掉')
     return
   }
 
   const next = [...textHits.found, ...imageHits.found]
   if (!next.length) {
     if (suggests.length) {
-      setSuggest(suggests)
+      pushSuggests(suggests)
       return
     }
     const slot = hitPageSlot(polygon, editor.view)
@@ -142,7 +165,13 @@ function applyHits(textHits, imageHits, polygon, { append, subtract }) {
     return
   }
   replaceSpans(next)
-  if (suggests.length) setSuggest(suggests)
+  if (consumePackagingHint() && next.some((s) => s.kind === 'image')) {
+    toast('已加上包装上的字（不贴物体）。再点「统一风格」或「替换」', 4200)
+    pushSuggests(suggests)
+    return
+  }
+  const sameCount = pushSuggests(suggests)
+  hintAfterSelect(next, sameCount)
 }
 
 bindLasso({
@@ -153,8 +182,16 @@ bindLasso({
     ignoreClickUntil = performance.now() + 400
     const textHits = hitText(editor.view, polygon, { skipCovered: shift && !subtract })
     const imageHits = hitImages(editor.view, polygon)
-    const apply = (images) => applyHits(textHits, images, polygon, { append: shift && !subtract, subtract })
-    if (subtract || !canSnap() || (!imageHits.found.length && !imageHits.suggest.length)) {
+    const hasImage = imageHits.found.length + imageHits.suggest.length > 0
+    const apply = (images) =>
+      applyHits(textHits, images, polygon, {
+        append: (shift && !subtract) || (peekPackagingHint() && hasImage),
+        subtract,
+      })
+    const skipSnap = peekSkipObjectSnap() && hasImage
+    const hasBig = [...imageHits.found, ...imageHits.suggest].some((s) => !isTinyImageSpan(s))
+    if (subtract || skipSnap || !canSnap() || !hasBig) {
+      if (skipSnap) consumeSkipObjectSnap()
       apply(imageHits)
       return
     }
@@ -180,21 +217,16 @@ window.addEventListener(
       e.preventDefault()
       const subtract = isSubtractMode() || e.altKey || e.ctrlKey
       const finish = (span) => {
-        const has = getSnapshot().spans.some((s) => s.kind === 'image' && s.block_id === span.block_id)
-        if (has) {
-          if (subtract) {
-            if (!eraseImageSpan(span, span.polygon)) toast('按住 Alt，圈不要的区域')
-          } else if (span.maskCanvas && unionImageMask(span, span.maskCanvas)) {
-            toast('已扩大图上选区')
-          } else {
-            unionImageSpan(span, span.polygon)
-            toast('已扩大图上选区')
-          }
-        } else {
-          appendSpans([span])
+        if (subtract) {
+          if (!eraseImageSpan(span, span.polygon)) toast('按住 Alt，圈不要的区域。不要点 ×')
+          return
         }
+        appendSpans([span])
+        if (consumePackagingHint()) toast('已加上包装上的字（不贴物体）。再点「统一风格」或「替换」', 4200)
+        else toast('已另作编号加上这块图（一张图两件货用 Shift 再圈）')
+        pushSuggests()
       }
-      if (!subtract && canSnap()) {
+      if (!subtract && canSnap() && !(peekSkipObjectSnap() && consumeSkipObjectSnap()) && !isTinyImageSpan(image)) {
         snapImageHits(
           { found: [image], suggest: [] },
           { point: { x: e.clientX, y: e.clientY } },
@@ -216,6 +248,8 @@ window.addEventListener(
       e.preventDefault()
       if (coversTextPos(word.from)) return
       appendSpans([word], editor.view.state.doc)
+      const sameCount = pushSuggests()
+      hintAfterSelect([word], sameCount)
     }
   },
   true,

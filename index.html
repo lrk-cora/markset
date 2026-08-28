@@ -21,9 +21,9 @@
             <input type="checkbox" id="allow-models" />
             允许调用云端模型
           </label>
-          <label class="allow-models" title="默认关闭。打开后，圈图松手会调用 fal SAM 贴物体轮廓，每次消耗额度。减选仍用本地像素。">
+          <label class="allow-models" title="默认关闭：选区就是鼠标圈出来的像素。打开后，每次圈图松手都会调用 SAM 贴到物体，消耗 fal 额度。减选仍用本地像素。">
             <input type="checkbox" id="snap-contour" />
-            松手贴轮廓
+            松手自动贴物体
           </label>
           <p class="hint">
             <kbd>Shift</kbd> 加上　<kbd>Alt</kbd> 减选　页上空白可插入　<kbd>Ctrl</kbd>+<kbd>Z</kbd> 撤销插入　<kbd>Esc</kbd> 清空
@@ -41,7 +41,7 @@
 
         <aside class="inspector" aria-label="当前篮子">
           <h2>选中列表</h2>
-          <p class="inspector-lead">图里的桌子、背景是像素，圈到后可改或「改背景」。页上空白是插入槽（会避开已有字和图）；插入会放在你圈的位置。Alt 从选区挖掉不要的部分。</p>
+          <p class="inspector-lead">松手后相同文案会出虚线，勾选才加入。品名贴到价格时拖蓝条。包装上的旧名：点「统一风格/替换」会先问，勾选后再圈那几个字（不贴物体）。一张图两件货用 Shift 再圈。只改字则取消勾选 #I。圈多了桌子用 Alt 减选，不要点 ×。</p>
           <ul id="selection-list" class="selection-list"></ul>
           <pre id="inspector-json">{}</pre>
         </aside>

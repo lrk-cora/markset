@@ -1,5 +1,7 @@
 import { inpaintImage, isClientModelGateOn, rewriteText } from './api.js'
+import { armSkipObjectSnap } from './contour.js'
 import { replaceRangeText, setImageSrcByBlockId } from './editor.js'
+import { isTinyImageSpan } from './hit-test.js'
 import { maskToFalDataUrl, makeMask, paintMask, rectToPoly } from './mask.js'
 import {
   beginWriteUndo,
@@ -106,6 +108,23 @@ export async function runWriteback(kind, editor, notify) {
     notify('先在输入框写要改成什么样')
     return
   }
+
+  const pageHasImage = Boolean(editor.view.dom.querySelector('img[data-block-id]'))
+  if (
+    (kind === 'unify' || kind === 'replace') &&
+    texts.length &&
+    pageHasImage &&
+    !images.some(isTinyImageSpan)
+  ) {
+    const pack = window.confirm(
+      '图上也有旧名称，是否一并改？\n确定：接下来只圈包装/杯身上印着的字（不走物体分割），再点同一命令。已选的字会保留。\n取消：只改当前勾选的字和图。',
+    )
+    if (pack) {
+      armSkipObjectSnap()
+      notify('请尽量只圈包装上那几个字（不必按 Shift）。松手后会加很小一块 #I，再点同一命令')
+      return
+    }
+  }
   if (kind === 'delete' && images.length) {
     const ok = window.confirm('删除会抹掉勾选范围内的字，并抹掉图上那一块（重画会消耗额度）。确定？')
     if (!ok) return
@@ -141,23 +160,20 @@ export async function runWriteback(kind, editor, notify) {
       }
     }
 
-    const inpaintResults = []
+    const latest = new Map()
     if (needsPaid && imageCalls) {
       const prompt = inpaintPrompt(kind, commandText)
       for (const span of images) {
         const img = editor.view.dom.querySelector(`img[data-block-id="${span.block_id}"]`)
         if (!img) throw new Error('找不到原图')
-        const imageDataUrl = await elementToDataUrl(img)
+        const imageDataUrl = latest.get(span.block_id) || (await elementToDataUrl(img))
         const mask = seedMask(span)
         const data = await inpaintImage({
           prompt,
           imageDataUrl,
           maskDataUrl: maskToFalDataUrl(mask),
         })
-        inpaintResults.push({
-          blockId: span.block_id,
-          src: await compositeMasked(imageDataUrl, data.imageUrl, mask),
-        })
+        latest.set(span.block_id, await compositeMasked(imageDataUrl, data.imageUrl, mask))
       }
     }
 
@@ -167,8 +183,8 @@ export async function runWriteback(kind, editor, notify) {
       applyTextFromEnd(editor, textIds, (live) => rewriteResults.get(live.markId) || live.text)
     }
 
-    for (const item of inpaintResults) {
-      if (!setImageSrcByBlockId(editor, item.blockId, item.src)) throw new Error('写回图片失败')
+    for (const [blockId, src] of latest) {
+      if (!setImageSrcByBlockId(editor, blockId, src)) throw new Error('写回图片失败')
     }
 
     ping()

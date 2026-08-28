@@ -1,5 +1,5 @@
 import { insertImageAt, insertParagraphAt, newBlockId, pageRelativeRect } from './editor.js'
-import { blockRange } from './hit-test.js'
+import { blockRange, collectDuplicateSuggests } from './hit-test.js'
 import { tintedMaskCanvas } from './mask.js'
 import { setSubtractMode } from './overlay.js'
 import {
@@ -15,6 +15,7 @@ import {
   removeMark,
   setAnchors,
   setCommandText,
+  setSuggest,
   targets,
   toggleBackground,
   toggleWillEdit,
@@ -23,19 +24,20 @@ import {
   updateTextRange,
   toSpec,
 } from './store.js'
+import { snapExistingMark } from './contour.js'
 import { runWriteback } from './writeback.js'
 
 let toastTimer = 0
 let drag = null
 
-export function toast(message) {
+export function toast(message, ms = 2200) {
   const el = document.getElementById('toast')
   el.hidden = false
   el.textContent = message
   window.clearTimeout(toastTimer)
   toastTimer = window.setTimeout(() => {
     el.hidden = true
-  }, 2200)
+  }, ms)
 }
 
 function textAnchor(view, span) {
@@ -306,6 +308,19 @@ function insertImage(editor) {
   input.click()
 }
 
+function addSnapButton(parent, markId, className = 'snap-one') {
+  const btn = document.createElement('button')
+  btn.type = 'button'
+  btn.className = className
+  btn.textContent = '贴物体'
+  btn.title = '用这块的大致范围调用 SAM，把选区贴到物体。不点则保持鼠标圈的范围。'
+  btn.addEventListener('click', (e) => {
+    e.stopPropagation()
+    snapExistingMark(markId, toast)
+  })
+  parent.append(btn)
+}
+
 function renderList() {
   const list = document.getElementById('selection-list')
   if (!list) return
@@ -330,8 +345,9 @@ function renderList() {
     const detail = document.createElement('span')
     if (span.kind === 'text') detail.textContent = span.text
     else if (span.kind === 'slot') detail.textContent = '页上空白 · 插入文字或图'
-    else detail.textContent = span.mode === 'background' ? '图 · 背景' : '图 · 像素'
+    else detail.textContent = span.mode === 'background' ? '图 · 背景' : '图 · 一块像素'
     li.append(check, name, detail)
+    if (span.kind === 'image') addSnapButton(li, span.markId)
     list.append(li)
   }
 }
@@ -400,7 +416,9 @@ export function renderChrome(editor) {
       removeMark(span.markId)
     })
 
-    badge.append(check, tag, x)
+    badge.append(check, tag)
+    if (span.kind === 'image') addSnapButton(badge, span.markId, 'snap-one')
+    badge.append(x)
     layer.append(badge)
   }
 
@@ -408,17 +426,23 @@ export function renderChrome(editor) {
     const rect = suggestRect(editor.view, item)
     if (!rect) continue
     const s = document.createElement('div')
-    s.className = 'suggest'
+    s.className = item.suggestReason === 'same' ? 'suggest is-same' : 'suggest'
     s.style.left = `${rect.x}px`
     s.style.top = `${rect.y}px`
     s.style.width = `${rect.w}px`
     s.style.height = `${rect.h}px`
     const btn = document.createElement('button')
     btn.type = 'button'
-    btn.textContent = '建议加入'
+    btn.textContent =
+      item.suggestReason === 'same'
+        ? '相同文案，加入'
+        : item.suggestReason === 'short'
+          ? '字太短，加入'
+          : '建议加入'
     btn.addEventListener('click', (e) => {
       e.stopPropagation()
       appendSpans([item], editor.view.state.doc)
+      setSuggest(collectDuplicateSuggests(editor.view))
     })
     s.append(btn)
     layer.append(s)
@@ -525,7 +549,7 @@ export function renderChrome(editor) {
           e.stopPropagation()
           if (msg === 'subtract') {
             setSubtractMode(true)
-            toast('减选已开：按住 Alt 再圈不要的部分（桌子、空隙），会从选区里挖掉')
+            toast('减选已开：按住 Alt 再圈不要的部分（桌子、空隙），会从选区里挖掉。不要点 ×')
             return
           }
           toast(msg)

@@ -384,21 +384,56 @@ export function spanWithMaskCanvas(span, canvas) {
   return next ? { ...next, mode: span.mode || 'region' } : null
 }
 
+export function replaceImageSpan(markId, nextSpan) {
+  let found = false
+  state.spans = state.spans.map((span) => {
+    if (span.markId !== markId || span.kind !== 'image') return span
+    found = true
+    return {
+      ...nextSpan,
+      markId,
+      willEdit: span.willEdit,
+    }
+  })
+  if (found) emit()
+  return found
+}
+
 export function applyImagePolygon(hit, polygon, mode) {
   const polyN = screenPolyToNatural(polygon, hit.imageRect, hit.naturalSize)
+  if (mode === 'erase') {
+    let did = false
+    const next = []
+    for (const cur of state.spans) {
+      if (cur.kind !== 'image' || cur.block_id !== hit.block_id) {
+        next.push(cur)
+        continue
+      }
+      did = true
+      const canvas = seedMask(cur)
+      paintMask(canvas, polyN, 'erase')
+      const synced = syncImageFromMask(cur, canvas)
+      if (synced) next.push(synced)
+    }
+    if (!did) return false
+    state.spans = withMarks(next)
+    emit()
+    return true
+  }
+
   const i = findImageIndex(hit.block_id)
   if (i < 0) return false
 
   const cur = state.spans[i]
   const canvas = seedMask(cur)
-  paintMask(canvas, polyN, mode === 'erase' ? 'erase' : mode === 'replace' ? 'replace' : 'add')
-  const next = syncImageFromMask(cur, canvas)
-  if (!next) {
+  paintMask(canvas, polyN, mode === 'replace' ? 'replace' : 'add')
+  const synced = syncImageFromMask(cur, canvas)
+  if (!synced) {
     state.spans = withMarks(state.spans.filter((s) => s.markId !== cur.markId))
     emit()
     return true
   }
-  state.spans[i] = next
+  state.spans[i] = synced
   emit()
   return true
 }

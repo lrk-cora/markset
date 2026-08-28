@@ -13,7 +13,7 @@ import {
   paintMask,
   screenPolyToNatural,
 } from './mask.js'
-import { coversTextPos } from './store.js'
+import { coversTextPos, getSnapshot } from './store.js'
 
 const SMALL_AREA = 24 * 24
 
@@ -97,10 +97,87 @@ export function hitText(view, polygon, { skipCovered = false } = {}) {
   const suggest = []
   for (const span of mergeCharHits(view, hits)) {
     const n = span.text.replace(/\s/g, '').length
-    if (n > 0 && n <= 2) suggest.push(span)
+    if (n > 0 && n <= 2) suggest.push({ ...span, suggestReason: 'short' })
     else found.push(span)
   }
   return { found, suggest }
+}
+
+export function findSameText(view, needle, occupied = []) {
+  const compact = String(needle || '').replace(/\s/g, '')
+  if (compact.length < 2) return []
+  const overlaps = (from, to) =>
+    occupied.some((s) => s.kind === 'text' && from < s.to && to > s.from) || coversTextPos(from)
+  const found = []
+  view.state.doc.descendants((node, pos) => {
+    if (!node.isText || !node.text) return
+    const value = node.text
+    let searchFrom = 0
+    while (searchFrom < value.length) {
+      const i = value.indexOf(needle, searchFrom)
+      if (i < 0) break
+      const from = pos + i
+      const to = from + needle.length
+      searchFrom = i + Math.max(1, needle.length)
+      if (overlaps(from, to)) continue
+      const info = blockInfo(view.state, from)
+      found.push({
+        kind: 'text',
+        suggestReason: compact.length <= 2 ? 'short' : 'same',
+        block_id: info?.blockId ?? null,
+        start: info ? from - info.contentStart : from,
+        end: info ? to - info.contentStart : to,
+        text: needle,
+        from,
+        to,
+      })
+    }
+  })
+  return found
+}
+
+export function collectDuplicateSuggests(view) {
+  const occupied = getSnapshot().spans.filter((s) => s.kind === 'text')
+  const needles = [
+    ...new Set(
+      occupied
+        .map((s) => String(s.text || '').trim())
+        .filter((t) => t.replace(/\s/g, '').length >= 2),
+    ),
+  ]
+  const dups = []
+  for (const needle of needles) dups.push(...findSameText(view, needle, occupied))
+  return dups
+}
+
+export function mergeSuggests(view, extra = []) {
+  const seen = new Set()
+  const out = []
+  for (const span of [...extra, ...collectDuplicateSuggests(view)]) {
+    const key =
+      span.kind === 'text'
+        ? `t:${span.from}:${span.to}`
+        : `i:${span.block_id}:${Math.round(span.bbox?.x || 0)}:${Math.round(span.bbox?.y || 0)}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    out.push(span)
+  }
+  return out
+}
+
+export function isTinyImageSpan(span) {
+  return Boolean(
+    span?.kind === 'image' && span.screenRect && span.screenRect.w * span.screenRect.h < 96 * 96,
+  )
+}
+
+export function looksLikePriceBleed(spans) {
+  return spans.some(
+    (s) =>
+      s.kind === 'text' &&
+      /[\d０-９]/.test(s.text) &&
+      /元|￥|¥|售价|专利/.test(s.text),
+  )
 }
 
 export function imageSpanFromPolygon(img, polygon) {

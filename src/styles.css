@@ -222,6 +222,20 @@ body.is-lassoing {
   letter-spacing: 0.02em;
 }
 
+.badge button.snap-one,
+.selection-list .snap-one {
+  height: 18px;
+  padding: 0 6px;
+  border: 0;
+  border-radius: 4px;
+  background: #fff;
+  color: #1b3a7a;
+  box-shadow: 0 0 0 1px var(--line);
+  font-size: 11px;
+  cursor: pointer;
+  font-family: var(--sans);
+}
+
 .badge button.x {
   width: 18px;
   height: 18px;
@@ -427,6 +441,11 @@ kbd {
   display: flex;
   align-items: flex-start;
   pointer-events: none;
+}
+
+.suggest.is-same {
+  outline-color: #2f6fed;
+  background: rgba(47, 111, 237, 0.12);
 }
 
 .suggest button {
