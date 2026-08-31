@@ -1,7 +1,8 @@
 import { insertImageAt, insertParagraphAt, newBlockId, pageRelativeRect } from './editor.js'
-import { blockRange, collectDuplicateSuggests } from './hit-test.js'
+import { blockRange } from './hit-test.js'
 import { tintedMaskCanvas } from './mask.js'
 import { setSubtractMode } from './overlay.js'
+import { applyScopeAfterSelect, visibleSuggests } from './scope.js'
 import {
   appendSpans,
   beginInsertUndo,
@@ -15,7 +16,7 @@ import {
   removeMark,
   setAnchors,
   setCommandText,
-  setSuggest,
+  setScope,
   targets,
   toggleBackground,
   toggleWillEdit,
@@ -27,8 +28,99 @@ import {
 import { snapExistingMark } from './contour.js'
 import { runWriteback } from './writeback.js'
 
+const TOOLBAR_POS_KEY = 'markset-toolbar-pos'
+
 let toastTimer = 0
 let drag = null
+let barDrag = null
+let toolbarPos = loadToolbarPos()
+
+function loadToolbarPos() {
+  try {
+    const raw = localStorage.getItem(TOOLBAR_POS_KEY)
+    if (!raw) return null
+    const pos = JSON.parse(raw)
+    if (typeof pos?.x !== 'number' || typeof pos?.y !== 'number') return null
+    return pos
+  } catch {
+    return null
+  }
+}
+
+function saveToolbarPos(pos) {
+  toolbarPos = pos
+  try {
+    if (pos) localStorage.setItem(TOOLBAR_POS_KEY, JSON.stringify(pos))
+    else localStorage.removeItem(TOOLBAR_POS_KEY)
+  } catch {
+    /* ignore */
+  }
+}
+
+function clampToolbarPos(x, y, bar) {
+  const w = bar?.offsetWidth || 420
+  const h = bar?.offsetHeight || 96
+  return {
+    x: Math.min(Math.max(8, x), Math.max(8, window.innerWidth - w - 8)),
+    y: Math.min(Math.max(56, y), Math.max(56, window.innerHeight - h - 8)),
+  }
+}
+
+function dockToolbarPos(bar) {
+  return clampToolbarPos(16, window.innerHeight - (bar?.offsetHeight || 96) - 20, bar)
+}
+
+function placeToolbar(bar) {
+  const pos = clampToolbarPos(
+    (toolbarPos ?? dockToolbarPos(bar)).x,
+    (toolbarPos ?? dockToolbarPos(bar)).y,
+    bar,
+  )
+  bar.style.left = `${pos.x}px`
+  bar.style.top = `${pos.y}px`
+}
+
+function bindToolbarMove(bar) {
+  const grip = document.createElement('button')
+  grip.type = 'button'
+  grip.className = 'toolbar-grip'
+  grip.title = '拖到别处，避免挡住正文或图。双击回到左下角'
+  grip.setAttribute('aria-label', '拖动工具栏')
+  grip.textContent = '⋮⋮'
+  grip.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0) return
+    e.preventDefault()
+    e.stopPropagation()
+    const rect = bar.getBoundingClientRect()
+    barDrag = { dx: e.clientX - rect.left, dy: e.clientY - rect.top }
+    bar.classList.add('is-moving')
+    grip.setPointerCapture(e.pointerId)
+  })
+  grip.addEventListener('pointermove', (e) => {
+    if (!barDrag) return
+    e.preventDefault()
+    const next = clampToolbarPos(e.clientX - barDrag.dx, e.clientY - barDrag.dy, bar)
+    bar.style.left = `${next.x}px`
+    bar.style.top = `${next.y}px`
+    toolbarPos = next
+  })
+  const endMove = () => {
+    if (!barDrag) return
+    barDrag = null
+    bar.classList.remove('is-moving')
+    const rect = bar.getBoundingClientRect()
+    saveToolbarPos(clampToolbarPos(rect.left, rect.top, bar))
+  }
+  grip.addEventListener('pointerup', endMove)
+  grip.addEventListener('pointercancel', endMove)
+  grip.addEventListener('dblclick', (e) => {
+    e.preventDefault()
+    e.stopPropagation()
+    saveToolbarPos(null)
+    placeToolbar(bar)
+  })
+  return grip
+}
 
 export function toast(message, ms = 2200) {
   const el = document.getElementById('toast')
@@ -66,21 +158,39 @@ function unionRect(rects) {
 
 function suggestRect(view, item) {
   if (item.screenRect) return item.screenRect
-  if (item.kind === 'text') {
-    try {
-      const a = view.coordsAtPos(item.from)
-      const b = view.coordsAtPos(item.to)
-      return {
-        x: a.left,
-        y: a.top,
-        w: Math.max(24, Math.abs(b.left - a.left)),
-        h: Math.max(18, a.bottom - a.top),
-      }
-    } catch {
-      return null
+  if (item.kind !== 'text') return null
+  try {
+    const start = view.domAtPos(item.from)
+    const end = view.domAtPos(item.to)
+    const range = document.createRange()
+    range.setStart(start.node, start.offset)
+    range.setEnd(end.node, end.offset)
+    const rects = [...range.getClientRects()].filter((r) => r.width > 1 && r.height > 1)
+    if (rects.length) {
+      return unionRect(
+        rects.map((r) => ({ x: r.left, y: r.top, w: r.width, h: r.height })),
+      )
     }
+    const a = view.coordsAtPos(item.from)
+    const b = view.coordsAtPos(item.to)
+    return {
+      x: a.left,
+      y: a.top,
+      w: Math.max(24, Math.abs(b.left - a.left)),
+      h: Math.max(18, a.bottom - a.top),
+    }
+  } catch {
+    return null
   }
-  return null
+}
+
+function suggestLabel(item) {
+  if (item.suggestReason === 'same') return '相同文案，加入'
+  if (item.suggestReason === 'short') return '字太短，加入'
+  if (item.suggestReason === 'semantic') return '语义辅改，加入'
+  if (item.suggestReason === 'print') return '盒侧印字，加入'
+  if (item.suggestReason === 'contradiction') return '矛盾处，加入'
+  return '建议加入'
 }
 
 function addMask(layer, span, boxes, anchors) {
@@ -321,7 +431,7 @@ function addSnapButton(parent, markId, className = 'snap-one') {
   parent.append(btn)
 }
 
-function renderList() {
+function renderList(editor) {
   const list = document.getElementById('selection-list')
   if (!list) return
   list.replaceChildren()
@@ -331,24 +441,60 @@ function renderList() {
     empty.className = 'muted'
     empty.textContent = '还没有选中。套索圈字、图，或页上空白。'
     list.append(empty)
+  } else {
+    for (const span of snap.spans) {
+      const li = document.createElement('li')
+      const check = document.createElement('input')
+      check.type = 'checkbox'
+      check.checked = span.willEdit !== false
+      check.disabled = Boolean(span.frozen)
+      check.title = span.frozen ? '禁改区：价格 / 物流 / 专利' : '将改'
+      check.addEventListener('change', () => toggleWillEdit(span.markId))
+      const name = document.createElement('strong')
+      name.textContent = `#${span.markId}`
+      const detail = document.createElement('span')
+      if (span.frozen) detail.textContent = `${span.text}（禁改）`
+      else if (span.kind === 'text') detail.textContent = span.text
+      else if (span.kind === 'slot') detail.textContent = '页上空白 · 插入文字或图'
+      else detail.textContent = span.mode === 'background' ? '图 · 背景' : '图 · 一块像素'
+      li.append(check, name, detail)
+      if (span.kind === 'image') addSnapButton(li, span.markId)
+      list.append(li)
+    }
+  }
+
+  const suggestBox = document.getElementById('suggest-list')
+  if (!suggestBox || !editor) return
+  suggestBox.replaceChildren()
+    const suggests = visibleSuggests(editor.view, snap.suggest)
+  if (!suggests.length) {
+    const empty = document.createElement('li')
+    empty.className = 'muted'
+    empty.textContent =
+      snap.scope === 'inside'
+        ? '仅圈内：提交时只改圈中的。要改别处相同品名请用「跟随」。'
+        : snap.scope === 'follow'
+          ? '跟随不预先圈选圈外。点选一个词、写要求，再点统一风格，系统再改相同品名和印字。'
+          : snap.scope === 'anchor'
+            ? '锚点不预先圈选矛盾句。圈中当作已对，点统一风格后才改正文色词，不重画圈中的图。'
+            : '圈字时若只碰到一两个字，会出现在这里，点一下可补进选中。'
+    suggestBox.append(empty)
     return
   }
-  for (const span of snap.spans) {
+  for (const item of suggests) {
     const li = document.createElement('li')
-    const check = document.createElement('input')
-    check.type = 'checkbox'
-    check.checked = span.willEdit !== false
-    check.title = '将改'
-    check.addEventListener('change', () => toggleWillEdit(span.markId))
-    const name = document.createElement('strong')
-    name.textContent = `#${span.markId}`
+    const btn = document.createElement('button')
+    btn.type = 'button'
+    btn.className = 'suggest-add'
+    btn.textContent = suggestLabel(item)
+    btn.addEventListener('click', () => {
+      appendSpans([item], editor.view.state.doc)
+      applyScopeAfterSelect(editor.view)
+    })
     const detail = document.createElement('span')
-    if (span.kind === 'text') detail.textContent = span.text
-    else if (span.kind === 'slot') detail.textContent = '页上空白 · 插入文字或图'
-    else detail.textContent = span.mode === 'background' ? '图 · 背景' : '图 · 一块像素'
-    li.append(check, name, detail)
-    if (span.kind === 'image') addSnapButton(li, span.markId)
-    list.append(li)
+    detail.textContent = item.text || item.suggestReason
+    li.append(btn, detail)
+    suggestBox.append(li)
   }
 }
 
@@ -395,7 +541,10 @@ export function renderChrome(editor) {
     const check = document.createElement('input')
     check.type = 'checkbox'
     check.checked = span.willEdit !== false
-    check.title = '将改：这次要不要改这一项。不要用 × 只去掉桌子。'
+    check.disabled = Boolean(span.frozen)
+    check.title = span.frozen
+      ? '禁改区'
+      : '将改：这次要不要改这一项。不要用 × 只去掉桌子。'
     check.addEventListener('click', (e) => e.stopPropagation())
     check.addEventListener('change', (e) => {
       e.stopPropagation()
@@ -422,40 +571,65 @@ export function renderChrome(editor) {
     layer.append(badge)
   }
 
-  for (const item of snap.suggest) {
+  const suggestItems = visibleSuggests(editor.view, snap.suggest)
+  for (const item of suggestItems) {
     const rect = suggestRect(editor.view, item)
     if (!rect) continue
     const s = document.createElement('div')
-    s.className = item.suggestReason === 'same' ? 'suggest is-same' : 'suggest'
+    s.className = `suggest${item.suggestReason ? ` is-${item.suggestReason}` : ''}`
     s.style.left = `${rect.x}px`
     s.style.top = `${rect.y}px`
     s.style.width = `${rect.w}px`
     s.style.height = `${rect.h}px`
     const btn = document.createElement('button')
     btn.type = 'button'
-    btn.textContent =
-      item.suggestReason === 'same'
-        ? '相同文案，加入'
-        : item.suggestReason === 'short'
-          ? '字太短，加入'
-          : '建议加入'
+    btn.textContent = suggestLabel(item)
     btn.addEventListener('click', (e) => {
       e.stopPropagation()
       appendSpans([item], editor.view.state.doc)
-      setSuggest(collectDuplicateSuggests(editor.view))
+      applyScopeAfterSelect(editor.view)
     })
     s.append(btn)
     layer.append(s)
   }
 
   if (snap.spans.length) {
-    const box = unionRect(boxes) ?? { x: 120, y: 160, w: 200, h: 40 }
     const bar = document.createElement('div')
     bar.className = 'toolbar'
-    const left = Math.min(Math.max(16, box.x), window.innerWidth - 520)
-    const top = Math.min(box.y + box.h + 16, window.innerHeight - 88)
-    bar.style.left = `${left}px`
-    bar.style.top = `${top}px`
+    bar.append(bindToolbarMove(bar))
+
+    const scopeRow = document.createElement('div')
+    scopeRow.className = 'scope-row'
+    for (const [id, label] of [
+      ['inside', '仅圈内'],
+      ['follow', '跟随'],
+      ['anchor', '锚点'],
+    ]) {
+      const btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = snap.scope === id ? 'is-on' : ''
+      btn.textContent = label
+      btn.title =
+        id === 'inside'
+          ? '只改圈中的。圈外不动。'
+          : id === 'follow'
+            ? '先圈一个词并写要求。提交时才按输入改圈外相同品名、印字；要求里带颜色才改色词。'
+            : '圈中当作已对，图不重画。提交时才改正文里矛盾的色词。'
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation()
+        setScope(id)
+        applyScopeAfterSelect(editor.view)
+        toast(
+          id === 'inside'
+            ? '范围：仅圈内。提交时只改圈中的。'
+            : id === 'follow'
+              ? '范围：跟随。圈一个词、写要求，点统一风格后才改圈外相同品名。'
+              : '范围：锚点。圈中不重画；点统一风格后才改正文矛盾处。',
+        )
+      })
+      scopeRow.append(btn)
+    }
+    bar.append(scopeRow)
 
     const unify = document.createElement('button')
     unify.type = 'button'
@@ -559,9 +733,10 @@ export function renderChrome(editor) {
     }
 
     layer.append(bar)
+    placeToolbar(bar)
   }
 
-  renderList()
+  renderList(editor)
   inspector.textContent = JSON.stringify(toSpec(), null, 2)
   const undoTop = document.getElementById('btn-undo')
   if (undoTop) undoTop.hidden = !canUndoInsert()

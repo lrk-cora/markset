@@ -1,5 +1,5 @@
 import './styles.css'
-import { createEditor, refreshDecorations } from './editor.js'
+import { applyDemoPage, createEditor, refreshDecorations } from './editor.js'
 import { bindChromeKeys, renderChrome, toast } from './chrome.js'
 import { fetchHealth, isClientModelGateOn, setClientModelGate } from './api.js'
 import { canSnap, consumePackagingHint, consumeSkipObjectSnap, peekPackagingHint, peekSkipObjectSnap, setSnapOn, snapImageHits } from './contour.js'
@@ -11,20 +11,20 @@ import {
   hitWordAt,
   isTinyImageSpan,
   looksLikePriceBleed,
-  mergeSuggests,
 } from './hit-test.js'
 import { bindLasso, isLassoMode, isSubtractMode, setLassoMode, setSubtractMode } from './overlay.js'
+import { applyScopeAfterSelect, describeScopeResult } from './scope.js'
 import {
   appendSpans,
+  clearAll,
   coversTextPos,
   eraseImageSpan,
   eraseSlots,
+  getSnapshot,
   refreshImageLayout,
   replaceSpans,
-  setSuggest,
   subscribe,
   undoLastInsert,
-  getSnapshot,
 } from './store.js'
 
 const editor = createEditor(document.getElementById('editor'))
@@ -38,6 +38,37 @@ subscribe(() => {
 bindChromeKeys(editor)
 renderChrome(editor)
 setLassoMode(true)
+forceModelsOff()
+
+function forceModelsOff() {
+  setClientModelGate(false)
+  setSnapOn(false)
+  const allow = document.getElementById('allow-models')
+  const snap = document.getElementById('snap-contour')
+  if (allow) {
+    allow.checked = false
+    allow.closest('label')?.classList.remove('is-on')
+  }
+  if (snap) {
+    snap.checked = false
+    snap.closest('label')?.classList.remove('is-on')
+  }
+}
+
+let currentPage = 'a'
+document.querySelectorAll('[data-demo-page]').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    const id = btn.getAttribute('data-demo-page')
+    if (!id || id === currentPage) return
+    currentPage = id
+    clearAll()
+    applyDemoPage(editor, id)
+    document.querySelectorAll('[data-demo-page]').forEach((el) => {
+      el.classList.toggle('is-on', el.getAttribute('data-demo-page') === id)
+    })
+    toast(id === 'b' ? '已换到页 B（锚点演示：杯身已是雾蓝）' : '已换到页 A（标题/正文/规格都有「原木杯」）')
+  })
+})
 
 document.getElementById('allow-models')?.addEventListener('change', (e) => {
   const on = e.target.checked
@@ -96,19 +127,18 @@ document.getElementById('btn-subtract')?.addEventListener('click', () => {
 
 let ignoreClickUntil = 0
 
-function pushSuggests(extra = []) {
-  const merged = mergeSuggests(editor.view, extra)
-  setSuggest(merged)
-  return merged.filter((s) => s.suggestReason === 'same').length
+function finishSelect(extra = []) {
+  return applyScopeAfterSelect(editor.view, extra)
 }
 
-function hintAfterSelect(spans, sameCount) {
+function hintAfterSelect(spans, result) {
   const bits = []
-  if (sameCount) bits.push(`文案里还有 ${sameCount} 处相同字，点虚线「相同文案，加入」`)
-  if (looksLikePriceBleed(spans)) bits.push('若圈到价格，拖蓝条两端缩短，或取消勾选那一段')
+  const msg = describeScopeResult(result, getSnapshot().scope)
+  if (msg) bits.push(msg)
+  if (looksLikePriceBleed(spans)) bits.push('价格是禁改区，请拖蓝条剔出或不要勾选')
   const hasText = spans.some((s) => s.kind === 'text')
   const hasImage = spans.some((s) => s.kind === 'image')
-  if (hasText && hasImage) bits.push('只改字、图不动：取消勾选图上的 #I')
+  if (hasText && hasImage) bits.push('只改字、图不动：取消勾选图上的 #I，或改用范围「锚点」')
   if (hasImage) bits.push('圈多了桌子用 Alt 减选，不要点 ×')
   if (bits.length) toast(bits.join('。'), 4800)
 }
@@ -139,12 +169,12 @@ function applyHits(textHits, imageHits, polygon, { append, subtract }) {
       const addedImg = extra.filter((s) => s.kind === 'image').length
       if (consumePackagingHint() && addedImg) {
         toast('已加上包装上的字（不贴物体）。再点「统一风格」或「替换」', 4200)
+        finishSelect(suggests)
       } else {
         toast(addedImg ? '已另作编号加上这块图（一张图两件货用 Shift 再圈）' : '已加上')
+        hintAfterSelect(extra, finishSelect(suggests))
       }
-      const sameCount = pushSuggests(suggests)
-      if (sameCount) hintAfterSelect(extra, sameCount)
-    } else if (suggests.length) pushSuggests(suggests)
+    } else if (suggests.length) finishSelect(suggests)
     else toast('按住 Shift 再圈可加上；Alt 圈不要的可挖掉')
     return
   }
@@ -152,7 +182,7 @@ function applyHits(textHits, imageHits, polygon, { append, subtract }) {
   const next = [...textHits.found, ...imageHits.found]
   if (!next.length) {
     if (suggests.length) {
-      pushSuggests(suggests)
+      finishSelect(suggests)
       return
     }
     const slot = hitPageSlot(polygon, editor.view)
@@ -167,11 +197,10 @@ function applyHits(textHits, imageHits, polygon, { append, subtract }) {
   replaceSpans(next)
   if (consumePackagingHint() && next.some((s) => s.kind === 'image')) {
     toast('已加上包装上的字（不贴物体）。再点「统一风格」或「替换」', 4200)
-    pushSuggests(suggests)
+    finishSelect(suggests)
     return
   }
-  const sameCount = pushSuggests(suggests)
-  hintAfterSelect(next, sameCount)
+  hintAfterSelect(next, finishSelect(suggests))
 }
 
 bindLasso({
@@ -224,7 +253,7 @@ window.addEventListener(
         appendSpans([span])
         if (consumePackagingHint()) toast('已加上包装上的字（不贴物体）。再点「统一风格」或「替换」', 4200)
         else toast('已另作编号加上这块图（一张图两件货用 Shift 再圈）')
-        pushSuggests()
+        finishSelect()
       }
       if (!subtract && canSnap() && !(peekSkipObjectSnap() && consumeSkipObjectSnap()) && !isTinyImageSpan(image)) {
         snapImageHits(
@@ -246,10 +275,13 @@ window.addEventListener(
     const word = hitWordAt(editor.view, e.clientX, e.clientY)
     if (word) {
       e.preventDefault()
-      if (coversTextPos(word.from)) return
-      appendSpans([word], editor.view.state.doc)
-      const sameCount = pushSuggests()
-      hintAfterSelect([word], sameCount)
+      if (e.shiftKey) {
+        if (coversTextPos(word.from)) return
+        appendSpans([word], editor.view.state.doc)
+      } else {
+        replaceSpans([word])
+      }
+      hintAfterSelect([word], finishSelect())
     }
   },
   true,

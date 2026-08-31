@@ -3,16 +3,18 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>MarkSet · 第 2 周</title>
+    <title>MarkSet · 本地完善</title>
   </head>
   <body>
     <div class="app">
       <header class="topbar">
         <div class="brand">
           <span class="mark">MarkSet</span>
-          <span class="week">第 2 周 · 默认不打模型</span>
+          <span class="week">本地完善 · 不打模型</span>
         </div>
         <div class="top-actions">
+          <button type="button" class="mode-btn is-on" data-demo-page="a">页 A</button>
+          <button type="button" class="mode-btn" data-demo-page="b">页 B</button>
           <button type="button" id="btn-lasso" class="mode-btn" aria-pressed="false">套索</button>
           <button type="button" id="btn-subtract" class="mode-btn" aria-pressed="false">减选</button>
           <button type="button" id="btn-undo" class="mode-btn" hidden>撤销插入</button>
@@ -26,7 +28,7 @@
             松手自动贴物体
           </label>
           <p class="hint">
-            <kbd>Shift</kbd> 加上　<kbd>Alt</kbd> 减选　页上空白可插入　<kbd>Ctrl</kbd>+<kbd>Z</kbd> 撤销插入　<kbd>Esc</kbd> 清空
+            <kbd>Shift</kbd> 加上　<kbd>Alt</kbd> 减选　单击整词　页上空白可插入　<kbd>Ctrl</kbd>+<kbd>Z</kbd> 撤销插入　<kbd>Esc</kbd> 清空
           </p>
         </div>
       </header>
@@ -34,15 +36,17 @@
       <div class="workspace">
         <main class="stage">
           <article class="page" aria-label="混排实验页">
-            <p class="kicker">商品介绍 · 就地改一处</p>
+            <p class="kicker" id="page-kicker">演示页 A · 任务 1 / 2 · 标题、正文、规格都有「原木杯」</p>
             <div id="editor"></div>
           </article>
         </main>
 
         <aside class="inspector" aria-label="当前篮子">
           <h2>选中列表</h2>
-          <p class="inspector-lead">松手后相同文案会出虚线，勾选才加入。品名贴到价格时拖蓝条。包装上的旧名：点「统一风格/替换」会先问，勾选后再圈那几个字（不贴物体）。一张图两件货用 Shift 再圈。只改字则取消勾选 #I。圈多了桌子用 Alt 减选，不要点 ×。</p>
+          <p class="inspector-lead">先点选或圈住一个词，再写要求。跟随、锚点不会预先圈上别处；点统一风格时系统再按输入改圈外该改的。仅圈内只动圈中。¥59、物流三种范围都不改。</p>
           <ul id="selection-list" class="selection-list"></ul>
+          <h2>未圈全</h2>
+          <ul id="suggest-list" class="selection-list"></ul>
           <pre id="inspector-json">{}</pre>
         </aside>
       </div>

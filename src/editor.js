@@ -147,9 +147,86 @@ const SelectionHighlight = Extension.create({
   },
 })
 
-export function createEditor(element) {
-  const cupSrc = `${import.meta.env.BASE_URL}cup.jpg`
+function cupSrc() {
+  return `${import.meta.env.BASE_URL}cup.jpg`
+}
 
+function para(blockId, text) {
+  return {
+    type: 'paragraph',
+    attrs: { blockId },
+    content: [{ type: 'text', text }],
+  }
+}
+
+export function demoDoc(pageId = 'a') {
+  const src = cupSrc()
+  const heading = {
+    type: 'heading',
+    attrs: { level: 1, blockId: 'h-1' },
+    content: [{ type: 'text', text: '原木杯' }],
+  }
+  const image = {
+    type: 'image',
+    attrs: {
+      src,
+      alt: pageId === 'b' ? '杯身已是雾蓝的杯子（演示，锚点时不要重画）' : '原木杯，盒侧面印着 OAK CUP，带杯盖，置于木桌边',
+      blockId: 'img-1',
+      width: 360,
+      height: 360,
+    },
+  }
+  const price = para('p-price', '¥59')
+  const ship = para('p-ship', '48小时内发货，偏远地区顺延。')
+
+  if (pageId === 'b') {
+    return {
+      type: 'doc',
+      content: [
+        heading,
+        para(
+          'p-1',
+          '红色原木杯，暖茶釉面，容量 280ml，杯口厚实。附赠杯盖，出行不易洒。',
+        ),
+        para('p-spec', '规格：原木杯 / 红色'),
+        image,
+        para('p-note', '演示设定：杯身已经是雾蓝。锚点时不要重画杯子。'),
+        price,
+        ship,
+      ],
+    }
+  }
+
+  return {
+    type: 'doc',
+    content: [
+      heading,
+      para(
+        'p-1',
+        '这款原木杯为暖茶色哑光釉，容量 280ml，杯口厚实，适合热饮。附赠杯盖，出行不易洒。杯底防滑。',
+      ),
+      para('p-spec', '规格：原木杯 / 暖茶 / 280ml'),
+      image,
+      para('p-print', '盒侧印字：OAK CUP'),
+      price,
+      ship,
+    ],
+  }
+}
+
+export const DEMO_KICKER = {
+  a: '演示页 A · 任务 1 / 2 · 标题、正文、规格都有「原木杯」',
+  b: '演示页 B · 任务 3 · 杯身已是雾蓝，说明仍写红色 / 原木',
+}
+
+export function applyDemoPage(editor, pageId = 'a') {
+  editor.commands.setContent(demoDoc(pageId))
+  const kicker = document.getElementById('page-kicker')
+  if (kicker) kicker.textContent = DEMO_KICKER[pageId] || DEMO_KICKER.a
+  document.querySelector('.page')?.classList.toggle('is-page-b', pageId === 'b')
+}
+
+export function createEditor(element) {
   return new Editor({
     element,
     editable: false,
@@ -177,41 +254,7 @@ export function createEditor(element) {
         return true
       },
     },
-    content: {
-      type: 'doc',
-      content: [
-        {
-          type: 'heading',
-          attrs: { level: 1, blockId: 'h-1' },
-          content: [{ type: 'text', text: '琥珀陶杯' }],
-        },
-        {
-          type: 'paragraph',
-          attrs: { blockId: 'p-1' },
-          content: [
-            {
-              type: 'text',
-              text: '这款琥珀陶杯为暖茶色哑光釉，容量 280ml，杯口厚实，适合热饮与下午茶。附赠杯盖，出行不易洒。杯底防滑，可与同系列叠放在桌边。',
-            },
-          ],
-        },
-        {
-          type: 'image',
-          attrs: {
-            src: cupSrc,
-            alt: '暖茶琥珀陶杯，带杯盖，置于木桌边',
-            blockId: 'img-1',
-            width: 360,
-            height: 360,
-          },
-        },
-        {
-          type: 'paragraph',
-          attrs: { blockId: 'p-2' },
-          content: [{ type: 'text', text: '售价 128 元' }],
-        },
-      ],
-    },
+    content: demoDoc('a'),
   })
 }
 

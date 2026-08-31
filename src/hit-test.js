@@ -13,6 +13,7 @@ import {
   paintMask,
   screenPolyToNatural,
 } from './mask.js'
+import { COLOR_TERMS, FORBIDDEN_RE, PRODUCT_ALIASES, RELATED_TERMS, isForbiddenSpan } from './forbidden.js'
 import { coversTextPos, getSnapshot } from './store.js'
 
 const SMALL_AREA = 24 * 24
@@ -103,6 +104,70 @@ export function hitText(view, polygon, { skipCovered = false } = {}) {
   return { found, suggest }
 }
 
+export function countOccurrences(hay, needle) {
+  if (!needle) return 0
+  let n = 0
+  let i = 0
+  while ((i = hay.indexOf(needle, i)) >= 0) {
+    n += 1
+    i += needle.length
+  }
+  return n
+}
+
+export function docPlain(view) {
+  return view.state.doc.textBetween(0, view.state.doc.content.size, '\n', '')
+}
+
+export function needlesFromText(text, docText) {
+  const t = String(text || '').trim()
+  if (t.replace(/\s/g, '').length < 2) return []
+  const found = []
+  if (countOccurrences(docText, t) >= 2) found.push(t)
+  const maxLen = Math.min(8, t.length)
+  for (let len = maxLen; len >= 2; len -= 1) {
+    for (let i = 0; i + len <= t.length; i += 1) {
+      const sub = t.slice(i, i + len)
+      if (!/^[\u4e00-\u9fffA-Za-z][\u4e00-\u9fffA-Za-z0-9]*$/.test(sub)) continue
+      if (countOccurrences(docText, sub) >= 2) found.push(sub)
+    }
+  }
+  const uniq = [...new Set(found)].sort((a, b) => b.length - a.length)
+  return uniq.filter((s, i) => !uniq.some((other, j) => j < i && other.includes(s)))
+}
+
+export function uniqueSuggests(items) {
+  const seen = new Set()
+  const out = []
+  for (const span of items || []) {
+    if (!span) continue
+    const key =
+      span.kind === 'text'
+        ? `t:${span.from}:${span.to}`
+        : `i:${span.block_id}:${Math.round(span.bbox?.x || 0)}:${Math.round(span.bbox?.y || 0)}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    out.push(span)
+  }
+  return out
+}
+
+function textHit(view, needle, from, to, reason) {
+  const info = blockInfo(view.state, from)
+  const span = {
+    kind: 'text',
+    suggestReason: reason,
+    block_id: info?.blockId ?? null,
+    start: info ? from - info.contentStart : from,
+    end: info ? to - info.contentStart : to,
+    text: needle,
+    from,
+    to,
+  }
+  if (isForbiddenSpan(span)) return null
+  return span
+}
+
 export function findSameText(view, needle, occupied = []) {
   const compact = String(needle || '').replace(/\s/g, '')
   if (compact.length < 2) return []
@@ -120,17 +185,8 @@ export function findSameText(view, needle, occupied = []) {
       const to = from + needle.length
       searchFrom = i + Math.max(1, needle.length)
       if (overlaps(from, to)) continue
-      const info = blockInfo(view.state, from)
-      found.push({
-        kind: 'text',
-        suggestReason: compact.length <= 2 ? 'short' : 'same',
-        block_id: info?.blockId ?? null,
-        start: info ? from - info.contentStart : from,
-        end: info ? to - info.contentStart : to,
-        text: needle,
-        from,
-        to,
-      })
+      const span = textHit(view, needle, from, to, compact.length <= 2 ? 'short' : 'same')
+      if (span) found.push(span)
     }
   })
   return found
@@ -138,31 +194,69 @@ export function findSameText(view, needle, occupied = []) {
 
 export function collectDuplicateSuggests(view) {
   const occupied = getSnapshot().spans.filter((s) => s.kind === 'text')
-  const needles = [
-    ...new Set(
-      occupied
-        .map((s) => String(s.text || '').trim())
-        .filter((t) => t.replace(/\s/g, '').length >= 2),
-    ),
-  ]
+  const hay = docPlain(view)
+  const set = new Set()
+  for (const span of occupied) {
+    for (const needle of needlesFromText(span.text, hay)) set.add(needle)
+  }
   const dups = []
-  for (const needle of needles) dups.push(...findSameText(view, needle, occupied))
-  return dups
+  for (const needle of [...set].sort((a, b) => b.length - a.length)) {
+    dups.push(...findSameText(view, needle, occupied))
+  }
+  return uniqueSuggests(dups)
+}
+
+export function collectSemanticSuggests(view) {
+  const occupied = getSnapshot().spans.filter((s) => s.kind === 'text')
+  const selected = occupied.map((s) => s.text || '').join('')
+  const hay = docPlain(view)
+  const hits = []
+  for (const term of RELATED_TERMS) {
+    if (selected.includes(term) && needlesFromText(selected, hay).some((n) => n.includes(term) && n !== term)) {
+      continue
+    }
+    if (!hay.includes(term)) continue
+    if (selected === term) continue
+    const found = findSameText(view, term, occupied).map((s) => ({ ...s, suggestReason: 'semantic' }))
+    hits.push(...found)
+  }
+  return uniqueSuggests(hits)
+}
+
+export function collectAliasSuggests(view) {
+  const occupied = getSnapshot().spans.filter((s) => s.kind === 'text')
+  const needles = new Set()
+  for (const span of occupied) {
+    const t = String(span.text || '')
+    for (const [canon, aliases] of Object.entries(PRODUCT_ALIASES)) {
+      if (t.includes(canon) || t === canon) aliases.forEach((a) => needles.add(a))
+      if (aliases.some((a) => t === a || t.includes(a))) needles.add(canon)
+    }
+  }
+  const hits = []
+  for (const needle of needles) {
+    hits.push(
+      ...findSameText(view, needle, occupied).map((s) => ({ ...s, suggestReason: 'print' })),
+    )
+  }
+  return uniqueSuggests(hits)
+}
+
+export function collectContradictionSuggests(view) {
+  const occupied = getSnapshot().spans.filter((s) => s.kind === 'text')
+  const hits = []
+  for (const term of COLOR_TERMS) {
+    hits.push(
+      ...findSameText(view, term, occupied)
+        .filter((s) => s.block_id !== 'p-note')
+        .map((s) => ({ ...s, suggestReason: 'contradiction' })),
+    )
+  }
+  return uniqueSuggests(hits)
 }
 
 export function mergeSuggests(view, extra = []) {
-  const seen = new Set()
-  const out = []
-  for (const span of [...extra, ...collectDuplicateSuggests(view)]) {
-    const key =
-      span.kind === 'text'
-        ? `t:${span.from}:${span.to}`
-        : `i:${span.block_id}:${Math.round(span.bbox?.x || 0)}:${Math.round(span.bbox?.y || 0)}`
-    if (seen.has(key)) continue
-    seen.add(key)
-    out.push(span)
-  }
-  return out
+  return uniqueSuggests([...(extra || []), ...collectDuplicateSuggests(view)])
 }
 
 export function isTinyImageSpan(span) {
@@ -172,12 +266,7 @@ export function isTinyImageSpan(span) {
 }
 
 export function looksLikePriceBleed(spans) {
-  return spans.some(
-    (s) =>
-      s.kind === 'text' &&
-      /[\d０-９]/.test(s.text) &&
-      /元|￥|¥|售价|专利/.test(s.text),
-  )
+  return spans.some((s) => s.kind === 'text' && (/[¥￥]/.test(s.text) || FORBIDDEN_RE.test(s.text)))
 }
 
 export function imageSpanFromPolygon(img, polygon) {
@@ -267,6 +356,21 @@ function rangeFromPoint(x, y) {
   return range
 }
 
+function longestRepeatedCovering(local, index, hay) {
+  if (!local) return null
+  const maxLen = Math.min(8, local.length)
+  for (let len = maxLen; len >= 2; len -= 1) {
+    const startMin = Math.max(0, index - len + 1)
+    const startMax = Math.min(index, local.length - len)
+    for (let start = startMin; start <= startMax; start += 1) {
+      const sub = local.slice(start, start + len)
+      if (!/^[\u4e00-\u9fffA-Za-z][\u4e00-\u9fffA-Za-z0-9]*$/.test(sub)) continue
+      if (countOccurrences(hay, sub) >= 2) return [start, start + len]
+    }
+  }
+  return null
+}
+
 function isWordChar(ch) {
   return /[A-Za-z0-9\u4e00-\u9fff]/.test(ch ?? '')
 }
@@ -302,7 +406,8 @@ export function hitWordAt(view, x, y) {
   if (!range || range.startContainer.nodeType !== Node.TEXT_NODE) return null
   if (!view.dom.contains(range.startContainer)) return null
   const textNode = range.startContainer
-  const bounds = wordBounds(textNode.nodeValue, range.startOffset)
+  const covering = longestRepeatedCovering(textNode.nodeValue, range.startOffset, docPlain(view))
+  const bounds = covering || wordBounds(textNode.nodeValue, range.startOffset)
   if (!bounds) return null
   let from
   let to

@@ -1,8 +1,12 @@
 import { inpaintImage, isClientModelGateOn, rewriteText } from './api.js'
-import { armSkipObjectSnap } from './contour.js'
 import { replaceRangeText, setImageSrcByBlockId } from './editor.js'
-import { isTinyImageSpan } from './hit-test.js'
+import { isForbiddenSpan } from './forbidden.js'
 import { maskToFalDataUrl, makeMask, paintMask, rectToPoly } from './mask.js'
+import { localNextText } from './plan-local.js'
+import {
+  collectOutsideEdits,
+  previewOutside,
+} from './scope.js'
 import {
   beginWriteUndo,
   getSnapshot,
@@ -74,24 +78,40 @@ function gateMessage(err) {
   return err.message || '调用失败'
 }
 
-function applyTextFromEnd(editor, markIds, nextText) {
-  const ordered = getSnapshot()
-    .spans.filter((s) => s.kind === 'text' && markIds.has(s.markId))
+function applyTextSpans(editor, spans, nextText) {
+  const work = spans
+    .filter((s) => s.kind === 'text' && s.from != null && s.to != null && s.from < s.to)
+    .map((s) => ({ ...s }))
     .sort((a, b) => b.from - a.from)
-  for (const span of ordered) {
-    const live = getSnapshot().spans.find((s) => s.markId === span.markId)
-    if (!live || live.kind !== 'text') continue
-    const text = typeof nextText === 'function' ? nextText(live) : nextText
-    const mapping = replaceRangeText(editor, live.from, live.to, text)
+  for (const span of work) {
+    if (span.from >= span.to) continue
+    let current = span.text
+    try {
+      current = editor.view.state.doc.textBetween(span.from, span.to)
+    } catch {
+      continue
+    }
+    const text = typeof nextText === 'function' ? nextText({ ...span, text: current }) : nextText
+    if (text === current) continue
+    const mapping = replaceRangeText(editor, span.from, span.to, text)
     remapAllTextSpans(mapping, editor.view.state.doc)
+    for (const rest of work) {
+      rest.from = mapping.map(rest.from, 1)
+      rest.to = mapping.map(rest.to, -1)
+    }
   }
 }
 
 export async function runWriteback(kind, editor, notify) {
   if (running) return
-  const scoped = targets().filter((s) => s.kind !== 'slot')
-  if (!scoped.length) {
+  const picked = targets().filter((s) => s.kind !== 'slot')
+  const scoped = picked.filter((s) => !s.frozen && !isForbiddenSpan(s))
+  if (!picked.length) {
     notify('先勾选「将改」。取消勾选即可这次不动某一项')
+    return
+  }
+  if (!scoped.length) {
+    notify('价格、专利、物流是禁改区，三种范围都不改它们')
     return
   }
   if (targets().length && targets().every((s) => s.kind === 'slot')) {
@@ -100,51 +120,61 @@ export async function runWriteback(kind, editor, notify) {
   }
 
   const commandText = getSnapshot().commandText.trim()
+  const scope = getSnapshot().scope || 'inside'
   const texts = scoped.filter((s) => s.kind === 'text')
-  const images = scoped.filter((s) => s.kind === 'image')
-  const textIds = new Set(texts.map((s) => s.markId))
+  let images = scoped.filter((s) => s.kind === 'image')
+  if (scope === 'anchor') images = []
 
   if ((kind === 'rewrite' || kind === 'unify' || kind === 'replace') && !commandText) {
     notify('先在输入框写要改成什么样')
     return
   }
 
-  const pageHasImage = Boolean(editor.view.dom.querySelector('img[data-block-id]'))
-  if (
-    (kind === 'unify' || kind === 'replace') &&
-    texts.length &&
-    pageHasImage &&
-    !images.some(isTinyImageSpan)
-  ) {
-    const pack = window.confirm(
-      '图上也有旧名称，是否一并改？\n确定：接下来只圈包装/杯身上印着的字（不走物体分割），再点同一命令。已选的字会保留。\n取消：只改当前勾选的字和图。',
-    )
-    if (pack) {
-      armSkipObjectSnap()
-      notify('请尽量只圈包装上那几个字（不必按 Shift）。松手后会加很小一块 #I，再点同一命令')
-      return
-    }
+  const outside =
+    kind !== 'delete' && (scope === 'follow' || scope === 'anchor')
+      ? collectOutsideEdits(editor.view, commandText, scope)
+      : []
+  const seen = new Set(texts.map((s) => `${s.from}:${s.to}`))
+  const extraTexts = outside.filter((s) => !seen.has(`${s.from}:${s.to}`))
+  const allTexts = [...texts, ...extraTexts]
+
+  if (scope === 'follow' && !texts.length && !extraTexts.length) {
+    notify('跟随：请先圈一个要改的词（例如标题里的品名），再写要求、点统一风格')
+    return
   }
-  if (kind === 'delete' && images.length) {
+
+  if (kind === 'delete' && images.length && isClientModelGateOn()) {
     const ok = window.confirm('删除会抹掉勾选范围内的字，并抹掉图上那一块（重画会消耗额度）。确定？')
     if (!ok) return
   }
 
-  const textCalls = kind === 'rewrite' || kind === 'unify' ? texts.length : 0
-  const imageCalls = images.length ? images.length : 0
-  const needsPaid =
-    textCalls > 0 ||
-    (imageCalls > 0 && (kind === 'rewrite' || kind === 'unify' || kind === 'delete' || kind === 'replace'))
+  const planned = allTexts.map((s) => ({ ...s }))
+  const wantTextModel = (kind === 'rewrite' || kind === 'unify') && planned.length > 0
+  const wantImage =
+    images.length > 0 && (kind === 'rewrite' || kind === 'unify' || kind === 'delete' || kind === 'replace')
+  const useTextModel = wantTextModel && isClientModelGateOn()
+  const useImageModel = wantImage && isClientModelGateOn()
+  const localText = planned.length > 0 && (kind === 'replace' || kind === 'delete' || !useTextModel)
+  const canDoSomething = localText || useTextModel || useImageModel || (kind === 'delete' && planned.length)
 
-  if (needsPaid && !isClientModelGateOn()) {
-    notify('未勾选「允许调用云端模型」。纯替换/删字不用额度；改写、统一风格、改图会消耗额度')
+  if (!planned.length && !images.length) {
+    notify(
+      scope === 'anchor'
+        ? '锚点：圈中不重画。说明里没有找到要改的矛盾色词。'
+        : '没有要改的字或图',
+    )
     return
   }
 
-  if (needsPaid) {
+  if (!canDoSomething && wantImage && !isClientModelGateOn()) {
+    notify('未开云端：图不会重画。请只勾字，或用「替换」改勾选的字')
+    return
+  }
+
+  if (useTextModel || useImageModel) {
     const parts = []
-    if (textCalls) parts.push(`改字 ${textCalls} 次`)
-    if (imageCalls) parts.push(`重画 ${imageCalls} 次`)
+    if (useTextModel) parts.push(`改字 ${planned.length} 次`)
+    if (useImageModel) parts.push(`重画 ${images.length} 次`)
     const ok = window.confirm(`将调用云端（${parts.join('，')}），会消耗额度。确定？`)
     if (!ok) return
   }
@@ -152,16 +182,15 @@ export async function runWriteback(kind, editor, notify) {
   running = true
   beginWriteUndo(editor)
   try {
-    const rewriteResults = new Map()
-    if (textCalls) {
-      for (const span of texts) {
+    if (useTextModel) {
+      for (const span of planned) {
         const data = await rewriteText(commandText, span.text)
-        rewriteResults.set(span.markId, data.text)
+        span.next = data.text
       }
     }
 
     const latest = new Map()
-    if (needsPaid && imageCalls) {
+    if (useImageModel) {
       const prompt = inpaintPrompt(kind, commandText)
       for (const span of images) {
         const img = editor.view.dom.querySelector(`img[data-block-id="${span.block_id}"]`)
@@ -177,10 +206,11 @@ export async function runWriteback(kind, editor, notify) {
       }
     }
 
-    if (kind === 'replace') applyTextFromEnd(editor, textIds, commandText)
-    else if (kind === 'delete') applyTextFromEnd(editor, textIds, '')
-    else if (textCalls) {
-      applyTextFromEnd(editor, textIds, (live) => rewriteResults.get(live.markId) || live.text)
+    if (kind === 'delete') applyTextSpans(editor, planned, '')
+    else if (useTextModel) {
+      applyTextSpans(editor, planned, (live) => live.next || live.text)
+    } else if (planned.length && (kind === 'replace' || kind === 'unify' || kind === 'rewrite')) {
+      applyTextSpans(editor, planned, (live) => localNextText(live, commandText, kind))
     }
 
     for (const [blockId, src] of latest) {
@@ -188,7 +218,20 @@ export async function runWriteback(kind, editor, notify) {
     }
 
     ping()
-    notify('已写回这一页。Ctrl+Z 可撤销')
+    const skippedImage = wantImage && !useImageModel
+    const extraNote = extraTexts.length
+      ? `圈外按${scope === 'follow' ? '跟随' : '锚点'}改了 ${extraTexts.length} 处（${previewOutside(extraTexts)}）。`
+      : ''
+    const skippedModel = wantTextModel && !useTextModel && planned.length
+    if (skippedImage && skippedModel) {
+      notify(`已按输入框改字（统一风格为本地：品名/色词分开写）。${extraNote}图未动。Ctrl+Z 可撤销`)
+    } else if (skippedImage) {
+      notify(`已改字。${extraNote}图未动（未开云端）。Ctrl+Z 可撤销`)
+    } else if (skippedModel) {
+      notify(`已按输入框改字（未开云端）。${extraNote}Ctrl+Z 可撤销`)
+    } else {
+      notify(`已写回这一页。${extraNote}Ctrl+Z 可撤销`)
+    }
   } catch (err) {
     undoLastWrite(editor)
     notify(gateMessage(err))

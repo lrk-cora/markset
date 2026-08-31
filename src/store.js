@@ -1,4 +1,5 @@
 import { aabb, clampBox, intersectBoxes, unionBoxes } from './geometry.js'
+import { tagFrozen } from './forbidden.js'
 import {
   clipMaskToRect,
   invertMask,
@@ -18,6 +19,7 @@ const state = {
   links: [],
   suggest: [],
   commandText: '',
+  scope: 'inside',
 }
 
 let insertUndo = null
@@ -62,6 +64,7 @@ export function getSnapshot() {
     links: [...state.links],
     suggest: state.suggest.map((s) => ({ ...s })),
     commandText: state.commandText,
+    scope: state.scope,
   }
 }
 
@@ -98,6 +101,7 @@ export function toSpec() {
       willEdit: span.willEdit !== false,
     })),
     links: [...state.links],
+    scope: state.scope,
   }
 }
 
@@ -109,7 +113,7 @@ export function setAnchors(anchorsById) {
 }
 
 export function replaceSpans(spans) {
-  state.spans = withMarks(spans.map((s) => ({ ...s, willEdit: true })))
+  state.spans = withMarks(tagFrozen(spans.map((s) => ({ ...s, willEdit: true }))))
   state.suggest = []
   emit()
 }
@@ -143,7 +147,7 @@ export function appendSpans(spans, doc) {
     }
     next.push({ ...incoming, willEdit: true })
   }
-  state.spans = withMarks(next)
+  state.spans = withMarks(tagFrozen(next))
   state.suggest = []
   emit()
 }
@@ -154,9 +158,30 @@ export function removeMark(markId) {
 }
 
 export function toggleWillEdit(markId) {
-  state.spans = state.spans.map((s) =>
-    s.markId === markId ? { ...s, willEdit: s.willEdit === false } : s,
-  )
+  state.spans = state.spans.map((s) => {
+    if (s.markId !== markId) return s
+    if (s.frozen) return s
+    return { ...s, willEdit: s.willEdit === false }
+  })
+  emit()
+}
+
+export function setImagesWillEdit(on) {
+  let changed = false
+  state.spans = state.spans.map((span) => {
+    if (span.kind !== 'image') return span
+    const next = Boolean(on)
+    if (span.willEdit === next) return span
+    changed = true
+    return { ...span, willEdit: next }
+  })
+  if (changed) emit()
+}
+
+export function setScope(scope) {
+  if (!['inside', 'follow', 'anchor'].includes(scope)) return
+  if (state.scope === scope) return
+  state.scope = scope
   emit()
 }
 
