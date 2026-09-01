@@ -124,10 +124,33 @@ async function rewrite(env, payload) {
   return { text: textOut, model: rewriteModel }
 }
 
+function planSystem(task) {
+  if (task === 'guess') {
+    return 'Output JSON only: {"guess":"..."}. One short Chinese phrase for what the user wants the stroked/blue-boxed region to become (color, print, or object). No quotes or explanation.'
+  }
+  if (task === 'find-same') {
+    return 'Output JSON only: {"boxes":[{"x":0,"y":0,"w":0,"h":0}]}. Natural image pixels. List OTHER instances of the same object class as the currently marked blue boxes. Do not repeat already-marked boxes. Empty array if none.'
+  }
+  return [
+    'Output JSON only: {"ops":[{"id":"C1","scope":"in"|"out"|"untouched","target":"T1","tool":"llm_rewrite"|"image_inpaint"|"none","args":{}}]}.',
+    'inside: only in. follow: in plus out duplicates/aliases/print. anchor: untouched for selected images, out for contradicting color words. Never edit price or shipping.',
+    'llm_rewrite args {before,after,block_id,start,end}. image_inpaint args {prompt,print?,bbox?}.',
+    'Packaging print (box-side letters such as OAK CUP): image_inpaint with args.print true and args.bbox {x,y,w,h} in natural pixels of the printed letters, not the cup body.',
+  ].join(' ')
+}
+
 async function plan(env, payload) {
   const { plannerModel } = models(env)
-  const instruction = String(payload.instruction || '').trim()
+  const task = String(payload.task || 'ops')
+  const defaults = {
+    guess: '根据选中笔迹猜测用户想把这块改成什么，输出一句简短中文。',
+    'find-same': '找出图中与当前选中物体同类的其他物体，不要重复已圈的框。',
+  }
+  const instruction = String(payload.instruction || '').trim() || defaults[task] || ''
   const marks = String(payload.marks || '')
+  const pageText = String(payload.pageText || '')
+  const scope = String(payload.scope || 'inside')
+  const kind = String(payload.kind || 'unify')
   const imageUrl = payload.imageDataUrl || payload.image_url
   if (!instruction) {
     const err = new Error('missing instruction')
@@ -137,7 +160,17 @@ async function plan(env, payload) {
   const userContent = [
     {
       type: 'text',
-      text: `指令：${instruction}\n当前编号：${marks || '无'}\n只输出 JSON，不要其它文字。`,
+      text: [
+        `任务：${task}`,
+        `指令：${instruction}`,
+        `范围：${scope}`,
+        `按钮：${kind}`,
+        `当前编号：\n${marks || '无'}`,
+        pageText ? `全文（禁改：价格/物流/专利）：\n${pageText}` : '',
+        '只输出 JSON，不要其它文字。',
+      ]
+        .filter(Boolean)
+        .join('\n'),
     },
   ]
   if (imageUrl) {
@@ -147,15 +180,26 @@ async function plan(env, payload) {
     model: plannerModel,
     temperature: 0,
     messages: [
-      {
-        role: 'system',
-        content:
-          'Output JSON only: {"ops":[{"target":"T1","tool":"llm_rewrite","args":{"instruction":"..."}},{"target":"I2","tool":"image_inpaint","args":{"prompt":"..."}}]}',
-      },
+      { role: 'system', content: planSystem(task) },
       { role: 'user', content: userContent },
     ],
   })
-  return { text: textOut, model: plannerModel }
+  let ops = []
+  let boxes = []
+  let guess = ''
+  try {
+    const start = textOut.indexOf('{')
+    const end = textOut.lastIndexOf('}')
+    if (start >= 0 && end > start) {
+      const json = JSON.parse(textOut.slice(start, end + 1))
+      if (Array.isArray(json.ops)) ops = json.ops
+      if (Array.isArray(json.boxes)) boxes = json.boxes
+      if (json.guess) guess = String(json.guess)
+    }
+  } catch {
+    ops = []
+  }
+  return { text: textOut, ops, boxes, guess, model: plannerModel }
 }
 
 async function falRun(env, model, body) {

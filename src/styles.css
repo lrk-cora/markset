@@ -34,6 +34,11 @@ body.is-armed * {
   cursor: crosshair !important;
 }
 
+body.is-subtract.is-armed,
+body.is-subtract.is-armed * {
+  cursor: crosshair !important;
+}
+
 body.is-lassoing {
   user-select: none;
   touch-action: none;
@@ -42,15 +47,17 @@ body.is-lassoing {
 .app {
   height: 100%;
   display: grid;
-  grid-template-rows: 52px 1fr;
+  grid-template-rows: auto 1fr;
 }
 
 .topbar {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 16px;
-  padding: 0 20px;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  min-height: 52px;
+  padding: 8px 20px;
   border-bottom: 1px solid var(--line);
   background: color-mix(in srgb, var(--paper) 88%, white);
 }
@@ -75,6 +82,8 @@ body.is-lassoing {
 .top-actions {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
   gap: 12px;
 }
 
@@ -201,8 +210,11 @@ body.is-lassoing {
   pointer-events: auto;
 }
 
-.badge.is-off .tag {
-  background: #8a837a;
+.anchor-hint {
+  flex-basis: 100%;
+  font-size: 11px;
+  color: var(--muted);
+  line-height: 1.4;
 }
 
 .badge input[type='checkbox'] {
@@ -296,7 +308,7 @@ kbd {
 .stage {
   display: grid;
   place-items: center;
-  overflow: hidden;
+  overflow: auto;
   padding: 20px;
 }
 
@@ -487,10 +499,6 @@ kbd {
   cursor: pointer;
 }
 
-.page.is-page-b img {
-  filter: hue-rotate(165deg) saturate(0.92);
-}
-
 .suggest button {
   pointer-events: auto;
   margin: -10px 0 0 -4px;
@@ -564,6 +572,11 @@ kbd {
 .toolbar button.pen {
   min-width: 34px;
   padding: 0 8px;
+}
+
+.toolbar button.pen.is-on {
+  border-color: var(--blue);
+  background: var(--blue-soft);
 }
 
 .toast {

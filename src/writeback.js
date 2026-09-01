@@ -1,12 +1,22 @@
-import { inpaintImage, isClientModelGateOn, rewriteText } from './api.js'
+import { fetchHealth, inpaintImage, isClientModelGateOn, planOps, rewriteText } from './api.js'
+import { captureMarkedPage } from './capture.js'
 import { replaceRangeText, setImageSrcByBlockId } from './editor.js'
 import { isForbiddenSpan } from './forbidden.js'
+import { resolveInpaintResult } from './inpaint-result.js'
 import { maskToFalDataUrl, makeMask, paintMask, rectToPoly } from './mask.js'
-import { localNextText } from './plan-local.js'
 import {
-  collectOutsideEdits,
-  previewOutside,
-} from './scope.js'
+  attachSpansToOps,
+  buildLocalOps,
+  inpaintPromptFor,
+  parsePlanOps,
+  shouldCallPlanner,
+  textAfterFromOp,
+} from './ops.js'
+import { localPaintMasked } from './pending.js'
+import { exitToView } from './view-mode.js'
+import { inferAnchorFact, inferCommandText, parseCommand } from './plan-local.js'
+import { attachImageOpsFromBboxes, collectCupBody, collectPrintStandIn } from './print-region.js'
+import { collectOutsideEdits } from './scope.js'
 import {
   beginWriteUndo,
   getSnapshot,
@@ -25,47 +35,19 @@ function seedMask(span) {
   return canvas
 }
 
-function loadImage(src) {
-  return new Promise((resolve, reject) => {
-    const image = new Image()
-    image.onload = () => resolve(image)
-    image.onerror = () => reject(new Error('image load'))
-    image.src = src
-  })
-}
-
 async function elementToDataUrl(img) {
   if (img.src.startsWith('data:')) return img.src
-  const image = await loadImage(img.src)
+  const image = await new Promise((resolve, reject) => {
+    const el = new Image()
+    el.onload = () => resolve(el)
+    el.onerror = () => reject(new Error('image load'))
+    el.src = img.src
+  })
   const canvas = document.createElement('canvas')
   canvas.width = image.naturalWidth || image.width
   canvas.height = image.naturalHeight || image.height
   canvas.getContext('2d').drawImage(image, 0, 0)
   return canvas.toDataURL('image/jpeg', 0.92)
-}
-
-async function compositeMasked(originalUrl, resultUrl, maskCanvas) {
-  const orig = await loadImage(originalUrl)
-  const result = await loadImage(resultUrl)
-  const out = document.createElement('canvas')
-  out.width = orig.naturalWidth || orig.width
-  out.height = orig.naturalHeight || orig.height
-  const ctx = out.getContext('2d')
-  ctx.drawImage(orig, 0, 0)
-  const tmp = document.createElement('canvas')
-  tmp.width = out.width
-  tmp.height = out.height
-  const tctx = tmp.getContext('2d')
-  tctx.drawImage(result, 0, 0, out.width, out.height)
-  tctx.globalCompositeOperation = 'destination-in'
-  tctx.drawImage(maskCanvas, 0, 0, out.width, out.height)
-  ctx.drawImage(tmp, 0, 0)
-  return out.toDataURL('image/png')
-}
-
-function inpaintPrompt(kind, commandText) {
-  if (kind === 'delete') return 'remove the selected object and fill with plausible background'
-  return `Product photo. Apply only inside the masked region, keep everything else unchanged: ${commandText}`
 }
 
 function gateMessage(err) {
@@ -102,6 +84,40 @@ function applyTextSpans(editor, spans, nextText) {
   }
 }
 
+async function resolveOps(ctx) {
+  const local = buildLocalOps(ctx)
+  const wantPlan =
+    isClientModelGateOn() &&
+    shouldCallPlanner(ctx.kind, ctx.scope, ctx.inTexts, ctx.inImages)
+  if (!wantPlan) return { ops: local.ops, source: 'local' }
+  const health = await fetchHealth().catch(() => ({}))
+  if (!health.dashscope) return { ops: local.ops, source: 'local' }
+  try {
+    const shot = await captureMarkedPage(ctx.editor)
+    const data = await planOps({
+      task: 'ops',
+      instruction: ctx.commandText,
+      marks: shot.marks,
+      imageDataUrl: shot.imageDataUrl,
+      pageText: shot.pageText,
+      scope: ctx.scope,
+      kind: ctx.kind,
+    })
+    const parsed = Array.isArray(data.ops) && data.ops.length ? { ops: data.ops } : parsePlanOps(data.text)
+    const attached = parsed ? attachSpansToOps(parsed.ops, ctx) : []
+    const withBoxes = attachImageOpsFromBboxes(ctx.editor.view, attached).filter(
+      (op) => op.span || op.tool === 'none' || op.scope === 'untouched',
+    )
+    if (!withBoxes.length) return { ops: local.ops, source: 'local-fallback' }
+    return { ops: withBoxes, source: 'plan' }
+  } catch (err) {
+    if (err.code === 'client-gate' || err.code === 'calls_disabled' || err.code === 'no_client_gate') {
+      return { ops: local.ops, source: 'local' }
+    }
+    return { ops: local.ops, source: 'local-fallback' }
+  }
+}
+
 export async function runWriteback(kind, editor, notify) {
   if (running) return
   const picked = targets().filter((s) => s.kind !== 'slot')
@@ -119,55 +135,116 @@ export async function runWriteback(kind, editor, notify) {
     return
   }
 
-  const commandText = getSnapshot().commandText.trim()
-  const scope = getSnapshot().scope || 'inside'
+  const snap = getSnapshot()
+  const scope = snap.scope || 'inside'
   const texts = scoped.filter((s) => s.kind === 'text')
+  let commandText = inferCommandText(snap.commandText, texts)
   let images = scoped.filter((s) => s.kind === 'image')
   if (scope === 'anchor') images = []
 
-  if ((kind === 'rewrite' || kind === 'unify' || kind === 'replace') && !commandText) {
-    notify('先在输入框写要改成什么样')
+  const parsed = parseCommand(commandText)
+  const colorIntent = Boolean(parsed.color)
+  const productIntent = Boolean(parsed.product)
+
+  if (scope === 'inside' && kind !== 'delete') {
+    const next = []
+    if (colorIntent) {
+      const cup = collectCupBody(editor.view)
+      if (cup) next.push(cup)
+    }
+    if (productIntent) {
+      const print = collectPrintStandIn(editor.view)
+      if (print) next.push(print)
+    }
+    if (next.length) images = next
+  }
+
+  const fact = scope === 'anchor' ? inferAnchorFact(picked, commandText) : inferAnchorFact([], commandText)
+  const anchorNoType = scope === 'anchor' && (kind === 'unify' || kind === 'rewrite')
+  if ((kind === 'rewrite' || kind === 'unify' || kind === 'replace') && !commandText && !anchorNoType) {
+    notify('先在输入框写要改成什么样。圈了「红色」等色词也可直接点统一风格。')
     return
   }
 
-  const outside =
+  const extraTexts =
     kind !== 'delete' && (scope === 'follow' || scope === 'anchor')
       ? collectOutsideEdits(editor.view, commandText, scope)
       : []
-  const seen = new Set(texts.map((s) => `${s.from}:${s.to}`))
-  const extraTexts = outside.filter((s) => !seen.has(`${s.from}:${s.to}`))
-  const allTexts = [...texts, ...extraTexts]
 
   if (scope === 'follow' && !texts.length && !extraTexts.length) {
     notify('跟随：请先圈一个要改的词（例如标题里的品名），再写要求、点统一风格')
     return
   }
 
-  if (kind === 'delete' && images.length && isClientModelGateOn()) {
-    const ok = window.confirm('删除会抹掉勾选范围内的字，并抹掉图上那一块（重画会消耗额度）。确定？')
-    if (!ok) return
-  }
-
-  const planned = allTexts.map((s) => ({ ...s }))
-  const wantTextModel = (kind === 'rewrite' || kind === 'unify') && planned.length > 0
-  const wantImage =
-    images.length > 0 && (kind === 'rewrite' || kind === 'unify' || kind === 'delete' || kind === 'replace')
-  const useTextModel = wantTextModel && isClientModelGateOn()
-  const useImageModel = wantImage && isClientModelGateOn()
-  const localText = planned.length > 0 && (kind === 'replace' || kind === 'delete' || !useTextModel)
-  const canDoSomething = localText || useTextModel || useImageModel || (kind === 'delete' && planned.length)
-
-  if (!planned.length && !images.length) {
-    notify(
-      scope === 'anchor'
-        ? '锚点：圈中不重画。说明里没有找到要改的矛盾色词。'
-        : '没有要改的字或图',
-    )
+  if (scope === 'anchor' && !fact.color && !commandText) {
+    notify('锚点：请圈已经正确的杯身（或一句已对的色词）。不用填改法。')
     return
   }
 
-  if (!canDoSomething && wantImage && !isClientModelGateOn()) {
-    notify('未开云端：图不会重画。请只勾字，或用「替换」改勾选的字')
+  if (kind === 'delete' && scoped.some((s) => s.kind === 'image')) {
+    const ok = window.confirm('删除会抹掉勾选范围内的字，并抹掉图上那一块。确定？')
+    if (!ok) return
+  }
+
+  const printSpan =
+    kind !== 'delete' && (scope === 'follow' || productIntent) ? collectPrintStandIn(editor.view) : null
+  const cupSpan = kind !== 'delete' && (scope === 'follow' || colorIntent) ? collectCupBody(editor.view) : null
+  const ctx = {
+    editor,
+    kind,
+    commandText,
+    scope,
+    inTexts: texts,
+    inImages: scope === 'anchor' ? scoped.filter((s) => s.kind === 'image') : images,
+    extraTexts,
+    printSpan,
+    cupSpan,
+    fact,
+  }
+
+  running = true
+  try {
+    const planned = await resolveOps(ctx)
+    const ops = planned.ops
+
+    if (scope === 'anchor' && !extraTexts.length) {
+      notify('锚点：说明里没有找到和圈中不一致的色词。')
+      return
+    }
+
+    await commitInside(editor, ops, kind, commandText, notify, fact, scope)
+  } catch (err) {
+    notify(gateMessage(err))
+  } finally {
+    running = false
+  }
+}
+
+async function commitInside(editor, ops, kind, commandText, notify, fact = null, scope = 'inside') {
+  const textOps = ops.filter((op) => op.tool === 'llm_rewrite' && op.span?.kind === 'text')
+  const imageOps = ops.filter((op) => op.tool === 'image_inpaint' && op.span?.kind === 'image')
+  const planned = textOps.map((op) => ({ ...op.span, op }))
+  const images = imageOps.map((op) => ({ ...op.span, op }))
+
+  const wantTextModel = (kind === 'rewrite' || kind === 'unify') && planned.length > 0
+  const wantImage =
+    images.length > 0 && (kind === 'rewrite' || kind === 'unify' || kind === 'delete' || kind === 'replace')
+  const gateOn = isClientModelGateOn()
+  const health = gateOn && (wantTextModel || wantImage) ? await fetchHealth().catch(() => ({})) : {}
+  const useTextModel = wantTextModel && gateOn && Boolean(health.dashscope)
+  const useImageModel = wantImage && gateOn && Boolean(health.fal)
+  const localText = planned.length > 0 && (kind === 'replace' || kind === 'delete' || !useTextModel)
+  const localImage = wantImage && !useImageModel
+  const canDoSomething =
+    localText || useTextModel || useImageModel || localImage || (kind === 'delete' && planned.length)
+
+  if (!planned.length && !images.length) {
+    notify('没有要改的字或图')
+    return
+  }
+
+  if (!canDoSomething) {
+    notify('没有可执行的改动')
     return
   }
 
@@ -179,7 +256,6 @@ export async function runWriteback(kind, editor, notify) {
     if (!ok) return
   }
 
-  running = true
   beginWriteUndo(editor)
   try {
     if (useTextModel) {
@@ -191,18 +267,26 @@ export async function runWriteback(kind, editor, notify) {
 
     const latest = new Map()
     if (useImageModel) {
-      const prompt = inpaintPrompt(kind, commandText)
       for (const span of images) {
         const img = editor.view.dom.querySelector(`img[data-block-id="${span.block_id}"]`)
         if (!img) throw new Error('找不到原图')
         const imageDataUrl = latest.get(span.block_id) || (await elementToDataUrl(img))
         const mask = seedMask(span)
         const data = await inpaintImage({
-          prompt,
+          prompt: span.op?.args?.prompt || inpaintPromptFor(kind, commandText),
           imageDataUrl,
           maskDataUrl: maskToFalDataUrl(mask),
         })
-        latest.set(span.block_id, await compositeMasked(imageDataUrl, data.imageUrl, mask))
+        latest.set(span.block_id, await resolveInpaintResult(imageDataUrl, data.imageUrl, mask))
+      }
+    } else if (localImage) {
+      for (const span of images) {
+        const img = editor.view.dom.querySelector(`img[data-block-id="${span.block_id}"]`)
+        if (!img) throw new Error('找不到原图')
+        const imageDataUrl = latest.get(span.block_id) || (await elementToDataUrl(img))
+        const mask = seedMask(span)
+        const stamp = span.op?.args?.print ? parseCommand(commandText).product : null
+        latest.set(span.block_id, await localPaintMasked(imageDataUrl, mask, commandText, kind, stamp, fact))
       }
     }
 
@@ -210,7 +294,7 @@ export async function runWriteback(kind, editor, notify) {
     else if (useTextModel) {
       applyTextSpans(editor, planned, (live) => live.next || live.text)
     } else if (planned.length && (kind === 'replace' || kind === 'unify' || kind === 'rewrite')) {
-      applyTextSpans(editor, planned, (live) => localNextText(live, commandText, kind))
+      applyTextSpans(editor, planned, (live) => textAfterFromOp(live.op, live, commandText, kind, fact))
     }
 
     for (const [blockId, src] of latest) {
@@ -218,24 +302,18 @@ export async function runWriteback(kind, editor, notify) {
     }
 
     ping()
-    const skippedImage = wantImage && !useImageModel
-    const extraNote = extraTexts.length
-      ? `圈外按${scope === 'follow' ? '跟随' : '锚点'}改了 ${extraTexts.length} 处（${previewOutside(extraTexts)}）。`
-      : ''
+    exitToView()
     const skippedModel = wantTextModel && !useTextModel && planned.length
-    if (skippedImage && skippedModel) {
-      notify(`已按输入框改字（统一风格为本地：品名/色词分开写）。${extraNote}图未动。Ctrl+Z 可撤销`)
-    } else if (skippedImage) {
-      notify(`已改字。${extraNote}图未动（未开云端）。Ctrl+Z 可撤销`)
-    } else if (skippedModel) {
-      notify(`已按输入框改字（未开云端）。${extraNote}Ctrl+Z 可撤销`)
-    } else {
-      notify(`已写回这一页。${extraNote}Ctrl+Z 可撤销`)
-    }
+    const usedLocalImage = localImage && images.length
+    const head =
+      scope === 'follow' ? '跟随已写入' : scope === 'anchor' ? '锚点已写入（圈内未改）' : '仅圈内已写入'
+    const bits = [head]
+    if (skippedModel) bits.push('字按输入改')
+    if (usedLocalImage) bits.push('图为选区内调色（未调用 fal）')
+    bits.push('已结束圈选。点「套索」继续改，「撤回」撤销')
+    notify(bits.join('。'))
   } catch (err) {
     undoLastWrite(editor)
-    notify(gateMessage(err))
-  } finally {
-    running = false
+    throw err
   }
 }

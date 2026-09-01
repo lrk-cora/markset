@@ -47,6 +47,30 @@ export function paintMask(canvas, polygonNatural, mode) {
   ctx.restore()
 }
 
+/** Stroke along a path (color pen). White/opaque = region to inpaint. */
+export function paintStrokeMask(canvas, pointsNatural, width) {
+  if (!pointsNatural?.length) return
+  const ctx = canvas.getContext('2d')
+  ctx.clearRect(0, 0, canvas.width, canvas.height)
+  ctx.save()
+  ctx.strokeStyle = '#ffffff'
+  ctx.lineWidth = Math.max(8, width || 24)
+  ctx.lineCap = 'round'
+  ctx.lineJoin = 'round'
+  ctx.beginPath()
+  ctx.moveTo(pointsNatural[0].x, pointsNatural[0].y)
+  for (let i = 1; i < pointsNatural.length; i += 1) {
+    ctx.lineTo(pointsNatural[i].x, pointsNatural[i].y)
+  }
+  ctx.stroke()
+  ctx.restore()
+}
+
+export function strokeWidthFor(naturalSize) {
+  const m = Math.min(naturalSize?.w || 1, naturalSize?.h || 1)
+  return Math.max(18, Math.round(m * 0.035))
+}
+
 /** Flip selected ↔ unselected. White/opaque remains “selected”. */
 export function invertMask(canvas) {
   const ctx = canvas.getContext('2d')

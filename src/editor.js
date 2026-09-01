@@ -129,7 +129,8 @@ const SelectionHighlight = Extension.create({
         props: {
           decorations(pmState) {
             const decos = []
-            for (const span of getSnapshot().spans) {
+            const snap = getSnapshot()
+            for (const span of snap.spans) {
               if (span.kind !== 'text' || span.from == null || span.to == null) continue
               if (span.from >= span.to) continue
               if (span.to > pmState.doc.content.size) continue
@@ -147,8 +148,28 @@ const SelectionHighlight = Extension.create({
   },
 })
 
-function cupSrc() {
-  return `${import.meta.env.BASE_URL}cup.jpg`
+export const DEMO_CUP = {
+  a: {
+    file: 'cup-a.png',
+    cup: { xRel: 0.05, yRel: 0.16, wRel: 0.52, hRel: 0.70 },
+    print: { xRel: 0.12, yRel: 0.38, wRel: 0.36, hRel: 0.24 },
+  },
+  b: {
+    file: 'cup-b.png',
+    cup: { xRel: 0.05, yRel: 0.14, wRel: 0.52, hRel: 0.72 },
+    print: { xRel: 0.10, yRel: 0.40, wRel: 0.38, hRel: 0.22 },
+  },
+}
+
+let currentDemoPage = 'a'
+
+export function getDemoPage() {
+  return currentDemoPage
+}
+
+function cupSrc(pageId = 'a') {
+  const file = DEMO_CUP[pageId]?.file || DEMO_CUP.a.file
+  return `${import.meta.env.BASE_URL}${file}?v=on-cup`
 }
 
 function para(blockId, text) {
@@ -160,7 +181,7 @@ function para(blockId, text) {
 }
 
 export function demoDoc(pageId = 'a') {
-  const src = cupSrc()
+  const src = cupSrc(pageId)
   const heading = {
     type: 'heading',
     attrs: { level: 1, blockId: 'h-1' },
@@ -170,7 +191,7 @@ export function demoDoc(pageId = 'a') {
     type: 'image',
     attrs: {
       src,
-      alt: pageId === 'b' ? '杯身已是雾蓝的杯子（演示，锚点时不要重画）' : '原木杯，盒侧面印着 OAK CUP，带杯盖，置于木桌边',
+      alt: pageId === 'b' ? '雾蓝杯身，杯面印着原木杯（演示，锚点时不要重画杯子）' : '原木杯，杯面印着原木杯，带杯盖，置于木桌边',
       blockId: 'img-1',
       width: 360,
       height: 360,
@@ -207,7 +228,7 @@ export function demoDoc(pageId = 'a') {
       ),
       para('p-spec', '规格：原木杯 / 暖茶 / 280ml'),
       image,
-      para('p-print', '盒侧印字：OAK CUP'),
+      para('p-print', '杯身印字：原木杯'),
       price,
       ship,
     ],
@@ -215,15 +236,15 @@ export function demoDoc(pageId = 'a') {
 }
 
 export const DEMO_KICKER = {
-  a: '演示页 A · 任务 1 / 2 · 标题、正文、规格都有「原木杯」',
-  b: '演示页 B · 任务 3 · 杯身已是雾蓝，说明仍写红色 / 原木',
+  a: '演示页 A · 任务 1 / 2 · 文案和图上杯身都有「原木杯」',
+  b: '演示页 B · 任务 3 · 杯身已是雾蓝且印着原木杯，说明仍写红色 / 原木',
 }
 
 export function applyDemoPage(editor, pageId = 'a') {
-  editor.commands.setContent(demoDoc(pageId))
+  currentDemoPage = pageId === 'b' ? 'b' : 'a'
+  editor.commands.setContent(demoDoc(currentDemoPage))
   const kicker = document.getElementById('page-kicker')
-  if (kicker) kicker.textContent = DEMO_KICKER[pageId] || DEMO_KICKER.a
-  document.querySelector('.page')?.classList.toggle('is-page-b', pageId === 'b')
+  if (kicker) kicker.textContent = DEMO_KICKER[currentDemoPage] || DEMO_KICKER.a
 }
 
 export function createEditor(element) {

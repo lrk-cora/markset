@@ -12,10 +12,13 @@ import {
   isTinyImageSpan,
   looksLikePriceBleed,
 } from './hit-test.js'
-import { bindLasso, isLassoMode, isSubtractMode, setLassoMode, setSubtractMode } from './overlay.js'
+import { bindLasso, isAddMode, isColorMode, isLassoMode, isSubtractMode, setLassoMode, setSubtractMode } from './overlay.js'
 import { applyScopeAfterSelect, describeScopeResult } from './scope.js'
+import { guessStrokePrompt } from './vision-tasks.js'
+import { exitToView } from './view-mode.js'
 import {
   appendSpans,
+  applyImageStroke,
   clearAll,
   coversTextPos,
   eraseImageSpan,
@@ -25,9 +28,11 @@ import {
   replaceSpans,
   subscribe,
   undoLastInsert,
+  unionImageSpan,
 } from './store.js'
 
 const editor = createEditor(document.getElementById('editor'))
+applyDemoPage(editor, 'a')
 
 subscribe(() => {
   refreshDecorations(editor)
@@ -36,9 +41,9 @@ subscribe(() => {
 })
 
 bindChromeKeys(editor)
-renderChrome(editor)
 setLassoMode(true)
 forceModelsOff()
+renderChrome(editor)
 
 function forceModelsOff() {
   setClientModelGate(false)
@@ -118,7 +123,7 @@ document.getElementById('btn-api')?.addEventListener('click', async () => {
 })
 
 document.getElementById('btn-lasso')?.addEventListener('click', () => {
-  if (isSubtractMode()) setSubtractMode(false)
+  if (isSubtractMode() || isAddMode() || isColorMode()) setLassoMode(true)
   else setLassoMode(!isLassoMode())
 })
 document.getElementById('btn-subtract')?.addEventListener('click', () => {
@@ -143,10 +148,10 @@ function hintAfterSelect(spans, result) {
   if (bits.length) toast(bits.join('。'), 4800)
 }
 
-function applyHits(textHits, imageHits, polygon, { append, subtract }) {
+function applyHits(textHits, imageHits, polygon, { append, subtract, add, color }) {
   const suggests = [...textHits.suggest]
-  const imgs = [...imageHits.found, ...((append || subtract) ? imageHits.suggest : [])]
-  if (!append && !subtract) suggests.push(...imageHits.suggest)
+  const imgs = [...imageHits.found, ...((append || subtract || add || color) ? imageHits.suggest : [])]
+  if (!append && !subtract && !add && !color) suggests.push(...imageHits.suggest)
 
   if (subtract) {
     let did = false
@@ -155,6 +160,33 @@ function applyHits(textHits, imageHits, polygon, { append, subtract }) {
     }
     if (eraseSlots(polygon)) did = true
     toast(did ? '已圈掉不要的部分' : '先圈要留的，再按住 Alt 圈不要的（桌边、空隙）。不要点 ×')
+    return
+  }
+
+  if (color) {
+    let did = false
+    for (const img of imgs) {
+      if (applyImageStroke(img, polygon)) did = true
+    }
+    toast(did ? '已记下笔迹范围。写要求后点统一风格（未开云端则本地调色）' : '色笔请涂在图上')
+    if (did) {
+      finishSelect(suggests)
+      guessStrokePrompt(editor, toast)
+    }
+    return
+  }
+
+  if (add) {
+    let did = false
+    for (const img of imgs) {
+      if (unionImageSpan(img, polygon)) did = true
+      else {
+        appendSpans([img], editor.view.state.doc)
+        did = true
+      }
+    }
+    toast(did ? '已扩大图上选区' : '加笔请圈在图上。也可先圈一块再加')
+    if (did) finishSelect(suggests)
     return
   }
 
@@ -207,19 +239,21 @@ bindLasso({
   onBegin() {
     ignoreClickUntil = Number.POSITIVE_INFINITY
   },
-  onFinish(polygon, { shift, subtract }) {
+  onFinish(polygon, { shift, subtract, add, color }) {
     ignoreClickUntil = performance.now() + 400
     const textHits = hitText(editor.view, polygon, { skipCovered: shift && !subtract })
     const imageHits = hitImages(editor.view, polygon)
     const hasImage = imageHits.found.length + imageHits.suggest.length > 0
     const apply = (images) =>
       applyHits(textHits, images, polygon, {
-        append: (shift && !subtract) || (peekPackagingHint() && hasImage),
+        append: (shift && !subtract && !add && !color) || (peekPackagingHint() && hasImage),
         subtract,
+        add,
+        color,
       })
     const skipSnap = peekSkipObjectSnap() && hasImage
     const hasBig = [...imageHits.found, ...imageHits.suggest].some((s) => !isTinyImageSpan(s))
-    if (subtract || skipSnap || !canSnap() || !hasBig) {
+    if (subtract || add || color || skipSnap || !canSnap() || !hasBig) {
       if (skipSnap) consumeSkipObjectSnap()
       apply(imageHits)
       return
@@ -231,6 +265,10 @@ bindLasso({
   },
 })
 
+function isDrawing() {
+  return isLassoMode() || isSubtractMode() || isAddMode() || isColorMode()
+}
+
 window.addEventListener(
   'click',
   (e) => {
@@ -239,9 +277,21 @@ window.addEventListener(
       return
     }
     const target = e.target instanceof Element ? e.target : e.target.parentElement
-    if (target?.closest('.chrome-layer, .inspector, .topbar, .suggest')) return
+    if (target?.closest('.chrome-layer, .inspector, .topbar, .suggest, .toolbar')) return
+
+    const hasSpans = getSnapshot().spans.length > 0
+    if (!isDrawing() && !hasSpans) return
 
     const image = hitImageAt(editor.view, e.clientX, e.clientY)
+    const word = image ? null : hitWordAt(editor.view, e.clientX, e.clientY)
+    if (!image && !word) {
+      if (!hasSpans) return
+      e.preventDefault()
+      exitToView()
+      toast('已结束编辑。这是改后的页面。点「套索」可继续改，「撤回」可撤销')
+      return
+    }
+
     if (image) {
       e.preventDefault()
       const subtract = isSubtractMode() || e.altKey || e.ctrlKey
@@ -272,15 +322,10 @@ window.addEventListener(
       return
     }
 
-    const word = hitWordAt(editor.view, e.clientX, e.clientY)
     if (word) {
       e.preventDefault()
-      if (e.shiftKey) {
-        if (coversTextPos(word.from)) return
-        appendSpans([word], editor.view.state.doc)
-      } else {
-        replaceSpans([word])
-      }
+      if (coversTextPos(word.from)) return
+      appendSpans([word], editor.view.state.doc)
       hintAfterSelect([word], finishSelect())
     }
   },

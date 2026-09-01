@@ -11,9 +11,17 @@ import {
   maskBounds,
   naturalBoxToScreen,
   paintMask,
+  rectToPoly,
   screenPolyToNatural,
 } from './mask.js'
-import { COLOR_TERMS, FORBIDDEN_RE, PRODUCT_ALIASES, RELATED_TERMS, isForbiddenSpan } from './forbidden.js'
+import {
+  COLOR_TERMS,
+  FORBIDDEN_RE,
+  PRODUCT_ALIASES,
+  RELATED_TERMS,
+  contradictionNeedles,
+  isForbiddenSpan,
+} from './forbidden.js'
 import { coversTextPos, getSnapshot } from './store.js'
 
 const SMALL_AREA = 24 * 24
@@ -242,10 +250,10 @@ export function collectAliasSuggests(view) {
   return uniqueSuggests(hits)
 }
 
-export function collectContradictionSuggests(view) {
+export function collectContradictionSuggests(view, fact = null) {
   const occupied = getSnapshot().spans.filter((s) => s.kind === 'text')
   const hits = []
-  for (const term of COLOR_TERMS) {
+  for (const term of contradictionNeedles(fact)) {
     hits.push(
       ...findSameText(view, term, occupied)
         .filter((s) => s.block_id !== 'p-note')
@@ -291,6 +299,82 @@ export function imageSpanFromPolygon(img, polygon) {
     naturalSize,
     mode: 'region',
     polygon,
+  }
+}
+
+export function normalizeVisionBox(raw, naturalSize) {
+  if (!raw || typeof raw !== 'object') return null
+  const nw = naturalSize?.w || 1
+  const nh = naturalSize?.h || 1
+  let x
+  let y
+  let w
+  let h
+  if (raw.xRel != null || raw.x_rel != null) {
+    x = Number(raw.xRel ?? raw.x_rel) * nw
+    y = Number(raw.yRel ?? raw.y_rel) * nh
+    w = Number(raw.wRel ?? raw.w_rel) * nw
+    h = Number(raw.hRel ?? raw.h_rel) * nh
+  } else if (raw.x_min != null) {
+    x = Number(raw.x_min)
+    y = Number(raw.y_min)
+    w = Number(raw.x_max) - x
+    h = Number(raw.y_max) - y
+  } else if (raw.x != null && raw.w != null) {
+    x = Number(raw.x)
+    y = Number(raw.y)
+    w = Number(raw.w)
+    h = Number(raw.h)
+    if (x <= 1 && y <= 1 && w <= 1 && h <= 1 && x + w <= 1.05) {
+      x *= nw
+      y *= nh
+      w *= nw
+      h *= nh
+    } else if (x + w > nw * 1.2 && x + w <= 1000.5) {
+      x = (x / 1000) * nw
+      y = (y / 1000) * nh
+      w = (w / 1000) * nw
+      h = (h / 1000) * nh
+    }
+  } else {
+    return null
+  }
+  if (!(w > 8 && h > 8)) return null
+  return {
+    x: Math.max(0, Math.round(x)),
+    y: Math.max(0, Math.round(y)),
+    w: Math.round(w),
+    h: Math.round(h),
+  }
+}
+
+export function imageSpanFromNaturalBox(img, bbox, extra = {}) {
+  if (!img || !bbox) return null
+  const br = img.getBoundingClientRect()
+  const imageRect = { x: br.left, y: br.top, w: br.width, h: br.height }
+  const nw = img.naturalWidth || Number(img.getAttribute('width')) || br.width
+  const nh = img.naturalHeight || Number(img.getAttribute('height')) || br.height
+  const naturalSize = { w: nw, h: nh }
+  const box = normalizeVisionBox(bbox, naturalSize) || {
+    x: Math.round(bbox.x),
+    y: Math.round(bbox.y),
+    w: Math.round(bbox.w),
+    h: Math.round(bbox.h),
+  }
+  if (!(box.w > 4 && box.h > 4)) return null
+  const canvas = makeMask(naturalSize)
+  paintMask(canvas, rectToPoly(box), 'replace')
+  return {
+    kind: 'image',
+    block_id: img.getAttribute('data-block-id'),
+    maskCanvas: canvas,
+    mask: { ...box },
+    bbox: box,
+    screenRect: naturalBoxToScreen(box, imageRect, naturalSize),
+    imageRect,
+    naturalSize,
+    mode: extra.mode || 'region',
+    printStandIn: Boolean(extra.printStandIn),
   }
 }
 

@@ -7,40 +7,60 @@ import {
   maskBounds,
   naturalBoxToScreen,
   paintMask,
+  paintStrokeMask,
   rectToPoly,
   screenBoxToNatural,
   screenPolyToNatural,
+  strokeWidthFor,
 } from './mask.js'
 
 const listeners = new Set()
 
 const state = {
   spans: [],
-  links: [],
   suggest: [],
   commandText: '',
   scope: 'inside',
 }
 
+let markSeq = 0
 let insertUndo = null
 let writeUndo = null
 
+function prefixOf(span) {
+  if (span.kind === 'text') return 'T'
+  if (span.kind === 'slot') return 'S'
+  return 'I'
+}
+
 function nextMarkId(prefix, used) {
-  let n = 1
-  while (used.has(`${prefix}${n}`)) n += 1
-  return `${prefix}${n}`
+  markSeq += 1
+  let id = `${prefix}${markSeq}`
+  while (used.has(id)) {
+    markSeq += 1
+    id = `${prefix}${markSeq}`
+  }
+  return id
 }
 
 function emit() {
   for (const fn of listeners) fn(getSnapshot())
 }
 
-function withMarks(spans) {
+function withMarks(spans, { reset = false } = {}) {
+  if (reset) markSeq = 0
   const used = new Set()
   return spans.map((span) => {
-    const prefix = span.kind === 'text' ? 'T' : span.kind === 'slot' ? 'S' : 'I'
+    const prefix = prefixOf(span)
     let markId = span.markId
-    if (!markId || used.has(markId) || markId[0] !== prefix) {
+    const keep =
+      markId &&
+      !used.has(markId) &&
+      markId[0] === prefix &&
+      /^\d+$/.test(markId.slice(1))
+    if (keep) {
+      markSeq = Math.max(markSeq, Number(markId.slice(1)))
+    } else {
       markId = nextMarkId(prefix, used)
     }
     used.add(markId)
@@ -61,7 +81,6 @@ export function subscribe(fn) {
 export function getSnapshot() {
   return {
     spans: state.spans.map((s) => ({ ...s })),
-    links: [...state.links],
     suggest: state.suggest.map((s) => ({ ...s })),
     commandText: state.commandText,
     scope: state.scope,
@@ -100,7 +119,6 @@ export function toSpec() {
       anchor: span.anchor ? { ...span.anchor } : null,
       willEdit: span.willEdit !== false,
     })),
-    links: [...state.links],
     scope: state.scope,
   }
 }
@@ -113,7 +131,10 @@ export function setAnchors(anchorsById) {
 }
 
 export function replaceSpans(spans) {
-  state.spans = withMarks(tagFrozen(spans.map((s) => ({ ...s, willEdit: true }))))
+  state.spans = withMarks(
+    tagFrozen(spans.map((s) => ({ ...s, willEdit: true }))),
+    { reset: true },
+  )
   state.suggest = []
   emit()
 }
@@ -153,7 +174,7 @@ export function appendSpans(spans, doc) {
 }
 
 export function removeMark(markId) {
-  state.spans = withMarks(state.spans.filter((s) => s.markId !== markId))
+  state.spans = state.spans.filter((s) => s.markId !== markId)
   emit()
 }
 
@@ -231,8 +252,8 @@ export function undoLastInsert(editor) {
   return true
 }
 
-export function beginWriteUndo(editor) {
-  writeUndo = {
+export function beginWriteUndo(editor, baseline) {
+  writeUndo = baseline || {
     json: editor.getJSON(),
     spans: state.spans.map((s) => ({ ...s })),
     commandText: state.commandText,
@@ -360,10 +381,22 @@ export function setCommandText(text) {
   state.commandText = text
 }
 
+export function replaceCommandText(text) {
+  state.commandText = String(text || '')
+  emit()
+}
+
 export function clearAll() {
   state.spans = []
-  state.links = []
   state.suggest = []
+  markSeq = 0
+  emit()
+}
+
+export function clearSelection() {
+  state.spans = []
+  state.suggest = []
+  markSeq = 0
   emit()
 }
 
@@ -459,6 +492,31 @@ export function applyImagePolygon(hit, polygon, mode) {
     return true
   }
   state.spans[i] = synced
+  emit()
+  return true
+}
+
+export function applyImageStroke(hit, polygon) {
+  if (!hit || !polygon?.length || !hit.imageRect || !hit.naturalSize) return false
+  const polyN = screenPolyToNatural(polygon, hit.imageRect, hit.naturalSize)
+  const canvas = makeMask(hit.naturalSize)
+  paintStrokeMask(canvas, polyN, strokeWidthFor(hit.naturalSize))
+  const syncedBase = {
+    ...hit,
+    kind: 'image',
+    willEdit: true,
+    mode: 'stroke',
+  }
+  const i = findImageIndex(hit.block_id)
+  const cur = i >= 0 ? state.spans[i] : syncedBase
+  const next = syncImageFromMask(cur, canvas)
+  if (!next) return false
+  const painted = { ...next, mode: 'stroke', willEdit: i >= 0 ? cur.willEdit : true }
+  if (i >= 0) {
+    state.spans[i] = { ...painted, markId: cur.markId }
+  } else {
+    state.spans = withMarks([...state.spans, painted])
+  }
   emit()
   return true
 }

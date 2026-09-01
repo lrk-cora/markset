@@ -47,3 +47,7 @@ export function inpaintImage({ prompt, imageDataUrl, maskDataUrl }) {
 export function segmentImage({ imageDataUrl, box, points }) {
   return post('/api/sam', { imageDataUrl, box, points })
 }
+
+export function planOps(payload) {
+  return post('/api/plan', payload)
+}

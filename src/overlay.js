@@ -1,10 +1,13 @@
 import { normalizeLasso, pathLength } from './geometry.js'
+import { ping } from './store.js'
 
 const MIN_PATH = 28
 const START_MOVE = 8
 
 let lassoMode = false
 let subtractMode = false
+let addMode = false
+let colorMode = false
 
 export function isLassoMode() {
   return lassoMode
@@ -14,13 +17,23 @@ export function isSubtractMode() {
   return subtractMode
 }
 
+export function isAddMode() {
+  return addMode
+}
+
+export function isColorMode() {
+  return colorMode
+}
+
 function syncButtons() {
   document.body.classList.toggle('is-armed', lassoMode)
   document.body.classList.toggle('is-subtract', subtractMode)
+  document.body.classList.toggle('is-add', addMode)
+  document.body.classList.toggle('is-color', colorMode)
   const lasso = document.getElementById('btn-lasso')
   if (lasso) {
-    lasso.setAttribute('aria-pressed', String(lassoMode))
-    lasso.classList.toggle('is-on', lassoMode)
+    lasso.setAttribute('aria-pressed', String(lassoMode && !subtractMode && !addMode && !colorMode))
+    lasso.classList.toggle('is-on', lassoMode && !subtractMode && !addMode && !colorMode)
   }
   const sub = document.getElementById('btn-subtract')
   if (sub) {
@@ -31,14 +44,59 @@ function syncButtons() {
 
 export function setLassoMode(on) {
   lassoMode = Boolean(on)
-  if (lassoMode) subtractMode = false
+  if (lassoMode) {
+    subtractMode = false
+    addMode = false
+    colorMode = false
+  } else {
+    subtractMode = false
+    addMode = false
+    colorMode = false
+  }
   syncButtons()
+  ping()
+}
+
+export function disarmDrawing() {
+  lassoMode = false
+  subtractMode = false
+  addMode = false
+  colorMode = false
+  syncButtons()
+  ping()
 }
 
 export function setSubtractMode(on) {
   subtractMode = Boolean(on)
-  if (subtractMode) lassoMode = true
+  if (subtractMode) {
+    lassoMode = true
+    addMode = false
+    colorMode = false
+  }
   syncButtons()
+  ping()
+}
+
+export function setAddMode(on) {
+  addMode = Boolean(on)
+  if (addMode) {
+    lassoMode = true
+    subtractMode = false
+    colorMode = false
+  }
+  syncButtons()
+  ping()
+}
+
+export function setColorMode(on) {
+  colorMode = Boolean(on)
+  if (colorMode) {
+    lassoMode = true
+    subtractMode = false
+    addMode = false
+  }
+  syncButtons()
+  ping()
 }
 
 function uiTarget(e) {
@@ -71,8 +129,14 @@ export function bindLasso({ onBegin, onMove, onFinish, onCancel }) {
   function draw(pts, closed) {
     if (!pts.length) return
     const erase = subtractHeld || subtractMode
-    const color = erase ? '#b44532' : '#3c6fd4'
-    const fill = erase ? 'rgba(180, 70, 50, 0.12)' : 'rgba(60, 111, 212, 0.08)'
+    const color = erase ? '#b44532' : colorMode ? '#7b4cc4' : addMode || shiftHeld ? '#2f8f5b' : '#3c6fd4'
+    const fill = erase
+      ? 'rgba(180, 70, 50, 0.12)'
+      : colorMode
+        ? 'rgba(123, 76, 196, 0.12)'
+        : addMode || shiftHeld
+          ? 'rgba(47, 143, 91, 0.10)'
+          : 'rgba(60, 111, 212, 0.08)'
     if (!poly) {
       poly = document.createElementNS('http://www.w3.org/2000/svg', 'polygon')
       poly.setAttribute('stroke-width', '1.5')
@@ -126,12 +190,14 @@ export function bindLasso({ onBegin, onMove, onFinish, onCancel }) {
     onFinish?.(polygon, {
       shift: shiftHeld && !subtractHeld,
       subtract: subtractHeld,
+      add: addMode && !subtractHeld,
+      color: colorMode && !subtractHeld,
     })
   }
 
   function onPointerDown(e) {
     if (e.button !== 0 || uiTarget(e)) return
-    if (!e.altKey && !lassoMode && !subtractMode) return
+    if (!e.altKey && !lassoMode && !subtractMode && !addMode && !colorMode) return
     e.preventDefault()
     e.stopPropagation()
     armed = true

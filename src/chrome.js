@@ -1,8 +1,11 @@
 import { insertImageAt, insertParagraphAt, newBlockId, pageRelativeRect } from './editor.js'
 import { blockRange } from './hit-test.js'
 import { tintedMaskCanvas } from './mask.js'
-import { setSubtractMode } from './overlay.js'
+import { isAddMode, isColorMode, isLassoMode, isSubtractMode, setAddMode, setColorMode, setSubtractMode } from './overlay.js'
 import { applyScopeAfterSelect, visibleSuggests } from './scope.js'
+import { snapExistingMark } from './contour.js'
+import { findSame as runFindSame } from './vision-tasks.js'
+import { runWriteback } from './writeback.js'
 import {
   appendSpans,
   beginInsertUndo,
@@ -12,6 +15,7 @@ import {
   getSnapshot,
   hasImage,
   hasSlot,
+  ping,
   refreshImageLayout,
   removeMark,
   setAnchors,
@@ -25,8 +29,6 @@ import {
   updateTextRange,
   toSpec,
 } from './store.js'
-import { snapExistingMark } from './contour.js'
-import { runWriteback } from './writeback.js'
 
 const TOOLBAR_POS_KEY = 'markset-toolbar-pos'
 
@@ -338,7 +340,7 @@ function insertText(editor) {
     added: [span],
   })
   relayoutAfterInsert(editor)
-  toast('已插到你圈的位置。Ctrl+Z 可撤销')
+  toast('已插到你圈的位置。点「撤回」或 Ctrl+Z 可撤销')
 }
 
 function readDataUrl(file) {
@@ -410,7 +412,7 @@ function insertImage(editor) {
         doc: editor.view.state.doc,
       })
       relayoutAfterInsert(editor)
-      toast('已插到你圈的位置。Ctrl+Z 可撤销')
+      toast('已插到你圈的位置。点「撤回」或 Ctrl+Z 可撤销')
     } catch {
       toast('没能读入这张图')
     }
@@ -439,7 +441,9 @@ function renderList(editor) {
   if (!snap.spans.length) {
     const empty = document.createElement('li')
     empty.className = 'muted'
-    empty.textContent = '还没有选中。套索圈字、图，或页上空白。'
+    empty.textContent = isLassoMode()
+      ? '还没有选中。套索圈字、图，或页上空白。'
+      : '这是改后的页面。点顶栏「套索」继续改，「撤回」撤销上次。'
     list.append(empty)
   } else {
     for (const span of snap.spans) {
@@ -470,13 +474,12 @@ function renderList(editor) {
   if (!suggests.length) {
     const empty = document.createElement('li')
     empty.className = 'muted'
-    empty.textContent =
-      snap.scope === 'inside'
+    empty.textContent = snap.scope === 'inside'
         ? '仅圈内：提交时只改圈中的。要改别处相同品名请用「跟随」。'
         : snap.scope === 'follow'
           ? '跟随不预先圈选圈外。点选一个词、写要求，再点统一风格，系统再改相同品名和印字。'
           : snap.scope === 'anchor'
-            ? '锚点不预先圈选矛盾句。圈中当作已对，点统一风格后才改正文色词，不重画圈中的图。'
+            ? '锚点不用填改法。圈已经对的杯身，点「对齐圈中」：圈内不重画，圈外矛盾色词直接改掉。'
             : '圈字时若只碰到一两个字，会出现在这里，点一下可补进选中。'
     suggestBox.append(empty)
     return
@@ -613,8 +616,8 @@ export function renderChrome(editor) {
         id === 'inside'
           ? '只改圈中的。圈外不动。'
           : id === 'follow'
-            ? '先圈一个词并写要求。提交时才按输入改圈外相同品名、印字；要求里带颜色才改色词。'
-            : '圈中当作已对，图不重画。提交时才改正文里矛盾的色词。'
+            ? '先圈一个词并写要求。提交后圈内和圈外相同品名一并写入。'
+            : '圈中当作已对，不用填改法。点「对齐圈中」后圈外矛盾处直接改掉。'
       btn.addEventListener('click', (e) => {
         e.stopPropagation()
         setScope(id)
@@ -623,8 +626,8 @@ export function renderChrome(editor) {
           id === 'inside'
             ? '范围：仅圈内。提交时只改圈中的。'
             : id === 'follow'
-              ? '范围：跟随。圈一个词、写要求，点统一风格后才改圈外相同品名。'
-              : '范围：锚点。圈中不重画；点统一风格后才改正文矛盾处。',
+              ? '范围：跟随。提交后圈内和圈外相同品名一并写入。'
+              : '范围：锚点。圈中已对、不用填改法。点「对齐圈中」即可。',
         )
       })
       scopeRow.append(btn)
@@ -634,35 +637,45 @@ export function renderChrome(editor) {
     const unify = document.createElement('button')
     unify.type = 'button'
     unify.className = 'primary'
-    unify.textContent = '统一风格'
+    unify.textContent = snap.scope === 'anchor' ? '对齐圈中' : '统一风格'
+    unify.title = snap.scope === 'anchor' ? '圈中当作已对，不用填输入框' : '按输入框改圈中的字和图'
     unify.addEventListener('click', (e) => {
       e.stopPropagation()
       runCommand('unify', editor)
     })
     bar.append(unify)
 
-    for (const [label, kind] of [
-      ['改写', 'rewrite'],
-      ['替换', 'replace'],
-      ['删除', 'delete'],
-    ]) {
-      const btn = document.createElement('button')
-      btn.type = 'button'
-      btn.textContent = label
-      btn.addEventListener('click', (e) => {
-        e.stopPropagation()
-        runCommand(kind, editor)
-      })
-      bar.append(btn)
+    if (snap.scope !== 'anchor') {
+      for (const [label, kind] of [
+        ['改写', 'rewrite'],
+        ['替换', 'replace'],
+        ['删除', 'delete'],
+      ]) {
+        const btn = document.createElement('button')
+        btn.type = 'button'
+        btn.textContent = label
+        btn.addEventListener('click', (e) => {
+          e.stopPropagation()
+          runCommand(kind, editor)
+        })
+        bar.append(btn)
+      }
     }
 
     const input = document.createElement('input')
     input.type = 'text'
     input.value = snap.commandText
-    input.placeholder = '产品名、颜色，如：海盐杯，雾蓝'
+    input.placeholder =
+      snap.scope === 'anchor' ? '可留空。若要指定颜色可写：雾蓝' : '产品名、颜色，如：海盐杯，雾蓝'
     input.addEventListener('input', () => setCommandText(input.value))
     input.addEventListener('pointerdown', (e) => e.stopPropagation())
     bar.append(input)
+    if (snap.scope === 'anchor') {
+      const hint = document.createElement('span')
+      hint.className = 'anchor-hint'
+      hint.textContent = '可留空：圈中杯子就是事实。只有要指定颜色时才填。'
+      bar.append(hint)
+    }
 
     if (hasSlot()) {
       const addText = document.createElement('button')
@@ -687,11 +700,11 @@ export function renderChrome(editor) {
     if (canUndoInsert()) {
       const undo = document.createElement('button')
       undo.type = 'button'
-      undo.textContent = '撤销插入'
-      undo.title = 'Ctrl+Z'
+      undo.textContent = '撤回'
+      undo.title = '撤回上次写入或插入（Ctrl+Z）'
       undo.addEventListener('click', (e) => {
         e.stopPropagation()
-        if (undoLastInsert(editor)) toast('已撤销插入')
+        if (undoLastInsert(editor)) toast('已撤回上次修改')
       })
       bar.append(undo)
     }
@@ -710,23 +723,59 @@ export function renderChrome(editor) {
       })
       bar.append(bg)
 
-      for (const [label, msg] of [
-        ['＋', '第 3 周接入加笔。现在可用 Shift + 再圈来扩大'],
+      const findSame = document.createElement('button')
+      findSame.type = 'button'
+      findSame.textContent = '查找相同'
+      findSame.title = '在图里找另一件相同的货。开云端后走规划 A；未开时请用 Shift 再圈'
+      findSame.addEventListener('click', (e) => {
+        e.stopPropagation()
+        runFindSame(editor, toast)
+      })
+      bar.append(findSame)
+
+      for (const [label, kind] of [
+        ['＋', 'add'],
         ['－', 'subtract'],
-        ['色', '第 3 周接入色笔'],
+        ['色', 'color'],
       ]) {
         const btn = document.createElement('button')
         btn.type = 'button'
         btn.className = 'pen'
         btn.textContent = label
+        if (kind === 'add') {
+          btn.classList.toggle('is-on', isAddMode())
+          btn.title = '加笔：再圈会并进当前图的选区'
+        } else if (kind === 'subtract') {
+          btn.classList.toggle('is-on', isSubtractMode())
+          btn.title = '减笔：从选区挖掉（也可用 Alt）'
+        } else {
+          btn.classList.toggle('is-on', isColorMode())
+          btn.title = '色笔：涂一笔，只这块会进重画范围'
+        }
         btn.addEventListener('click', (e) => {
           e.stopPropagation()
-          if (msg === 'subtract') {
-            setSubtractMode(true)
-            toast('减选已开：按住 Alt 再圈不要的部分（桌子、空隙），会从选区里挖掉。不要点 ×')
+          if (kind === 'subtract') {
+            const on = !isSubtractMode()
+            setSubtractMode(on)
+            ping()
+            toast(on ? '减选已开：再圈不要的部分（桌子、空隙），会从选区里挖掉。不要点 ×' : '已关闭减笔')
             return
           }
-          toast(msg)
+          if (kind === 'add') {
+            const on = !isAddMode()
+            setAddMode(on)
+            ping()
+            toast(on ? '加笔已开：再圈会并进当前图的选区' : '已关闭加笔')
+            return
+          }
+          const on = !isColorMode()
+          setColorMode(on)
+          ping()
+          toast(
+            on
+              ? '色笔已开：在图上涂一笔，只这块会进重画。未开云端时提交后本地调色'
+              : '已关闭色笔',
+          )
         })
         bar.append(btn)
       }
@@ -739,17 +788,27 @@ export function renderChrome(editor) {
   renderList(editor)
   inspector.textContent = JSON.stringify(toSpec(), null, 2)
   const undoTop = document.getElementById('btn-undo')
-  if (undoTop) undoTop.hidden = !canUndoInsert()
+  if (undoTop) {
+    undoTop.textContent = '撤回'
+    undoTop.title = '撤回上次写入或插入（Ctrl+Z）'
+    undoTop.hidden = !canUndoInsert()
+  }
 }
 
 export function bindChromeKeys(editor) {
+  document.getElementById('btn-undo')?.addEventListener('click', () => {
+    if (canUndoInsert() && undoLastInsert(editor)) toast('已撤回上次修改')
+  })
+
   window.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') clearAll()
+    if (e.key === 'Escape') {
+      clearAll()
+    }
     if ((e.ctrlKey || e.metaKey) && (e.key === 'z' || e.key === 'Z') && !e.shiftKey) {
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return
       if (canUndoInsert() && undoLastInsert(editor)) {
         e.preventDefault()
-        toast('已撤销插入')
+        toast('已撤回上次修改')
       }
     }
   })
