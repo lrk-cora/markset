@@ -59,8 +59,8 @@ export function applyScopeAfterSelect(view, extra = []) {
 
 export function describeScopeResult(_result, scope) {
   if (scope === 'inside') return '仅圈内：提交时只改圈中的，成功才写入。'
-  if (scope === 'follow') return '跟随：写要求后提交，圈内和圈外相同品名一并写入。'
-  if (scope === 'anchor') return '锚点：圈中当作已对，不用填改法。点「对齐圈中」后圈外矛盾处直接改掉。'
+  if (scope === 'follow') return '辐射式：写要求后提交，圈内和圈外相同品名一并写入。'
+  if (scope === 'anchor') return '锚定式：圈中当作已对，不用填改法。点「对齐圈中」后圈外矛盾处直接改掉。'
   return ''
 }
 

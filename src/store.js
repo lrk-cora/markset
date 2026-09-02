@@ -21,11 +21,14 @@ const state = {
   suggest: [],
   commandText: '',
   scope: 'inside',
+  changes: [],
+  changeActive: null,
 }
 
 let markSeq = 0
 let insertUndo = null
 let writeUndo = null
+let changeBaseline = null
 
 function prefixOf(span) {
   if (span.kind === 'text') return 'T'
@@ -84,6 +87,8 @@ export function getSnapshot() {
     suggest: state.suggest.map((s) => ({ ...s })),
     commandText: state.commandText,
     scope: state.scope,
+    changes: state.changes.map((c) => ({ ...c })),
+    changeActive: state.changeActive,
   }
 }
 
@@ -264,9 +269,21 @@ export function undoLastWrite(editor) {
   if (!writeUndo) return false
   const snapshot = writeUndo
   writeUndo = null
+  state.changes = []
+  state.changeActive = null
+  changeBaseline = null
   editor.commands.setContent(snapshot.json)
   state.spans = snapshot.spans.map((s) => ({ ...s }))
   state.commandText = snapshot.commandText
+  emit()
+  return true
+}
+
+export function restoreEditorFromBaseline(editor, baseline) {
+  if (!baseline) return false
+  editor.commands.setContent(baseline.json)
+  state.spans = (baseline.spans || []).map((s) => ({ ...s }))
+  if (baseline.commandText != null) state.commandText = baseline.commandText
   emit()
   return true
 }
@@ -275,9 +292,79 @@ export function remapAllTextSpans(mapping, doc) {
   state.spans = state.spans
     .map((span) => (span.kind === 'text' ? remapTextSpan(span, mapping, doc) : span))
     .filter(Boolean)
+  if (!state.changes.length) return
+  state.changes = state.changes.map((item) => {
+    if (item.kind !== 'text' || item.from == null || item.to == null) return item
+    const from = mapping.map(item.from, 1)
+    const to = mapping.map(item.to, -1)
+    return { ...item, from, to }
+  })
 }
 
 export function ping() {
+  emit()
+}
+
+export function captureWriteBaseline(editor) {
+  const imageSrcs = {}
+  editor.view.state.doc.descendants((node) => {
+    if (node.type.name === 'image' && node.attrs.blockId) {
+      imageSrcs[node.attrs.blockId] = node.attrs.src
+    }
+  })
+  return {
+    json: editor.getJSON(),
+    spans: state.spans.map((s) => ({ ...s })),
+    commandText: state.commandText,
+    imageSrcs,
+  }
+}
+
+export function hasChanges() {
+  return state.changes.length > 0
+}
+
+export function getChangeBaseline() {
+  return changeBaseline
+}
+
+export function setChanges(items, baseline) {
+  state.changes = (items || []).map((c) => ({ ...c, keep: c.keep !== false }))
+  state.changeActive = state.changes[0]?.id || null
+  changeBaseline = baseline || null
+  emit()
+}
+
+export function setChangeActive(id) {
+  if (state.changeActive === id) return
+  if (!state.changes.some((c) => c.id === id)) return
+  state.changeActive = id
+  emit()
+}
+
+export function patchChange(id, patch) {
+  let found = false
+  state.changes = state.changes.map((c) => {
+    if (c.id !== id) return c
+    found = true
+    return { ...c, ...patch }
+  })
+  if (found) emit()
+  return found
+}
+
+export function replaceChangeList(items) {
+  state.changes = items || []
+  if (!state.changes.some((c) => c.id === state.changeActive)) {
+    state.changeActive = state.changes[0]?.id || null
+  }
+  emit()
+}
+
+export function clearChanges() {
+  state.changes = []
+  state.changeActive = null
+  changeBaseline = null
   emit()
 }
 
@@ -389,6 +476,9 @@ export function replaceCommandText(text) {
 export function clearAll() {
   state.spans = []
   state.suggest = []
+  state.changes = []
+  state.changeActive = null
+  changeBaseline = null
   markSeq = 0
   emit()
 }

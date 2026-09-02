@@ -133,7 +133,7 @@ function planSystem(task) {
   }
   return [
     'Output JSON only: {"ops":[{"id":"C1","scope":"in"|"out"|"untouched","target":"T1","tool":"llm_rewrite"|"image_inpaint"|"none","args":{}}]}.',
-    'inside: only in. follow: in plus out duplicates/aliases/print. anchor: untouched for selected images, out for contradicting color words. Never edit price or shipping.',
+    'inside: only in. follow (辐射式): MUST rewrite every circled text AND every 圈外相同品名 listed below, even if those outside hits have no #T number. Do not stop at the lasso. anchor (锚定式): untouched for selected images, out for contradicting color words. Never edit price or shipping.',
     'llm_rewrite args {before,after,block_id,start,end}. image_inpaint args {prompt,print?,bbox?}.',
     'Packaging print (box-side letters such as OAK CUP): image_inpaint with args.print true and args.bbox {x,y,w,h} in natural pixels of the printed letters, not the cup body.',
   ].join(' ')
@@ -148,6 +148,7 @@ async function plan(env, payload) {
   }
   const instruction = String(payload.instruction || '').trim() || defaults[task] || ''
   const marks = String(payload.marks || '')
+  const outsideTexts = String(payload.outsideTexts || '')
   const pageText = String(payload.pageText || '')
   const scope = String(payload.scope || 'inside')
   const kind = String(payload.kind || 'unify')
@@ -166,6 +167,7 @@ async function plan(env, payload) {
         `范围：${scope}`,
         `按钮：${kind}`,
         `当前编号：\n${marks || '无'}`,
+        outsideTexts ? `圈外相同品名（辐射式必须改，不要只改圈内）：\n${outsideTexts}` : '',
         pageText ? `全文（禁改：价格/物流/专利）：\n${pageText}` : '',
         '只输出 JSON，不要其它文字。',
       ]

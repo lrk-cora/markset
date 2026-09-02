@@ -101,7 +101,7 @@ export function setColorMode(on) {
 
 function uiTarget(e) {
   const el = e.target instanceof Element ? e.target : e.target.parentElement
-  return el?.closest?.('.hl-handle, .img-handle, .badge, .toolbar, .topbar, .inspector, .suggest, .confirm')
+  return el?.closest?.('.hl-handle, .img-handle, .badge, .toolbar, .topbar, .inspector, .suggest, .confirm, .change-badge')
 }
 
 export function bindLasso({ onBegin, onMove, onFinish, onCancel }) {

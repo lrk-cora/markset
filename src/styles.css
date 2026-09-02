@@ -217,6 +217,47 @@ body.is-lassoing {
   line-height: 1.4;
 }
 
+.badge.change-badge .tag {
+  background: #7a4e12;
+}
+
+.badge.change-badge.is-on .tag {
+  background: #b45309;
+}
+
+.badge.change-badge .change-toggle {
+  height: 20px;
+  padding: 0 6px;
+  border: 1px solid #d4cbbd;
+  border-radius: 6px;
+  background: #fff;
+  font: 11px var(--sans);
+  cursor: pointer;
+}
+
+.badge.change-badge.is-off .change-toggle {
+  background: var(--blue-soft);
+}
+
+.mark-change {
+  background: rgba(180, 83, 9, 0.22);
+  box-decoration-break: clone;
+  border-radius: 2px;
+}
+
+.mark-change.is-restored {
+  background: #e7e2d8;
+  text-decoration: line-through;
+}
+
+.mark-change.is-fail {
+  outline: 1px dashed #9b1c1c;
+}
+
+.mark-change.is-active {
+  box-shadow: 0 0 0 1px #b45309;
+}
+
 .badge input[type='checkbox'] {
   width: 14px;
   height: 14px;

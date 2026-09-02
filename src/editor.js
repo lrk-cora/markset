@@ -140,6 +140,19 @@ const SelectionHighlight = Extension.create({
                 }),
               )
             }
+            for (const item of snap.changes || []) {
+              if (item.kind !== 'text' || item.from == null || item.to == null) continue
+              if (item.from >= item.to || item.to > pmState.doc.content.size) continue
+              const cls = [
+                'mark-change',
+                item.keep === false ? 'is-restored' : '',
+                item.status === 'fail' ? 'is-fail' : '',
+                snap.changeActive === item.id ? 'is-active' : '',
+              ]
+                .filter(Boolean)
+                .join(' ')
+              decos.push(Decoration.inline(item.from, item.to, { class: cls }))
+            }
             return DecorationSet.create(pmState.doc, decos)
           },
         },
@@ -169,7 +182,7 @@ export function getDemoPage() {
 
 function cupSrc(pageId = 'a') {
   const file = DEMO_CUP[pageId]?.file || DEMO_CUP.a.file
-  return `${import.meta.env.BASE_URL}${file}?v=on-cup`
+  return `${import.meta.env.BASE_URL}${file}?v=blank-cup`
 }
 
 function para(blockId, text) {
@@ -191,7 +204,7 @@ export function demoDoc(pageId = 'a') {
     type: 'image',
     attrs: {
       src,
-      alt: pageId === 'b' ? '雾蓝杯身，杯面印着原木杯（演示，锚点时不要重画杯子）' : '原木杯，杯面印着原木杯，带杯盖，置于木桌边',
+      alt: pageId === 'b' ? '雾蓝杯身，无印字（演示，锚定式时不要重画杯子）' : '原木杯，杯身无印字，带杯盖，置于木桌边',
       blockId: 'img-1',
       width: 360,
       height: 360,
@@ -211,7 +224,7 @@ export function demoDoc(pageId = 'a') {
         ),
         para('p-spec', '规格：原木杯 / 红色'),
         image,
-        para('p-note', '演示设定：杯身已经是雾蓝。锚点时不要重画杯子。'),
+        para('p-note', '演示设定：杯身已经是雾蓝。锚定式时不要重画杯子。'),
         price,
         ship,
       ],
@@ -228,7 +241,6 @@ export function demoDoc(pageId = 'a') {
       ),
       para('p-spec', '规格：原木杯 / 暖茶 / 280ml'),
       image,
-      para('p-print', '杯身印字：原木杯'),
       price,
       ship,
     ],
@@ -236,8 +248,8 @@ export function demoDoc(pageId = 'a') {
 }
 
 export const DEMO_KICKER = {
-  a: '演示页 A · 任务 1 / 2 · 文案和图上杯身都有「原木杯」',
-  b: '演示页 B · 任务 3 · 杯身已是雾蓝且印着原木杯，说明仍写红色 / 原木',
+  a: '演示页 A · 任务 1 / 2 · 文案里有「原木杯」，杯身无印字',
+  b: '演示页 B · 任务 3 · 锚定式：杯身已是雾蓝、无印字，说明仍写红色 / 原木',
 }
 
 export function applyDemoPage(editor, pageId = 'a') {

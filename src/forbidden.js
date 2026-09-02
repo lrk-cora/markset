@@ -13,7 +13,7 @@ export function contradictionNeedles(fact) {
   return needles
 }
 
-/** 跟随：品名中英对照。不是 OCR，是同一商品的别名。 */
+/** 辐射式：品名中英对照。不是 OCR，是同一商品的别名。 */
 export const PRODUCT_ALIASES = {
   原木杯: ['OAK CUP', 'Oak Cup'],
   'OAK CUP': ['原木杯'],

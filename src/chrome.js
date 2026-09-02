@@ -6,6 +6,7 @@ import { applyScopeAfterSelect, visibleSuggests } from './scope.js'
 import { snapExistingMark } from './contour.js'
 import { findSame as runFindSame } from './vision-tasks.js'
 import { runWriteback } from './writeback.js'
+import { redoChange, restoreChange } from './changes.js'
 import {
   appendSpans,
   beginInsertUndo,
@@ -19,6 +20,7 @@ import {
   refreshImageLayout,
   removeMark,
   setAnchors,
+  setChangeActive,
   setCommandText,
   setScope,
   targets,
@@ -475,11 +477,11 @@ function renderList(editor) {
     const empty = document.createElement('li')
     empty.className = 'muted'
     empty.textContent = snap.scope === 'inside'
-        ? '仅圈内：提交时只改圈中的。要改别处相同品名请用「跟随」。'
+        ? '仅圈内：提交时只改圈中的。要改别处相同品名请用「辐射式」。'
         : snap.scope === 'follow'
-          ? '跟随不预先圈选圈外。点选一个词、写要求，再点统一风格，系统再改相同品名和印字。'
+          ? '辐射式不预先圈选圈外。点选一个词、写要求，再点统一风格，系统再改相同品名和印字。'
           : snap.scope === 'anchor'
-            ? '锚点不用填改法。圈已经对的杯身，点「对齐圈中」：圈内不重画，圈外矛盾色词直接改掉。'
+            ? '锚定式不用填改法。圈已经对的杯身，点「对齐圈中」：圈内不重画，圈外矛盾色词直接改掉。'
             : '圈字时若只碰到一两个字，会出现在这里，点一下可补进选中。'
     suggestBox.append(empty)
     return
@@ -498,6 +500,59 @@ function renderList(editor) {
     detail.textContent = item.text || item.suggestReason
     li.append(btn, detail)
     suggestBox.append(li)
+  }
+}
+
+function changeAnchor(view, item) {
+  if (item.kind === 'image') {
+    if (item.screenRect) return { x: item.screenRect.x, y: item.screenRect.y }
+    return null
+  }
+  try {
+    const coords = view.coordsAtPos(item.from)
+    return { x: coords.left, y: coords.top }
+  } catch {
+    return null
+  }
+}
+
+function addChangeBadges(layer, editor) {
+  const snap = getSnapshot()
+  for (const item of snap.changes || []) {
+    const anchor = changeAnchor(editor.view, item)
+    if (!anchor) continue
+    const badge = document.createElement('div')
+    badge.className = `badge change-badge${snap.changeActive === item.id ? ' is-on' : ''}${
+      item.keep === false ? ' is-off' : ''
+    }${item.status === 'fail' ? ' is-fail' : ''}`
+    badge.style.left = `${anchor.x}px`
+    badge.style.top = `${anchor.y - 18}px`
+    const restored = item.keep === false
+    const label =
+      item.kind === 'text'
+        ? `${item.before || '（空）'} → ${restored ? item.before || '（空）' : item.after || '（删）'}`
+        : '图'
+    badge.title = restored ? `#${item.id} 已还原` : `#${item.id} ${label}`
+    const tag = document.createElement('span')
+    tag.className = 'tag'
+    tag.textContent = `#${item.id}`
+    badge.append(tag)
+    const btn = document.createElement('button')
+    btn.type = 'button'
+    btn.className = 'change-toggle'
+    btn.textContent = restored ? '改回' : '还原'
+    btn.title = restored ? '再应用这一处' : '只还原这一处，其它改动不动'
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation()
+      const run = restored ? redoChange(editor, item.id) : restoreChange(editor, item.id)
+      run.then(() => toast(restored ? `已改回 #${item.id}` : `已还原 #${item.id}`))
+    })
+    badge.append(btn)
+    badge.addEventListener('click', (e) => {
+      e.stopPropagation()
+      setChangeActive(item.id)
+    })
+    layer.append(badge)
   }
 }
 
@@ -605,8 +660,8 @@ export function renderChrome(editor) {
     scopeRow.className = 'scope-row'
     for (const [id, label] of [
       ['inside', '仅圈内'],
-      ['follow', '跟随'],
-      ['anchor', '锚点'],
+      ['follow', '辐射式'],
+      ['anchor', '锚定式'],
     ]) {
       const btn = document.createElement('button')
       btn.type = 'button'
@@ -626,8 +681,8 @@ export function renderChrome(editor) {
           id === 'inside'
             ? '范围：仅圈内。提交时只改圈中的。'
             : id === 'follow'
-              ? '范围：跟随。提交后圈内和圈外相同品名一并写入。'
-              : '范围：锚点。圈中已对、不用填改法。点「对齐圈中」即可。',
+              ? '范围：辐射式。提交后圈内和圈外相同品名一并写入。'
+              : '范围：锚定式。圈中已对、不用填改法。点「对齐圈中」即可。',
         )
       })
       scopeRow.append(btn)
@@ -785,6 +840,7 @@ export function renderChrome(editor) {
     placeToolbar(bar)
   }
 
+  addChangeBadges(layer, editor)
   renderList(editor)
   inspector.textContent = JSON.stringify(toSpec(), null, 2)
   const undoTop = document.getElementById('btn-undo')

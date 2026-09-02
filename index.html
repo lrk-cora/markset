@@ -10,7 +10,7 @@
       <header class="topbar">
         <div class="brand">
           <span class="mark">MarkSet</span>
-          <span class="week">本地完善 · 不打模型</span>
+          <span class="week">本地完善 · 已开云端模型</span>
         </div>
         <div class="top-actions">
           <button type="button" class="mode-btn is-on" data-demo-page="a">页 A</button>
@@ -19,8 +19,8 @@
           <button type="button" id="btn-subtract" class="mode-btn" aria-pressed="false">减选</button>
           <button type="button" id="btn-undo" class="mode-btn" hidden>撤回</button>
           <button type="button" id="btn-api" class="mode-btn">检查接口</button>
-          <label class="allow-models" title="默认关闭。套索、改选区、检查接口从不消耗额度。改写/改图前还要再确认一次。">
-            <input type="checkbox" id="allow-models" />
+          <label class="allow-models is-on" title="已打开。套索、改选区、检查接口仍不消耗额度。改写/改图前还会再确认一次。">
+            <input type="checkbox" id="allow-models" checked />
             允许调用云端模型
           </label>
           <label class="allow-models" title="默认关闭：选区就是鼠标圈出来的像素。打开后，每次圈图松手都会调用 SAM 贴到物体，消耗 fal 额度。减选仍用本地像素。">
@@ -43,7 +43,7 @@
 
         <aside class="inspector" aria-label="当前篮子">
           <h2>选中列表</h2>
-          <p class="inspector-lead">先圈震源，再选范围、写要求。仅圈内只改圈中的；跟随改圈内外相同品名；锚点圈中已对、只改圈外矛盾处。三种范围都直接写入，可用「撤回」撤销。¥59、物流不改。</p>
+          <p class="inspector-lead">先圈要改的那一处，再选范围、写要求。仅圈内只改圈中的；辐射式改圈内外相同品名；锚定式圈中已对、只改圈外矛盾处。改完每处标出，可点「还原」。¥59、物流不改。</p>
           <ul id="selection-list" class="selection-list"></ul>
           <h2>未圈全</h2>
           <ul id="suggest-list" class="selection-list"></ul>

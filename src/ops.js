@@ -101,18 +101,11 @@ export function buildLocalOps({
   for (const span of inImages) pushImage(span, 'in')
 
   if (scope === 'follow') {
-    const hasProduct = [...inTexts, ...extraTexts].some((s) =>
-      /原木杯|OAK CUP|Oak Cup/i.test(s.text || ''),
-    )
-    const hasPrintText = extraTexts.some(
-      (s) => s.suggestReason === 'print' || s.block_id === 'p-print',
-    )
     const hasColor =
       Boolean(fact?.color) ||
       [...inTexts, ...extraTexts].some((s) => /暖茶|红色|雾蓝/.test(s.text || '')) ||
       /暖茶|红色|雾蓝/.test(commandText || '')
     if (cupSpan && hasColor) pushImage(cupSpan, 'out', { cup: true })
-    if ((hasProduct || hasPrintText) && printSpan) pushImage(printSpan, 'out', { print: true })
   }
 
   return { ops }
@@ -130,6 +123,46 @@ export function parsePlanOps(text) {
   } catch {
     return null
   }
+}
+
+function spanKey(span) {
+  if (!span) return ''
+  if (span.kind === 'text' && span.from != null) return `t:${span.from}:${span.to}`
+  if (span.kind === 'image') {
+    const b = span.bbox || {}
+    return `i:${span.block_id}:${Math.round(b.x || 0)}:${Math.round(b.y || 0)}:${Math.round(b.w || 0)}:${Math.round(b.h || 0)}`
+  }
+  return span.markId ? `m:${span.markId}` : ''
+}
+
+/** Local ops decide which spans to edit (辐射式圈外相同品名). Planner may refine how. */
+export function mergePlanOps(planOps, localOps) {
+  const planned = new Map()
+  for (const op of planOps || []) {
+    const key = spanKey(op.span)
+    if (key) planned.set(key, op)
+  }
+  const used = new Set()
+  const merged = []
+  for (const local of localOps || []) {
+    const key = spanKey(local.span)
+    const hit = key ? planned.get(key) : null
+    if (local.tool === 'none' || local.scope === 'untouched') {
+      merged.push(local)
+    } else if (hit && hit.tool !== 'none' && hit.scope !== 'untouched') {
+      merged.push({ ...hit, span: local.span, scope: local.scope || hit.scope })
+    } else {
+      merged.push(local)
+    }
+    if (key) used.add(key)
+  }
+  for (const op of planOps || []) {
+    const key = spanKey(op.span)
+    if (key && used.has(key)) continue
+    if (!op.span && !(op.tool === 'image_inpaint' && op.args?.bbox)) continue
+    merged.push(op)
+  }
+  return merged
 }
 
 export function attachSpansToOps(ops, { inTexts = [], inImages = [], extraTexts = [], printSpan = null, cupSpan = null }) {

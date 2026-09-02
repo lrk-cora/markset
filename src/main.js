@@ -15,6 +15,7 @@ import {
 import { bindLasso, isAddMode, isColorMode, isLassoMode, isSubtractMode, setLassoMode, setSubtractMode } from './overlay.js'
 import { applyScopeAfterSelect, describeScopeResult } from './scope.js'
 import { guessStrokePrompt } from './vision-tasks.js'
+import { dismissChanges } from './changes.js'
 import { exitToView } from './view-mode.js'
 import {
   appendSpans,
@@ -24,6 +25,7 @@ import {
   eraseImageSpan,
   eraseSlots,
   getSnapshot,
+  hasChanges,
   refreshImageLayout,
   replaceSpans,
   subscribe,
@@ -42,21 +44,15 @@ subscribe(() => {
 
 bindChromeKeys(editor)
 setLassoMode(true)
-forceModelsOff()
+forceModelsOn()
 renderChrome(editor)
 
-function forceModelsOff() {
-  setClientModelGate(false)
-  setSnapOn(false)
+function forceModelsOn() {
+  setClientModelGate(true)
   const allow = document.getElementById('allow-models')
-  const snap = document.getElementById('snap-contour')
   if (allow) {
-    allow.checked = false
-    allow.closest('label')?.classList.remove('is-on')
-  }
-  if (snap) {
-    snap.checked = false
-    snap.closest('label')?.classList.remove('is-on')
+    allow.checked = true
+    allow.closest('label')?.classList.add('is-on')
   }
 }
 
@@ -71,7 +67,7 @@ document.querySelectorAll('[data-demo-page]').forEach((btn) => {
     document.querySelectorAll('[data-demo-page]').forEach((el) => {
       el.classList.toggle('is-on', el.getAttribute('data-demo-page') === id)
     })
-    toast(id === 'b' ? '已换到页 B（锚点演示：杯身已是雾蓝）' : '已换到页 A（标题/正文/规格都有「原木杯」）')
+    toast(id === 'b' ? '已换到页 B（锚定式演示：杯身已是雾蓝）' : '已换到页 A（标题/正文/规格都有「原木杯」）')
   })
 })
 
@@ -143,12 +139,13 @@ function hintAfterSelect(spans, result) {
   if (looksLikePriceBleed(spans)) bits.push('价格是禁改区，请拖蓝条剔出或不要勾选')
   const hasText = spans.some((s) => s.kind === 'text')
   const hasImage = spans.some((s) => s.kind === 'image')
-  if (hasText && hasImage) bits.push('只改字、图不动：取消勾选图上的 #I，或改用范围「锚点」')
+  if (hasText && hasImage) bits.push('只改字、图不动：取消勾选图上的 #I，或改用范围「锚定式」')
   if (hasImage) bits.push('圈多了桌子用 Alt 减选，不要点 ×')
   if (bits.length) toast(bits.join('。'), 4800)
 }
 
 function applyHits(textHits, imageHits, polygon, { append, subtract, add, color }) {
+  if (hasChanges()) dismissChanges()
   const suggests = [...textHits.suggest]
   const imgs = [...imageHits.found, ...((append || subtract || add || color) ? imageHits.suggest : [])]
   if (!append && !subtract && !add && !color) suggests.push(...imageHits.suggest)
@@ -277,16 +274,22 @@ window.addEventListener(
       return
     }
     const target = e.target instanceof Element ? e.target : e.target.parentElement
-    if (target?.closest('.chrome-layer, .inspector, .topbar, .suggest, .toolbar')) return
+    if (target?.closest('.chrome-layer, .inspector, .topbar, .suggest, .toolbar, .change-badge')) return
 
     const hasSpans = getSnapshot().spans.length > 0
-    if (!isDrawing() && !hasSpans) return
+    const changing = hasChanges()
+    if (!isDrawing() && !hasSpans && !changing) return
 
     const image = hitImageAt(editor.view, e.clientX, e.clientY)
     const word = image ? null : hitWordAt(editor.view, e.clientX, e.clientY)
     if (!image && !word) {
-      if (!hasSpans) return
       e.preventDefault()
+      if (changing) {
+        dismissChanges()
+        toast('已收起改处标记。这是改后的页面。点「套索」可继续改，「撤回」可撤销')
+        return
+      }
+      if (!hasSpans) return
       exitToView()
       toast('已结束编辑。这是改后的页面。点「套索」可继续改，「撤回」可撤销')
       return
@@ -294,6 +297,7 @@ window.addEventListener(
 
     if (image) {
       e.preventDefault()
+      if (changing) dismissChanges()
       const subtract = isSubtractMode() || e.altKey || e.ctrlKey
       const finish = (span) => {
         if (subtract) {
@@ -324,6 +328,7 @@ window.addEventListener(
 
     if (word) {
       e.preventDefault()
+      if (changing) dismissChanges()
       if (coversTextPos(word.from)) return
       appendSpans([word], editor.view.state.doc)
       hintAfterSelect([word], finishSelect())
