@@ -129,16 +129,16 @@ export async function guessStrokePrompt(editor, notify) {
     const json = parseVisionJson(data?.text) || data
     const guess = String(data?.guess || json?.guess || '').trim()
     if (!guess) {
-      notify('没猜到，请在输入框自己写，再点统一风格')
+      notify('没猜到，请自己写下要改成什么样')
       return
     }
     replaceCommandText(guess)
-    notify(`已猜：${guess}。可改后再点统一风格`)
+    notify(`已猜：${guess}。可改后再点改这些`)
   } catch (err) {
     if (err.code === 'client-gate' || err.code === 'calls_disabled' || err.code === 'no_client_gate') {
       return
     }
-    notify(err.message || '猜提示失败，请自己写再点统一风格')
+    notify(err.message || '猜提示失败，请自己写')
   } finally {
     running = false
   }

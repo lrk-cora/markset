@@ -10,17 +10,17 @@
       <header class="topbar">
         <div class="brand">
           <span class="mark">MarkSet</span>
-          <span class="week">本地完善 · 已开云端模型</span>
+          <span class="week">新手分批卡片</span>
         </div>
         <div class="top-actions">
           <button type="button" class="mode-btn is-on" data-demo-page="a">页 A</button>
           <button type="button" class="mode-btn" data-demo-page="b">页 B</button>
           <button type="button" id="btn-lasso" class="mode-btn" aria-pressed="false">套索</button>
           <button type="button" id="btn-subtract" class="mode-btn" aria-pressed="false">减选</button>
-          <button type="button" id="btn-undo" class="mode-btn" hidden>撤回</button>
+          <button type="button" id="btn-undo" class="mode-btn" hidden>撤回全部</button>
           <button type="button" id="btn-api" class="mode-btn">检查接口</button>
-          <label class="allow-models is-on" title="已打开。套索、改选区、检查接口仍不消耗额度。改写/改图前还会再确认一次。">
-            <input type="checkbox" id="allow-models" checked />
+          <label class="allow-models" title="默认关闭。套索、改选区、检查接口从不消耗额度。只有勾上后，改写/改图才会打百炼或 fal。">
+            <input type="checkbox" id="allow-models" />
             允许调用云端模型
           </label>
           <label class="allow-models" title="默认关闭：选区就是鼠标圈出来的像素。打开后，每次圈图松手都会调用 SAM 贴到物体，消耗 fal 额度。减选仍用本地像素。">
@@ -36,14 +36,14 @@
       <div class="workspace">
         <main class="stage">
           <article class="page" aria-label="混排实验页">
-            <p class="kicker" id="page-kicker">演示页 A · 任务 1 / 2 · 文案和图上杯身都有「原木杯」</p>
+            <p class="kicker" id="page-kicker">演示页 A · 文案三处「原木杯」，杯面釉上印字</p>
             <div id="editor"></div>
           </article>
         </main>
 
         <aside class="inspector" aria-label="当前篮子">
           <h2>选中列表</h2>
-          <p class="inspector-lead">先圈要改的那一处，再选范围、写要求。仅圈内只改圈中的；辐射式改圈内外相同品名；锚定式圈中已对、只改圈外矛盾处。改完每处标出，可点「还原」。¥59、物流不改。</p>
+          <p class="inspector-lead">圈住要改的字或杯子。卡片会先问做什么，需要时再问还改别处吗。改完按处标出，可还原一处或撤回全部。价格、物流不改。</p>
           <ul id="selection-list" class="selection-list"></ul>
           <h2>未圈全</h2>
           <ul id="suggest-list" class="selection-list"></ul>

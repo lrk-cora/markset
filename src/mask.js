@@ -264,7 +264,7 @@ export function tintedMaskCanvas(maskCanvas) {
   out.width = maskCanvas.width
   out.height = maskCanvas.height
   const ctx = out.getContext('2d')
-  ctx.fillStyle = 'rgba(60, 111, 212, 0.38)'
+  ctx.fillStyle = 'rgba(60, 111, 212, 0.28)'
   ctx.fillRect(0, 0, out.width, out.height)
   ctx.globalCompositeOperation = 'destination-in'
   ctx.drawImage(maskCanvas, 0, 0)

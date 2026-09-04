@@ -5,6 +5,7 @@ import { resolveInpaintResult } from './inpaint-result.js'
 import { makeMask, maskToFalDataUrl, paintMask, rectToPoly } from './mask.js'
 import { textAfterFromOp } from './ops.js'
 import { localPaintMasked } from './pending.js'
+import { parseCommand } from './plan-local.js'
 import {
   beginWriteUndo,
   captureWriteBaseline,
@@ -189,15 +190,16 @@ export async function presentChanges({
       continue
     }
     if ((span?.kind === 'image' || op.tool === 'image_inpaint') && span) {
-      if (span.printStandIn || op.args?.print) continue
+      const isPrint = Boolean(span.printStandIn || op.args?.print)
+      if (isPrint && !modelsImage) continue
       const src = imageLatest.get(span.block_id) || baseline.imageSrcs[span.block_id]
       const mask = seedMask(span)
       let afterSrc = src
       let status = 'ok'
-      const stampText = null
+      const stampText = isPrint ? parseCommand(commandText).product || commandText || '原木杯' : null
       if (src) {
         try {
-          if (modelsImage && op.tool === 'image_inpaint') {
+          if (modelsImage && op.tool === 'image_inpaint' && !isPrint) {
             const data = await inpaintImage({
               prompt: op.args?.prompt || commandText,
               imageDataUrl: src,

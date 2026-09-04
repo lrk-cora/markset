@@ -1,10 +1,12 @@
+import { COLOR_IDS } from './colors.js'
+
 export const FORBIDDEN_BLOCKS = new Set(['p-price', 'p-ship'])
 
 export const FORBIDDEN_RE = /¥\s*\d+|售价|专利|发货|物流|顺延|偏远/
 
-export const COLOR_TERMS = ['暖茶', '红色', '雾蓝']
+export const COLOR_TERMS = COLOR_IDS
 export const MATERIAL_TERMS = ['原木']
-export const RELATED_TERMS = ['暖茶', '红色', '雾蓝', '原木']
+export const RELATED_TERMS = [...COLOR_IDS, '原木']
 
 export function contradictionNeedles(fact) {
   const truth = fact?.color || null

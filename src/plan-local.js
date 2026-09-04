@@ -1,11 +1,13 @@
+import { colorRgb, parseHexColor } from './colors.js'
 import { getDemoPage } from './editor.js'
 import { COLOR_TERMS, MATERIAL_TERMS, PRODUCT_ALIASES } from './forbidden.js'
 
 export function parseCommand(commandText) {
   const raw = String(commandText || '').trim()
   const parts = raw.split(/[，,、;；]/).map((s) => s.trim()).filter(Boolean)
-  const color = COLOR_TERMS.find((c) => raw.includes(c)) || null
-  const product = parts.find((p) => !COLOR_TERMS.includes(p) && !COLOR_TERMS.some((c) => p === c)) || null
+  const named = [...COLOR_TERMS].sort((a, b) => b.length - a.length).find((c) => raw.includes(c))
+  const color = named || parseHexColor(raw) || null
+  const product = parts.find((p) => !COLOR_TERMS.includes(p) && !parseHexColor(p) && !COLOR_TERMS.some((c) => p === c)) || null
   return { raw, parts, color, product }
 }
 
@@ -46,10 +48,7 @@ export function localNextText(span, commandText, kind, fact = null) {
 
 export function targetRgb(commandText, fact = null) {
   const color = parseCommand(commandText).color || fact?.color
-  if (color === '雾蓝') return [88, 132, 176]
-  if (color === '暖茶') return [176, 96, 64]
-  if (color === '红色') return [198, 56, 48]
-  return [60, 111, 212]
+  return colorRgb(color)
 }
 
 /** If the input is empty, a circled color word is the instruction (apply that color). */

@@ -182,7 +182,7 @@ export function getDemoPage() {
 
 function cupSrc(pageId = 'a') {
   const file = DEMO_CUP[pageId]?.file || DEMO_CUP.a.file
-  return `${import.meta.env.BASE_URL}${file}?v=blank-cup`
+  return `${import.meta.env.BASE_URL}${file}?v=b-blank-3`
 }
 
 function para(blockId, text) {
@@ -204,7 +204,7 @@ export function demoDoc(pageId = 'a') {
     type: 'image',
     attrs: {
       src,
-      alt: pageId === 'b' ? '雾蓝杯身，无印字（演示，锚定式时不要重画杯子）' : '原木杯，杯身无印字，带杯盖，置于木桌边',
+      alt: pageId === 'b' ? '雾蓝杯身，无印字（演示，照着杯子改说明时不要重画杯子）' : '原木杯，釉上印着品名，带杯盖，置于木桌边',
       blockId: 'img-1',
       width: 360,
       height: 360,
@@ -224,7 +224,7 @@ export function demoDoc(pageId = 'a') {
         ),
         para('p-spec', '规格：原木杯 / 红色'),
         image,
-        para('p-note', '演示设定：杯身已经是雾蓝。锚定式时不要重画杯子。'),
+        para('p-note', '演示设定：杯身已经是雾蓝。照着杯子改说明时不要重画杯子。'),
         price,
         ship,
       ],
@@ -248,8 +248,8 @@ export function demoDoc(pageId = 'a') {
 }
 
 export const DEMO_KICKER = {
-  a: '演示页 A · 任务 1 / 2 · 文案里有「原木杯」，杯身无印字',
-  b: '演示页 B · 任务 3 · 锚定式：杯身已是雾蓝、无印字，说明仍写红色 / 原木',
+  a: '演示页 A · 文案三处「原木杯」，杯面釉上印字',
+  b: '演示页 B · 杯身已是雾蓝、无印字；说明仍写红色 / 原木。圈杯子可把说明改成和杯子一致',
 }
 
 export function applyDemoPage(editor, pageId = 'a') {

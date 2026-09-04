@@ -13,9 +13,10 @@ import {
   looksLikePriceBleed,
 } from './hit-test.js'
 import { bindLasso, isAddMode, isColorMode, isLassoMode, isSubtractMode, setLassoMode, setSubtractMode } from './overlay.js'
-import { applyScopeAfterSelect, describeScopeResult } from './scope.js'
+import { applyScopeAfterSelect } from './scope.js'
 import { guessStrokePrompt } from './vision-tasks.js'
 import { dismissChanges } from './changes.js'
+import { dismissCoach, getCard, idleCard, keepCardForAppend, resetCardForNewSelection } from './card-flow.js'
 import { exitToView } from './view-mode.js'
 import {
   appendSpans,
@@ -44,15 +45,21 @@ subscribe(() => {
 
 bindChromeKeys(editor)
 setLassoMode(true)
-forceModelsOn()
+forceModelsOff()
 renderChrome(editor)
 
-function forceModelsOn() {
-  setClientModelGate(true)
+function forceModelsOff() {
+  setClientModelGate(false)
+  setSnapOn(false)
   const allow = document.getElementById('allow-models')
+  const snap = document.getElementById('snap-contour')
   if (allow) {
-    allow.checked = true
-    allow.closest('label')?.classList.add('is-on')
+    allow.checked = false
+    allow.closest('label')?.classList.remove('is-on')
+  }
+  if (snap) {
+    snap.checked = false
+    snap.closest('label')?.classList.remove('is-on')
   }
 }
 
@@ -63,11 +70,12 @@ document.querySelectorAll('[data-demo-page]').forEach((btn) => {
     if (!id || id === currentPage) return
     currentPage = id
     clearAll()
+    idleCard()
     applyDemoPage(editor, id)
     document.querySelectorAll('[data-demo-page]').forEach((el) => {
       el.classList.toggle('is-on', el.getAttribute('data-demo-page') === id)
     })
-    toast(id === 'b' ? '已换到页 B（锚定式演示：杯身已是雾蓝）' : '已换到页 A（标题/正文/规格都有「原木杯」）')
+    toast(id === 'b' ? '已换到页 B：杯身已是雾蓝，说明还写着红色 / 原木' : '已换到页 A：标题、正文、规格都有「原木杯」')
   })
 })
 
@@ -132,16 +140,8 @@ function finishSelect(extra = []) {
   return applyScopeAfterSelect(editor.view, extra)
 }
 
-function hintAfterSelect(spans, result) {
-  const bits = []
-  const msg = describeScopeResult(result, getSnapshot().scope)
-  if (msg) bits.push(msg)
-  if (looksLikePriceBleed(spans)) bits.push('价格是禁改区，请拖蓝条剔出或不要勾选')
-  const hasText = spans.some((s) => s.kind === 'text')
-  const hasImage = spans.some((s) => s.kind === 'image')
-  if (hasText && hasImage) bits.push('只改字、图不动：取消勾选图上的 #I，或改用范围「锚定式」')
-  if (hasImage) bits.push('圈多了桌子用 Alt 减选，不要点 ×')
-  if (bits.length) toast(bits.join('。'), 4800)
+function hintAfterSelect(spans) {
+  if (looksLikePriceBleed(spans)) toast('价格是禁改区，请拖蓝条剔出或不要勾选', 4200)
 }
 
 function applyHits(textHits, imageHits, polygon, { append, subtract, add, color }) {
@@ -165,7 +165,7 @@ function applyHits(textHits, imageHits, polygon, { append, subtract, add, color 
     for (const img of imgs) {
       if (applyImageStroke(img, polygon)) did = true
     }
-    toast(did ? '已记下笔迹范围。写要求后点统一风格（未开云端则本地调色）' : '色笔请涂在图上')
+    toast(did ? '已记下笔迹范围。未开云端则提交后本地调色' : '色笔请涂在图上')
     if (did) {
       finishSelect(suggests)
       guessStrokePrompt(editor, toast)
@@ -183,7 +183,10 @@ function applyHits(textHits, imageHits, polygon, { append, subtract, add, color 
       }
     }
     toast(did ? '已扩大图上选区' : '加笔请圈在图上。也可先圈一块再加')
-    if (did) finishSelect(suggests)
+    if (did) {
+      keepCardForAppend()
+      finishSelect(suggests)
+    }
     return
   }
 
@@ -195,13 +198,16 @@ function applyHits(textHits, imageHits, polygon, { append, subtract, add, color 
     }
     if (extra.length) {
       appendSpans(extra, editor.view.state.doc)
+      keepCardForAppend()
+      dismissCoach()
       const addedImg = extra.filter((s) => s.kind === 'image').length
       if (consumePackagingHint() && addedImg) {
-        toast('已加上包装上的字（不贴物体）。再点「统一风格」或「替换」', 4200)
+        toast('已加上包装上的字（不贴物体）', 4200)
         finishSelect(suggests)
       } else {
         toast(addedImg ? '已另作编号加上这块图（一张图两件货用 Shift 再圈）' : '已加上')
-        hintAfterSelect(extra, finishSelect(suggests))
+        finishSelect(suggests)
+        hintAfterSelect(extra)
       }
     } else if (suggests.length) finishSelect(suggests)
     else toast('按住 Shift 再圈可加上；Alt 圈不要的可挖掉')
@@ -217,19 +223,24 @@ function applyHits(textHits, imageHits, polygon, { append, subtract, add, color 
     const slot = hitPageSlot(polygon, editor.view)
     if (slot) {
       replaceSpans([slot])
-      toast('空白槽：插入会放在你圈的位置。输入框写字后点「插入文字」，或点「插入图片」')
+      resetCardForNewSelection()
+      dismissCoach()
+      toast('空白槽：插入会放在你圈的位置')
       return
     }
     toast('圈字、图上的像素（含桌面空白），或页上空白处')
     return
   }
   replaceSpans(next)
+  resetCardForNewSelection()
+  dismissCoach()
   if (consumePackagingHint() && next.some((s) => s.kind === 'image')) {
-    toast('已加上包装上的字（不贴物体）。再点「统一风格」或「替换」', 4200)
+    toast('已加上包装上的字（不贴物体）', 4200)
     finishSelect(suggests)
     return
   }
-  hintAfterSelect(next, finishSelect(suggests))
+  finishSelect(suggests)
+  hintAfterSelect(next)
 }
 
 bindLasso({
@@ -274,7 +285,7 @@ window.addEventListener(
       return
     }
     const target = e.target instanceof Element ? e.target : e.target.parentElement
-    if (target?.closest('.chrome-layer, .inspector, .topbar, .suggest, .toolbar, .change-badge')) return
+    if (target?.closest('.chrome-layer, .inspector, .topbar, .suggest, .toolbar, .novice-card, .coach, .change-badge')) return
 
     const hasSpans = getSnapshot().spans.length > 0
     const changing = hasChanges()
@@ -284,14 +295,20 @@ window.addEventListener(
     const word = image ? null : hitWordAt(editor.view, e.clientX, e.clientY)
     if (!image && !word) {
       e.preventDefault()
+      if (getCard().coachOn) {
+        dismissCoach()
+        return
+      }
       if (changing) {
         dismissChanges()
-        toast('已收起改处标记。这是改后的页面。点「套索」可继续改，「撤回」可撤销')
+        idleCard()
+        toast('已收起改处标记。这是改后的页面。点「套索」可继续改，「撤回全部」可撤销')
         return
       }
       if (!hasSpans) return
       exitToView()
-      toast('已结束编辑。这是改后的页面。点「套索」可继续改，「撤回」可撤销')
+      idleCard()
+      toast('已结束编辑。这是改后的页面。点「套索」可继续改，「撤回全部」可撤销')
       return
     }
 
@@ -305,7 +322,9 @@ window.addEventListener(
           return
         }
         appendSpans([span])
-        if (consumePackagingHint()) toast('已加上包装上的字（不贴物体）。再点「统一风格」或「替换」', 4200)
+        keepCardForAppend()
+        dismissCoach()
+        if (consumePackagingHint()) toast('已加上包装上的字（不贴物体）', 4200)
         else toast('已另作编号加上这块图（一张图两件货用 Shift 再圈）')
         finishSelect()
       }
@@ -331,7 +350,10 @@ window.addEventListener(
       if (changing) dismissChanges()
       if (coversTextPos(word.from)) return
       appendSpans([word], editor.view.state.doc)
-      hintAfterSelect([word], finishSelect())
+      keepCardForAppend()
+      dismissCoach()
+      finishSelect()
+      hintAfterSelect([word])
     }
   },
   true,
@@ -341,3 +363,12 @@ window.addEventListener('resize', () => {
   refreshImageLayout(editor.view)
   renderChrome(editor)
 })
+
+document.querySelector('.stage')?.addEventListener(
+  'scroll',
+  () => {
+    refreshImageLayout(editor.view)
+    renderChrome(editor)
+  },
+  { passive: true },
+)

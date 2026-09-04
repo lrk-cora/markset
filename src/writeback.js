@@ -11,8 +11,9 @@ import {
 import { presentChanges } from './changes.js'
 import { exitToView } from './view-mode.js'
 import { inferAnchorFact, inferCommandText, parseCommand } from './plan-local.js'
-import { attachImageOpsFromBboxes, collectCupBody } from './print-region.js'
+import { attachImageOpsFromBboxes, collectCupBody, collectPrintStandIn } from './print-region.js'
 import { collectOutsideEdits } from './scope.js'
+import { startReview } from './card-flow.js'
 import { getSnapshot, ping, targets, undoLastWrite } from './store.js'
 
 let running = false
@@ -104,7 +105,7 @@ export async function runWriteback(kind, editor, notify) {
   const fact = scope === 'anchor' ? inferAnchorFact(picked, commandText) : inferAnchorFact([], commandText)
   const anchorNoType = scope === 'anchor' && (kind === 'unify' || kind === 'rewrite')
   if ((kind === 'rewrite' || kind === 'unify' || kind === 'replace') && !commandText && !anchorNoType) {
-    notify('先在输入框写要改成什么样。圈了「红色」等色词也可直接点统一风格。')
+    notify('先写下新名字或选出颜色。圈了「红色」等色词也可直接改。')
     return
   }
 
@@ -114,12 +115,12 @@ export async function runWriteback(kind, editor, notify) {
       : []
 
   if (scope === 'follow' && !texts.length && !extraTexts.length) {
-    notify('辐射式：请先圈一个要改的词（例如标题里的品名），再写要求、点统一风格')
+    notify('请先圈一个要改的词（例如标题里的品名），再写新名字、点改这些')
     return
   }
 
   if (scope === 'anchor' && !fact.color && !commandText) {
-    notify('锚定式：请圈已经正确的杯身（或一句已对的色词）。不用填改法。')
+    notify('请圈已经正确的杯身（或一句已对的色词）。不用填新值。')
     return
   }
 
@@ -128,8 +129,9 @@ export async function runWriteback(kind, editor, notify) {
     if (!ok) return
   }
 
-  const printSpan = null
-  const cupSpan = kind !== 'delete' && (scope === 'follow' || colorIntent) ? collectCupBody(editor.view) : null
+  const printSpan =
+    kind !== 'delete' && scope === 'follow' && parsed.product ? collectPrintStandIn(editor.view) : null
+  const cupSpan = kind !== 'delete' && colorIntent ? collectCupBody(editor.view) : null
   const ctx = {
     editor,
     kind,
@@ -149,7 +151,7 @@ export async function runWriteback(kind, editor, notify) {
     const ops = planned.ops
 
     if (scope === 'anchor' && !extraTexts.length) {
-      notify('锚定式：说明里没有找到和圈中不一致的色词。')
+      notify('说明里没有找到和圈中不一致的色词或品名。')
       return
     }
 
@@ -214,14 +216,15 @@ async function commitInside(editor, ops, kind, commandText, notify, fact = null,
 
     ping()
     exitToView()
+    startReview()
     const skippedModel = wantTextModel && !useTextModel && planned.length
     const usedLocalImage = localImage && images.length
     const head =
-      scope === 'follow' ? '辐射式已写入' : scope === 'anchor' ? '锚定式已写入（圈内未改）' : '仅圈内已写入'
+      scope === 'follow' ? '已写入圈内外相同的名字' : scope === 'anchor' ? '已按圈中改正文（圈里没动）' : '已写入圈里的'
     const bits = [head, `已标出 ${result.count} 处`]
-    if (skippedModel) bits.push('字按输入改')
+    if (skippedModel) bits.push('字按你填的新值改')
     if (usedLocalImage) bits.push('图为选区内调色（未调用 fal）')
-    bits.push('每处可点「还原」。点页面空白结束查看成品，「撤回」撤销整次')
+    bits.push('每处可点「还原这一处」。点页面空白看成品，「撤回全部」撤销整次')
     notify(bits.join('。'))
   } catch (err) {
     undoLastWrite(editor)

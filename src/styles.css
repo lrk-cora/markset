@@ -208,6 +208,7 @@ body.is-lassoing {
   align-items: center;
   gap: 4px;
   pointer-events: auto;
+  z-index: 40;
 }
 
 .anchor-hint {
@@ -259,10 +260,11 @@ body.is-lassoing {
 }
 
 .badge input[type='checkbox'] {
-  width: 14px;
-  height: 14px;
+  width: 16px;
+  height: 16px;
   margin: 0;
   accent-color: var(--blue);
+  pointer-events: auto;
 }
 
 .badge .tag {
@@ -480,6 +482,10 @@ kbd {
   image-rendering: auto;
 }
 
+.image-mask-canvas.is-off {
+  opacity: 0.35;
+}
+
 .slot-mask {
   position: fixed;
   outline: 2px dashed var(--blue);
@@ -615,9 +621,190 @@ kbd {
   padding: 0 8px;
 }
 
-.toolbar button.pen.is-on {
+.toolbar button.pen.is-on,
+.toolbar button.is-on {
   border-color: var(--blue);
   background: var(--blue-soft);
+  color: #1b3a7a;
+}
+
+.toolbar.novice-card {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+  max-width: min(420px, calc(100vw - 24px));
+  padding: 10px;
+}
+
+.toolbar.novice-card .toolbar-grip {
+  align-self: flex-start;
+}
+
+.toolbar.novice-card input {
+  width: 100%;
+}
+
+.card-title {
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.card-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.card-note,
+.card-hint {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--muted);
+}
+
+.card-hint {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  border-radius: 8px;
+  background: #f3ebe0;
+}
+
+.card-hint.is-warn {
+  background: #f8ead6;
+  color: #7a4e12;
+}
+
+.card-hint-x {
+  margin-left: auto;
+  width: 22px;
+  min-width: 22px;
+  padding: 0;
+}
+
+.color-palette {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.swatch {
+  min-width: 64px;
+  padding-left: 10px;
+  box-shadow: inset 8px 0 0 var(--swatch, #5884b0);
+}
+
+.swatch.is-on {
+  border-color: var(--blue);
+  background: var(--blue-soft);
+}
+
+.color-custom {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 32px;
+  padding: 0 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  font: 13px var(--sans);
+  cursor: pointer;
+}
+
+.color-custom.is-on {
+  border-color: var(--blue);
+  background: var(--blue-soft);
+}
+
+.color-custom input[type='color'] {
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+}
+
+.card-more {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding-top: 4px;
+  border-top: 1px dashed var(--line);
+}
+
+.card-changes {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 6px;
+}
+
+.card-changes li {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.card-changes li.is-on {
+  outline: 1px solid #b45309;
+  border-radius: 6px;
+}
+
+.change-line {
+  flex: 1;
+  text-align: left;
+  height: auto;
+  min-height: 30px;
+  padding: 4px 8px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.coach-ring {
+  position: fixed;
+  border: 2px dashed var(--blue);
+  border-radius: 10px;
+  box-shadow: 0 0 0 1px rgba(255, 250, 242, 0.9);
+  pointer-events: none;
+}
+
+.coach-caption {
+  position: fixed;
+  left: 20px;
+  bottom: 20px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  max-width: min(420px, calc(100vw - 40px));
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: rgba(255, 250, 242, 0.96);
+  box-shadow: 0 10px 28px rgba(28, 25, 23, 0.12);
+  font-size: 13px;
+  line-height: 1.45;
+  pointer-events: auto;
+  z-index: 41;
+}
+
+.coach-caption button {
+  height: 30px;
+  padding: 0 10px;
+  border: 1px solid var(--blue);
+  border-radius: 6px;
+  background: var(--blue);
+  color: #fff;
+  font: 13px var(--sans);
+  cursor: pointer;
+  pointer-events: auto;
 }
 
 .toast {

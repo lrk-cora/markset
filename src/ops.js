@@ -1,4 +1,4 @@
-import { isForbiddenSpan } from './forbidden.js'
+import { COLOR_TERMS, isForbiddenSpan } from './forbidden.js'
 import { localNextText } from './plan-local.js'
 
 export function shouldCallPlanner(kind, scope, texts, images) {
@@ -101,11 +101,13 @@ export function buildLocalOps({
   for (const span of inImages) pushImage(span, 'in')
 
   if (scope === 'follow') {
+    const colorRe = new RegExp(COLOR_TERMS.map((c) => c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|'))
     const hasColor =
       Boolean(fact?.color) ||
-      [...inTexts, ...extraTexts].some((s) => /暖茶|红色|雾蓝/.test(s.text || '')) ||
-      /暖茶|红色|雾蓝/.test(commandText || '')
+      [...inTexts, ...extraTexts].some((s) => colorRe.test(s.text || '')) ||
+      colorRe.test(commandText || '')
     if (cupSpan && hasColor) pushImage(cupSpan, 'out', { cup: true })
+    if (printSpan) pushImage(printSpan, 'out', { print: true })
   }
 
   return { ops }
