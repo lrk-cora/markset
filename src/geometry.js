@@ -60,6 +60,39 @@ export function isSelfIntersecting(pts) {
   return false
 }
 
+export function looksLikeXStroke(pts) {
+  if (!pts || pts.length < 8 || !isSelfIntersecting(pts)) return false
+  const box = aabb(pts)
+  if (box.w < 16 || box.h < 16) return false
+  const len = pathLength(pts)
+  const diag = Math.hypot(box.w, box.h)
+  return len > diag * 1.55
+}
+
+/** Small near-closed square/rectangle, e.g. two boxes drawn before a paragraph. */
+export function looksLikeBoxStroke(pts) {
+  if (!pts || pts.length < 5) return false
+  const box = aabb(pts)
+  if (box.w < 10 || box.h < 10 || box.w > 110 || box.h > 110) return false
+  const aspect = box.w / Math.max(1, box.h)
+  if (aspect < 0.4 || aspect > 2.4) return false
+  const len = pathLength(pts)
+  const peri = 2 * (box.w + box.h)
+  if (len < peri * 0.38) return false
+  const compact = box.w <= 78 && box.h <= 78
+  if (len > peri * (compact ? 5.5 : 2.8)) return false
+  const tolX = Math.max(4, box.w * 0.22)
+  const tolY = Math.max(4, box.h * 0.22)
+  const near = (v, t, tol) => Math.abs(v - t) <= tol
+  const sides = [
+    pts.some((p) => near(p.x, box.x, tolX)),
+    pts.some((p) => near(p.x, box.x + box.w, tolX)),
+    pts.some((p) => near(p.y, box.y, tolY)),
+    pts.some((p) => near(p.y, box.y + box.h, tolY)),
+  ].filter(Boolean).length
+  return sides >= 3
+}
+
 export function convexHull(pts) {
   const p = [...pts].sort((a, b) => (a.x === b.x ? a.y - b.y : a.x - b.x))
   if (p.length <= 2) return p
@@ -91,6 +124,38 @@ export function simplify(pts, minDist = 2) {
     if (dist(out[out.length - 1], pts[i]) >= minDist) out.push(pts[i])
   }
   return out
+}
+
+/** Paint-stroke hit region: a thick ribbon around the polyline. */
+export function strokeToPolygon(pts, radius = 18) {
+  const cleaned = simplify(pts, 2)
+  if (!cleaned.length) return []
+  if (cleaned.length === 1) {
+    const p = cleaned[0]
+    const r = radius
+    return [
+      { x: p.x - r, y: p.y - r },
+      { x: p.x + r, y: p.y - r },
+      { x: p.x + r, y: p.y + r },
+      { x: p.x - r, y: p.y + r },
+    ]
+  }
+  const left = []
+  const right = []
+  for (let i = 0; i < cleaned.length; i += 1) {
+    const prev = cleaned[Math.max(0, i - 1)]
+    const next = cleaned[Math.min(cleaned.length - 1, i + 1)]
+    let dx = next.x - prev.x
+    let dy = next.y - prev.y
+    const len = Math.hypot(dx, dy) || 1
+    dx /= len
+    dy /= len
+    const nx = -dy * radius
+    const ny = dx * radius
+    left.push({ x: cleaned[i].x + nx, y: cleaned[i].y + ny })
+    right.push({ x: cleaned[i].x - nx, y: cleaned[i].y - ny })
+  }
+  return left.concat(right.reverse())
 }
 
 /** Self-intersecting lassos fall back to the convex hull as an outer contour. */

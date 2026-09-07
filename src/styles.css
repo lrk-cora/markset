@@ -459,6 +459,8 @@ kbd {
 }
 
 .lasso-layer,
+.paint-layer,
+.ink-layer,
 .chrome-layer {
   position: fixed;
   inset: 0;
@@ -468,8 +470,18 @@ kbd {
   z-index: 20;
 }
 
-.lasso-layer {
+.lasso-layer,
+.paint-layer,
+.ink-layer {
   overflow: visible;
+}
+
+.paint-layer {
+  z-index: 22;
+}
+
+.ink-layer {
+  z-index: 25;
 }
 
 .chrome-layer {
@@ -632,7 +644,7 @@ kbd {
   flex-direction: column;
   align-items: stretch;
   gap: 8px;
-  max-width: min(420px, calc(100vw - 24px));
+  max-width: min(480px, calc(100vw - 24px));
   padding: 10px;
 }
 
@@ -642,6 +654,33 @@ kbd {
 
 .toolbar.novice-card input {
   width: 100%;
+}
+
+.scheme-list {
+  display: grid;
+  gap: 6px;
+}
+
+.scheme-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  height: auto !important;
+  padding: 8px 10px !important;
+  text-align: left;
+}
+
+.scheme-dots {
+  display: flex;
+  gap: 4px;
+}
+
+.scheme-dots i {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.12);
 }
 
 .card-title {
@@ -818,6 +857,72 @@ kbd {
   color: #fff;
   font-size: 13px;
   z-index: 40;
+}
+
+.text-anno.is-underline {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  text-decoration-thickness: 2px;
+}
+
+.text-anno.is-wavy {
+  text-decoration: underline wavy #3c6fd4;
+  text-underline-offset: 4px;
+}
+
+.text-anno.is-strike {
+  text-decoration: line-through;
+}
+
+.text-anno.is-box {
+  outline: 1.5px solid #3c6fd4;
+  outline-offset: 3px;
+}
+
+.text-anno.is-highlight {
+  background: #ffe08a;
+  box-decoration-break: clone;
+}
+
+.text-anno.is-bold {
+  font-weight: 700;
+}
+
+.page-deco-host {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 4;
+}
+
+.page-deco {
+  position: absolute;
+  pointer-events: none;
+  box-sizing: border-box;
+}
+
+.page-deco.is-frame {
+  border: 2px solid #3c6fd4;
+  border-radius: 2px;
+}
+
+.page-deco.is-line {
+  border: 0;
+  border-bottom: 2px solid #3c6fd4;
+  height: 0 !important;
+}
+
+.page-deco.is-shadow {
+  filter: blur(11px);
+  opacity: 0.45;
+  z-index: 3;
+}
+
+.page-deco.is-wavy svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
 }
 
 @media (max-width: 980px) {

@@ -16,6 +16,12 @@ export const COLORS = [
   { id: '青瓷', fill: '#7aa89a' },
 ]
 
+export const COLOR_SCHEMES = [
+  { id: 'dopamine', label: '多巴胺', colors: ['粉色', '姜黄', '浅蓝'] },
+  { id: 'luxe', label: '高级感 / 黑白灰', colors: ['黑色', '岩灰', '白色'] },
+  { id: 'oak', label: '原木自然', colors: ['暖茶', '米色', '奶油'] },
+]
+
 export const COLOR_IDS = COLORS.map((c) => c.id)
 
 export function parseHexColor(text) {

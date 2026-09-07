@@ -1,3 +1,4 @@
+import { DEMO_CUP, getDemoPage } from './editor.js'
 import {
   aabb,
   clientRectBox,
@@ -400,6 +401,87 @@ export function hitImages(view, polygon) {
   }
 
   return { found, suggest }
+}
+
+function relOverlap(bbox, rel, nw, nh) {
+  if (!rel || !bbox) return 0
+  const box = { x: nw * rel.xRel, y: nh * rel.yRel, w: nw * rel.wRel, h: nh * rel.hRel }
+  const hit = intersectBoxes(bbox, box)
+  if (!hit) return 0
+  return (hit.w * hit.h) / Math.max(1, bbox.w * bbox.h)
+}
+
+function isTableBackground(span) {
+  const demo = DEMO_CUP[getDemoPage()]
+  if (!demo?.cup || !span?.bbox || !span.naturalSize) return false
+  const nw = span.naturalSize.w
+  const nh = span.naturalSize.h
+  const cupHit = relOverlap(span.bbox, demo.cup, nw, nh)
+  const packHit = relOverlap(span.bbox, demo.pack, nw, nh)
+  if (cupHit > 0.12 || packHit > 0.12) return false
+  const cx = (span.bbox.x + span.bbox.w / 2) / nw
+  const cy = (span.bbox.y + span.bbox.h / 2) / nh
+  return cy > 0.74 || (cx > 0.58 && cy > 0.64 && cupHit < 0.08 && packHit < 0.08)
+}
+
+/** True when the painted pixels cover the cup/packaging, not empty table. */
+export function isObjectImageHit(span) {
+  if (!span || span.kind !== 'image' || !span.bbox || !span.naturalSize) return false
+  const demo = DEMO_CUP[getDemoPage()]
+  if (!demo?.cup) return true
+  const nw = span.naturalSize.w
+  const nh = span.naturalSize.h
+  const cupHit = relOverlap(span.bbox, demo.cup, nw, nh)
+  const packHit = relOverlap(span.bbox, demo.pack, nw, nh)
+  if (cupHit > 0.12 || packHit > 0.12) return true
+  return !isTableBackground(span)
+}
+
+export function contentImageHits(hits) {
+  if (!hits) return { found: [], suggest: [] }
+  return {
+    found: hits.found.filter(isObjectImageHit),
+    suggest: hits.suggest.filter(isObjectImageHit),
+  }
+}
+
+/** Small box drawn just left of a paragraph/heading first line → indent target. */
+export function findIndentTarget(view, box) {
+  if (!view || !box || box.w < 8 || box.h < 8 || box.w > 110 || box.h > 110) return null
+  const aspect = box.w / Math.max(1, box.h)
+  if (aspect < 0.35 || aspect > 2.6) return null
+  const skip = new Set(['p-price', 'p-ship'])
+  const pcx = box.x + box.w / 2
+  const pcy = box.y + box.h / 2
+  let best = null
+  let bestScore = Infinity
+  view.state.doc.descendants((node, pos) => {
+    if (!node.isTextblock || !node.textContent) return true
+    const blockId = node.attrs?.blockId
+    if (skip.has(blockId)) return true
+    const start = pos + 1
+    let coords
+    try {
+      coords = view.coordsAtPos(start)
+    } catch {
+      return true
+    }
+    if (!coords) return true
+    const left = coords.left
+    const top = coords.top
+    const lineH = Math.max(16, coords.bottom - coords.top)
+    const toLeft = pcx < left + 64
+    const nearLeft = pcx > left - 140
+    const vert = pcy > top - 48 && pcy < top + Math.max(lineH * 2.8, 88)
+    if (!toLeft || !nearLeft || !vert) return true
+    const score = Math.abs(pcx - (left - Math.min(28, box.w / 2))) + Math.abs(pcy - (top + lineH / 2))
+    if (score < bestScore) {
+      bestScore = score
+      best = { block_id: blockId || `pos-${pos}`, pos: start, coords }
+    }
+    return true
+  })
+  return best
 }
 
 export function hitPageSlot(polygon, view) {

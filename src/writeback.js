@@ -71,6 +71,10 @@ export async function runWriteback(kind, editor, notify) {
   const picked = targets().filter((s) => s.kind !== 'slot')
   const scoped = picked.filter((s) => !s.frozen && !isForbiddenSpan(s))
   if (!picked.length) {
+    if (getSnapshot().spans.some((s) => s.kind === 'slot')) {
+      notify('涂到的是空白，改不了颜色。请涂在杯子或包装盒上；空白处可加阴影、空两格或插入')
+      return
+    }
     notify('先勾选「将改」。取消勾选即可这次不动某一项')
     return
   }
@@ -95,7 +99,7 @@ export async function runWriteback(kind, editor, notify) {
 
   if (scope === 'inside' && kind !== 'delete') {
     const next = []
-    if (colorIntent) {
+    if (colorIntent && !images.length) {
       const cup = collectCupBody(editor.view)
       if (cup) next.push(cup)
     }

@@ -1,4 +1,4 @@
-import { normalizeLasso, pathLength } from './geometry.js'
+import { pathLength, looksLikeXStroke, strokeToPolygon } from './geometry.js'
 import { ping } from './store.js'
 
 const MIN_PATH = 28
@@ -104,19 +104,53 @@ function uiTarget(e) {
   return el?.closest?.('.hl-handle, .img-handle, .badge, .toolbar, .topbar, .inspector, .suggest, .confirm, .change-badge')
 }
 
+let paintMarks = []
+
+export function keepPaintMark(points, { append = false, color = '#3c6fd4' } = {}) {
+  if (!points?.length) return
+  if (!append) paintMarks = []
+  paintMarks.push({
+    points: points.map((p) => ({ x: p.x, y: p.y })),
+    color,
+  })
+  renderPaintMarks()
+}
+
+export function clearPaintMarks() {
+  paintMarks = []
+  renderPaintMarks()
+}
+
+function renderPaintMarks() {
+  const svg = document.getElementById('paint-layer')
+  if (!svg) return
+  svg.replaceChildren()
+  for (const mark of paintMarks) {
+    if (mark.points.length < 2) continue
+    const line = document.createElementNS('http://www.w3.org/2000/svg', 'polyline')
+    line.setAttribute('fill', 'none')
+    line.setAttribute('stroke', mark.color)
+    line.setAttribute('stroke-width', '4.5')
+    line.setAttribute('stroke-linecap', 'round')
+    line.setAttribute('stroke-linejoin', 'round')
+    line.setAttribute('opacity', '0.72')
+    line.setAttribute('vector-effect', 'non-scaling-stroke')
+    line.setAttribute('points', mark.points.map((p) => `${p.x},${p.y}`).join(' '))
+    svg.append(line)
+  }
+}
+
 export function bindLasso({ onBegin, onMove, onFinish, onCancel }) {
   const svg = document.getElementById('lasso-layer')
   let drawing = false
   let armed = false
   let points = []
-  let poly = null
   let line = null
   let shiftHeld = false
   let subtractHeld = false
 
   function clearSvg() {
     svg.replaceChildren()
-    poly = null
     line = null
   }
 
@@ -126,44 +160,29 @@ export function bindLasso({ onBegin, onMove, onFinish, onCancel }) {
     if (e.ctrlKey || e.metaKey || subtractMode || e.altKey) subtractHeld = true
   }
 
-  function draw(pts, closed) {
+  function draw(pts) {
     if (!pts.length) return
     const erase = subtractHeld || subtractMode
     const color = erase ? '#b44532' : colorMode ? '#7b4cc4' : addMode || shiftHeld ? '#2f8f5b' : '#3c6fd4'
-    const fill = erase
-      ? 'rgba(180, 70, 50, 0.12)'
-      : colorMode
-        ? 'rgba(123, 76, 196, 0.12)'
-        : addMode || shiftHeld
-          ? 'rgba(47, 143, 91, 0.10)'
-          : 'rgba(60, 111, 212, 0.08)'
-    if (!poly) {
-      poly = document.createElementNS('http://www.w3.org/2000/svg', 'polygon')
-      poly.setAttribute('stroke-width', '1.5')
-      poly.setAttribute('stroke-dasharray', '5 4')
-      poly.setAttribute('vector-effect', 'non-scaling-stroke')
-      svg.append(poly)
+    if (!line) {
       line = document.createElementNS('http://www.w3.org/2000/svg', 'polyline')
       line.setAttribute('fill', 'none')
-      line.setAttribute('stroke-width', '1.5')
-      line.setAttribute('stroke-dasharray', '5 4')
+      line.setAttribute('stroke-width', '4.5')
+      line.setAttribute('stroke-linecap', 'round')
+      line.setAttribute('stroke-linejoin', 'round')
+      line.setAttribute('opacity', '0.9')
       line.setAttribute('vector-effect', 'non-scaling-stroke')
       svg.append(line)
     }
-    poly.setAttribute('fill', fill)
-    poly.setAttribute('stroke', color)
     line.setAttribute('stroke', color)
-    const d = pts.map((p) => `${p.x},${p.y}`).join(' ')
-    poly.setAttribute('points', d)
-    line.setAttribute('points', d)
-    poly.style.display = closed ? 'block' : 'none'
+    line.setAttribute('points', pts.map((p) => `${p.x},${p.y}`).join(' '))
   }
 
   function beginDraw() {
     drawing = true
     document.body.classList.add('is-lassoing')
     clearSvg()
-    draw(points, false)
+    draw(points)
     onBegin?.()
   }
 
@@ -178,21 +197,26 @@ export function bindLasso({ onBegin, onMove, onFinish, onCancel }) {
       return
     }
     if (e) points.push({ x: e.clientX, y: e.clientY })
-    const polygon = normalizeLasso(points)
+    const polygon = strokeToPolygon(points, 8)
     const tooSmall = polygon.length < 3 || pathLength(points) < MIN_PATH
     if (tooSmall) {
       clearSvg()
       onCancel?.({ drew: true })
       return
     }
-    draw(polygon, true)
-    window.setTimeout(clearSvg, 280)
-    onFinish?.(polygon, {
+    const persist = onFinish?.(polygon, {
       shift: shiftHeld && !subtractHeld,
       subtract: subtractHeld,
       add: addMode && !subtractHeld,
       color: colorMode && !subtractHeld,
+      crossOut: looksLikeXStroke(points),
+      rawPoints: points.map((p) => ({ x: p.x, y: p.y })),
     })
+    const color = subtractHeld || subtractMode ? '#b44532' : colorMode ? '#7b4cc4' : addMode || shiftHeld ? '#2f8f5b' : '#3c6fd4'
+    if (persist !== false) {
+      keepPaintMark(points, { append: shiftHeld && !subtractHeld, color })
+    }
+    clearSvg()
   }
 
   function onPointerDown(e) {
@@ -216,7 +240,7 @@ export function bindLasso({ onBegin, onMove, onFinish, onCancel }) {
     points.push({ x: e.clientX, y: e.clientY })
     if (!drawing && pathLength(points) >= START_MOVE) beginDraw()
     if (drawing) {
-      draw(points, false)
+      draw(points)
       onMove?.(points)
     }
   }

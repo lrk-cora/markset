@@ -6,12 +6,24 @@ import { applyScopeAfterSelect, visibleSuggests } from './scope.js'
 import { snapExistingMark } from './contour.js'
 import { runWriteback } from './writeback.js'
 import { redoChange, restoreChange } from './changes.js'
-import { addCoachMarks, fillNoviceCard, idleCard } from './card-flow.js'
+import {
+  addCoachMarks,
+  canUndoLocal,
+  eraseWrittenNote,
+  fillNoviceCard,
+  getCard,
+  idleCard,
+  peekLocalUndoAt,
+  peekLocalUndoLabel,
+  undoLastLocalAction,
+} from './card-flow.js'
+import { clearInk, hasInk, undoLastInkStroke } from './ink.js'
 import {
   appendSpans,
   beginInsertUndo,
   canUndoInsert,
   clearAll,
+  lastWriteUndoAt,
   finishInsert,
   getSnapshot,
   refreshImageLayout,
@@ -439,8 +451,8 @@ function renderList(editor) {
     const empty = document.createElement('li')
     empty.className = 'muted'
     empty.textContent = isLassoMode()
-      ? '还没有选中。套索圈字、图，或页上空白。'
-      : '这是改后的页面。点顶栏「套索」继续改，「撤回全部」撤销上次。'
+      ? '还没有选中。先用画笔涂过字或图，再在旁边写出要做什么。'
+      : '这是改后的页面。点顶栏「画笔」继续改，「撤回全部」撤销上次。'
     list.append(empty)
   } else {
     for (const span of snap.spans) {
@@ -456,6 +468,8 @@ function renderList(editor) {
       const detail = document.createElement('span')
       if (span.frozen) detail.textContent = `${span.text}（禁改）`
       else if (span.kind === 'text') detail.textContent = span.text
+      else if (span.indentMark) detail.textContent = '段前格子 · 再画一个可空两格'
+      else if (span.paintMark) detail.textContent = '空白笔迹 · 阴影 / 空两格 / 插入'
       else if (span.kind === 'slot') detail.textContent = '页上空白 · 插入文字或图'
       else detail.textContent = span.mode === 'background' ? '图 · 背景' : '图 · 一块像素'
       li.append(check, name, detail)
@@ -640,7 +654,7 @@ export function renderChrome(editor) {
     layer.append(s)
   }
 
-  if (snap.spans.length || (snap.changes || []).length) {
+  if (snap.spans.length || (snap.changes || []).length || canUndoLocal()) {
     const bar = document.createElement('div')
     bar.className = 'toolbar novice-card'
     bar.append(bindToolbarMove(bar))
@@ -661,34 +675,77 @@ export function renderChrome(editor) {
   addChangeBadges(layer, editor)
   renderList(editor)
   inspector.textContent = JSON.stringify(toSpec(), null, 2)
+  syncUndoButton()
+}
+
+function localUndoIsLatest() {
+  if (!canUndoLocal()) return false
+  if (!canUndoInsert()) return true
+  return peekLocalUndoAt() >= lastWriteUndoAt()
+}
+
+function syncUndoButton() {
   const undoTop = document.getElementById('btn-undo')
-  if (undoTop) {
+  if (!undoTop) return
+  if (localUndoIsLatest()) {
+    const label = peekLocalUndoLabel()
+    undoTop.hidden = false
+    undoTop.textContent = '撤回刚才'
+    undoTop.title = `撤回「${label}」（Ctrl+Z）`
+    return
+  }
+  if (canUndoInsert()) {
+    undoTop.hidden = false
     undoTop.textContent = '撤回全部'
     undoTop.title = '撤回上次写入或插入（Ctrl+Z）'
-    undoTop.hidden = !canUndoInsert()
+    return
   }
+  undoTop.hidden = true
+}
+
+function performUndo(editor) {
+  if (localUndoIsLatest()) {
+    const label = undoLastLocalAction(editor)
+    if (label) toast(`已撤回${label}`)
+    return true
+  }
+  if (canUndoInsert() && undoLastInsert(editor)) {
+    idleCard()
+    toast('已撤回整次修改')
+    return true
+  }
+  return false
 }
 
 export function bindChromeKeys(editor) {
   document.getElementById('btn-undo')?.addEventListener('click', () => {
-    if (canUndoInsert() && undoLastInsert(editor)) {
-      idleCard()
-      toast('已撤回整次修改')
-    }
+    performUndo(editor)
   })
 
   window.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') {
       clearAll()
       idleCard()
+      clearInk()
+    }
+    if (e.key === 'Backspace' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return
+      if (hasInk()) {
+        e.preventDefault()
+        undoLastInkStroke()
+        toast(hasInk() ? '已擦掉上一笔，可继续写' : '字已擦掉，可再写')
+        return
+      }
+      if (getCard().noteText) {
+        e.preventDefault()
+        eraseWrittenNote()
+        toast('字已擦掉，可再写')
+        return
+      }
     }
     if ((e.ctrlKey || e.metaKey) && (e.key === 'z' || e.key === 'Z') && !e.shiftKey) {
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return
-      if (canUndoInsert() && undoLastInsert(editor)) {
-        e.preventDefault()
-        idleCard()
-        toast('已撤回整次修改')
-      }
+      if (performUndo(editor)) e.preventDefault()
     }
   })
 

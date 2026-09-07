@@ -204,6 +204,13 @@ export function setImagesWillEdit(on) {
   if (changed) emit()
 }
 
+export function keepKindsWillEdit(kind) {
+  state.spans = state.spans.map((s) => {
+    if (s.kind === 'slot' || s.frozen) return s
+    return { ...s, willEdit: s.kind === kind }
+  })
+}
+
 export function setScope(scope) {
   if (!['inside', 'follow', 'anchor'].includes(scope)) return
   if (state.scope === scope) return
@@ -235,6 +242,7 @@ function remapTextSpan(span, mapping, doc) {
 
 export function beginInsertUndo(editor) {
   insertUndo = {
+    at: Date.now(),
     json: editor.getJSON(),
     spans: state.spans.map((s) => ({ ...s })),
     commandText: state.commandText,
@@ -243,6 +251,10 @@ export function beginInsertUndo(editor) {
 
 export function canUndoInsert() {
   return Boolean(insertUndo) || Boolean(writeUndo)
+}
+
+export function lastWriteUndoAt() {
+  return writeUndo?.at || insertUndo?.at || 0
 }
 
 export function undoLastInsert(editor) {
@@ -258,11 +270,14 @@ export function undoLastInsert(editor) {
 }
 
 export function beginWriteUndo(editor, baseline) {
-  writeUndo = baseline || {
-    json: editor.getJSON(),
-    spans: state.spans.map((s) => ({ ...s })),
-    commandText: state.commandText,
-  }
+  writeUndo = baseline
+    ? { ...baseline, at: Date.now() }
+    : {
+        at: Date.now(),
+        json: editor.getJSON(),
+        spans: state.spans.map((s) => ({ ...s })),
+        commandText: state.commandText,
+      }
 }
 
 export function undoLastWrite(editor) {

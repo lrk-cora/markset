@@ -1,4 +1,4 @@
-import { Editor, Extension } from '@tiptap/core'
+import { Editor, Extension, Mark } from '@tiptap/core'
 import Image from '@tiptap/extension-image'
 import StarterKit from '@tiptap/starter-kit'
 import { Plugin, PluginKey } from '@tiptap/pm/state'
@@ -120,6 +120,22 @@ const DocImage = Image.extend({
   },
 })
 
+export const TextAnno = Mark.create({
+  name: 'textAnno',
+  addAttributes() {
+    return {
+      kind: { default: 'underline' },
+    }
+  },
+  parseHTML() {
+    return [{ tag: 'span[data-text-anno]' }]
+  },
+  renderHTML({ HTMLAttributes }) {
+    const kind = HTMLAttributes.kind || 'underline'
+    return ['span', { 'data-text-anno': kind, class: `text-anno is-${kind}` }, 0]
+  },
+})
+
 const SelectionHighlight = Extension.create({
   name: 'selectionHighlight',
   addProseMirrorPlugins() {
@@ -165,11 +181,13 @@ export const DEMO_CUP = {
   a: {
     file: 'cup-a.png',
     cup: { xRel: 0.05, yRel: 0.16, wRel: 0.52, hRel: 0.70 },
+    pack: { xRel: 0.46, yRel: 0.18, wRel: 0.52, hRel: 0.62 },
     print: { xRel: 0.12, yRel: 0.38, wRel: 0.36, hRel: 0.24 },
   },
   b: {
     file: 'cup-b.png',
     cup: { xRel: 0.05, yRel: 0.14, wRel: 0.52, hRel: 0.72 },
+    pack: { xRel: 0.46, yRel: 0.16, wRel: 0.52, hRel: 0.64 },
     print: { xRel: 0.10, yRel: 0.40, wRel: 0.38, hRel: 0.22 },
   },
 }
@@ -277,6 +295,7 @@ export function createEditor(element) {
       DocImage,
       BlockId,
       Placed,
+      TextAnno,
       SelectionHighlight,
     ],
     editorProps: {

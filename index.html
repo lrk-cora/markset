@@ -10,13 +10,14 @@
       <header class="topbar">
         <div class="brand">
           <span class="mark">MarkSet</span>
-          <span class="week">新手分批卡片</span>
+          <span class="week">画完后出选项</span>
         </div>
         <div class="top-actions">
           <button type="button" class="mode-btn is-on" data-demo-page="a">页 A</button>
           <button type="button" class="mode-btn" data-demo-page="b">页 B</button>
-          <button type="button" id="btn-lasso" class="mode-btn" aria-pressed="false">套索</button>
+          <button type="button" id="btn-lasso" class="mode-btn" aria-pressed="false">画笔</button>
           <button type="button" id="btn-subtract" class="mode-btn" aria-pressed="false">减选</button>
+          <button type="button" id="btn-recolor" class="mode-btn">换配色</button>
           <button type="button" id="btn-undo" class="mode-btn" hidden>撤回全部</button>
           <button type="button" id="btn-api" class="mode-btn">检查接口</button>
           <label class="allow-models" title="默认关闭。套索、改选区、检查接口从不消耗额度。只有勾上后，改写/改图才会打百炼或 fal。">
@@ -28,7 +29,7 @@
             松手自动贴物体
           </label>
           <p class="hint">
-            <kbd>Shift</kbd> 加上　<kbd>Alt</kbd> 减选　改完点页面空白结束编辑　<kbd>Ctrl</kbd>+<kbd>Z</kbd> 撤回　<kbd>Esc</kbd> 清空
+            涂过字或图，再在旁边写出要做什么　写错 <kbd>Backspace</kbd>　选区上打 <kbd>×</kbd>　<kbd>Shift</kbd> 加上　<kbd>Alt</kbd> 减选　<kbd>Esc</kbd> 清掉　<kbd>Ctrl+Z</kbd> 撤回
           </p>
         </div>
       </header>
@@ -43,9 +44,9 @@
 
         <aside class="inspector" aria-label="当前篮子">
           <h2>选中列表</h2>
-          <p class="inspector-lead">圈住要改的字或杯子。卡片会先问做什么，需要时再问还改别处吗。改完按处标出，可还原一处或撤回全部。价格、物流不改。</p>
+          <p class="inspector-lead">用画笔涂过要改的字或图，再在旁边手写一两个字。系统按写下的字推测操作，由你点选。写错可擦掉重写。认不出时仍给通用项。价格、物流不改。</p>
           <ul id="selection-list" class="selection-list"></ul>
-          <h2>未圈全</h2>
+          <h2>未涂全</h2>
           <ul id="suggest-list" class="selection-list"></ul>
           <pre id="inspector-json">{}</pre>
         </aside>
@@ -53,6 +54,8 @@
     </div>
 
     <svg id="lasso-layer" class="lasso-layer" aria-hidden="true"></svg>
+    <svg id="paint-layer" class="paint-layer" aria-hidden="true"></svg>
+    <svg id="ink-layer" class="ink-layer" aria-hidden="true"></svg>
     <div id="chrome-layer" class="chrome-layer"></div>
     <div id="toast" class="toast" hidden></div>
 

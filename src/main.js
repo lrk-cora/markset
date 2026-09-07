@@ -3,7 +3,10 @@ import { applyDemoPage, createEditor, refreshDecorations } from './editor.js'
 import { bindChromeKeys, renderChrome, toast } from './chrome.js'
 import { fetchHealth, isClientModelGateOn, setClientModelGate } from './api.js'
 import { canSnap, consumePackagingHint, consumeSkipObjectSnap, peekPackagingHint, peekSkipObjectSnap, setSnapOn, snapImageHits } from './contour.js'
+import { aabb, looksLikeBoxStroke } from './geometry.js'
 import {
+  contentImageHits,
+  findIndentTarget,
   hitImageAt,
   hitImages,
   hitPageSlot,
@@ -16,7 +19,8 @@ import { bindLasso, isAddMode, isColorMode, isLassoMode, isSubtractMode, setLass
 import { applyScopeAfterSelect } from './scope.js'
 import { guessStrokePrompt } from './vision-tasks.js'
 import { dismissChanges } from './changes.js'
-import { dismissCoach, getCard, idleCard, keepCardForAppend, resetCardForNewSelection } from './card-flow.js'
+import { clearLocalUndos, dismissCoach, getCard, idleCard, keepCardForAppend, markCrossOut, openPageRecolor, applyWrittenNote, paintLooksLikeCupShadow, resetCardForNewSelection, setPaintGesture } from './card-flow.js'
+import { addInkStroke, clearInk, hasInk, isLikelyInk, onInkRecognized } from './ink.js'
 import { exitToView } from './view-mode.js'
 import {
   appendSpans,
@@ -46,6 +50,10 @@ subscribe(() => {
 bindChromeKeys(editor)
 setLassoMode(true)
 forceModelsOff()
+onInkRecognized(({ text, confident }) => {
+  applyWrittenNote(text, { confident })
+  if (!text) toast('字没认清，先给通用项。可在旁边再写')
+})
 renderChrome(editor)
 
 function forceModelsOff() {
@@ -71,6 +79,8 @@ document.querySelectorAll('[data-demo-page]').forEach((btn) => {
     currentPage = id
     clearAll()
     idleCard()
+    clearInk()
+    clearLocalUndos()
     applyDemoPage(editor, id)
     document.querySelectorAll('[data-demo-page]').forEach((el) => {
       el.classList.toggle('is-on', el.getAttribute('data-demo-page') === id)
@@ -134,6 +144,11 @@ document.getElementById('btn-subtract')?.addEventListener('click', () => {
   setSubtractMode(!isSubtractMode())
 })
 
+document.getElementById('btn-recolor')?.addEventListener('click', () => {
+  if (openPageRecolor(editor)) toast('已圈出色词和杯子。点一套配色，或改成同一颜色')
+  else toast('页上没有现成色词。先圈要改颜色的字或图，再在旁边写「色」')
+})
+
 let ignoreClickUntil = 0
 
 function finishSelect(extra = []) {
@@ -144,7 +159,19 @@ function hintAfterSelect(spans) {
   if (looksLikePriceBleed(spans)) toast('价格是禁改区，请拖蓝条剔出或不要勾选', 4200)
 }
 
-function applyHits(textHits, imageHits, polygon, { append, subtract, add, color }) {
+function emptyPaintSpan(rawPoints, polygon) {
+  const box = aabb(rawPoints?.length ? rawPoints : polygon)
+  if (!(box.w > 6 && box.h > 6)) return null
+  return {
+    kind: 'slot',
+    screenRect: box,
+    poly: polygon,
+    paintMark: true,
+    why: 'paint-empty',
+  }
+}
+
+function applyHits(textHits, imageHits, polygon, { append, subtract, add, color, rawPoints }) {
   if (hasChanges()) dismissChanges()
   const suggests = [...textHits.suggest]
   const imgs = [...imageHits.found, ...((append || subtract || add || color) ? imageHits.suggest : [])]
@@ -191,9 +218,10 @@ function applyHits(textHits, imageHits, polygon, { append, subtract, add, color 
   }
 
   if (append) {
-    const extra = [...textHits.found, ...imgs]
-    if (!imgs.length && !textHits.found.length) {
-      const slot = hitPageSlot(polygon, editor.view)
+    const objectHits = contentImageHits({ found: imgs, suggest: [] }).found
+    const extra = [...textHits.found, ...objectHits]
+    if (!extra.length) {
+      const slot = emptyPaintSpan(rawPoints, polygon) || hitPageSlot(polygon, editor.view)
       if (slot) extra.push(slot)
     }
     if (extra.length) {
@@ -205,7 +233,7 @@ function applyHits(textHits, imageHits, polygon, { append, subtract, add, color 
         toast('已加上包装上的字（不贴物体）', 4200)
         finishSelect(suggests)
       } else {
-        toast(addedImg ? '已另作编号加上这块图（一张图两件货用 Shift 再圈）' : '已加上')
+        toast(addedImg ? '已另作编号加上这块图（一张图两件货用 Shift 再圈）' : extra.some((s) => s.paintMark) ? '已记下这笔。没涂到字或杯子' : '已加上')
         finishSelect(suggests)
         hintAfterSelect(extra)
       }
@@ -214,21 +242,31 @@ function applyHits(textHits, imageHits, polygon, { append, subtract, add, color 
     return
   }
 
-  const next = [...textHits.found, ...imageHits.found]
+  const objectHits = contentImageHits(imageHits)
+  const next = [...textHits.found, ...objectHits.found]
   if (!next.length) {
-    if (suggests.length) {
-      finishSelect(suggests)
+    const slot = emptyPaintSpan(rawPoints, polygon) || hitPageSlot(polygon, editor.view)
+    const existing = getSnapshot().spans
+    const keepContent = existing.some((s) => s.kind === 'text' || s.kind === 'image')
+    if (slot && keepContent) {
+      appendSpans([slot], editor.state.doc)
+      keepCardForAppend()
+      dismissCoach()
+      toast('没涂到字或杯子。可加阴影、空两格，或加框 / 线 / 插入')
       return
     }
-    const slot = hitPageSlot(polygon, editor.view)
     if (slot) {
       replaceSpans([slot])
       resetCardForNewSelection()
       dismissCoach()
-      toast('空白槽：插入会放在你圈的位置')
+      toast('没涂到字或杯子。可加阴影、空两格，或加框 / 线 / 插入')
       return
     }
-    toast('圈字、图上的像素（含桌面空白），或页上空白处')
+    if (suggests.length) {
+      finishSelect(suggests)
+      return
+    }
+    toast('涂过字或杯子，或在空白处画一笔')
     return
   }
   replaceSpans(next)
@@ -243,21 +281,104 @@ function applyHits(textHits, imageHits, polygon, { append, subtract, add, color 
   hintAfterSelect(next)
 }
 
+function indentSpanFromStroke(rawPoints, polygon) {
+  const box = aabb(rawPoints)
+  const compact =
+    box.w >= 10 && box.h >= 10 && box.w <= 110 && box.h <= 110 && box.w / Math.max(1, box.h) >= 0.4 && box.w / Math.max(1, box.h) <= 2.5
+  if (!looksLikeBoxStroke(rawPoints) && !compact) return null
+  let para = findIndentTarget(editor.view, box)
+  const existing = getSnapshot().spans.filter((s) => s.indentMark || (s.paintMark && s.screenRect && s.screenRect.w <= 110))
+  if (!para && existing.length) {
+    const prev = existing[existing.length - 1]
+    const pr = prev.screenRect
+    const nearPrev = pr && Math.abs(box.y - pr.y) < 100 && Math.abs(box.x - pr.x) < 120
+    if (nearPrev) para = { block_id: prev.block_id, pos: prev.paraPos }
+  }
+  if (!para) return null
+  return {
+    kind: 'slot',
+    indentMark: true,
+    block_id: para.block_id,
+    paraPos: para.pos,
+    screenRect: box,
+    poly: polygon,
+    why: 'indent-box',
+  }
+}
+
 bindLasso({
   onBegin() {
     ignoreClickUntil = Number.POSITIVE_INFINITY
   },
-  onFinish(polygon, { shift, subtract, add, color }) {
+  onFinish(polygon, { shift, subtract, add, color, crossOut, rawPoints }) {
     ignoreClickUntil = performance.now() + 400
+    if (crossOut && getSnapshot().spans.length && !shift && !subtract && !add && !color) {
+      markCrossOut()
+      toast('圈上打了 ×，当作删除。点一项确认')
+      return false
+    }
+    if (
+      !shift &&
+      !subtract &&
+      !add &&
+      !color &&
+      hasInk() &&
+      isLikelyInk(rawPoints, { hasSelection: true, hasNewContent: false })
+    ) {
+      addInkStroke(rawPoints)
+      return false
+    }
+    const indentSpan = !subtract && !add && !color ? indentSpanFromStroke(rawPoints, polygon) : null
+    if (indentSpan) {
+      const existing = getSnapshot().spans.filter((s) => s.indentMark)
+      clearInk()
+      setPaintGesture(rawPoints, { silent: true })
+      if (existing.length === 0) {
+        replaceSpans([indentSpan])
+        resetCardForNewSelection()
+        dismissCoach()
+        toast('再在段前画一个小方格，就会空两格')
+      } else {
+        appendSpans([indentSpan], editor.state.doc)
+        keepCardForAppend()
+        dismissCoach()
+        toast('已记下两个格子。点「这段空两格」')
+      }
+      return
+    }
+    if (rawPoints?.length) setPaintGesture(rawPoints, { silent: true })
     const textHits = hitText(editor.view, polygon, { skipCovered: shift && !subtract })
-    const imageHits = hitImages(editor.view, polygon)
+    const rawImageHits = hitImages(editor.view, polygon)
+    const imageHits = subtract || add || color ? rawImageHits : contentImageHits(rawImageHits)
     const hasImage = imageHits.found.length + imageHits.suggest.length > 0
+    const selected = getSnapshot().spans
+    const newText = textHits.found.filter((s) => !selected.some((c) => c.kind === 'text' && c.from === s.from && c.to === s.to))
+    const newImg = imageHits.found.filter(
+      (s) => !isTinyImageSpan(s) && !selected.some((c) => c.kind === 'image' && c.block_id === s.block_id),
+    )
+    const asShadow = paintLooksLikeCupShadow(rawPoints, editor)
+    if (
+      !shift &&
+      !subtract &&
+      !add &&
+      !color &&
+      !asShadow &&
+      isLikelyInk(rawPoints, {
+        hasSelection: selected.length > 0,
+        hasNewContent: newText.length + newImg.length > 0,
+      })
+    ) {
+      addInkStroke(rawPoints)
+      return false
+    }
+    if (!(shift || subtract || add || color)) clearInk()
     const apply = (images) =>
       applyHits(textHits, images, polygon, {
         append: (shift && !subtract && !add && !color) || (peekPackagingHint() && hasImage),
         subtract,
         add,
         color,
+        rawPoints,
       })
     const skipSnap = peekSkipObjectSnap() && hasImage
     const hasBig = [...imageHits.found, ...imageHits.suggest].some((s) => !isTinyImageSpan(s))
@@ -302,13 +423,13 @@ window.addEventListener(
       if (changing) {
         dismissChanges()
         idleCard()
-        toast('已收起改处标记。这是改后的页面。点「套索」可继续改，「撤回全部」可撤销')
+        toast('已收起改处标记。这是改后的页面。点「画笔」可继续改，「撤回全部」可撤销')
         return
       }
       if (!hasSpans) return
       exitToView()
       idleCard()
-      toast('已结束编辑。这是改后的页面。点「套索」可继续改，「撤回全部」可撤销')
+      toast('已结束编辑。这是改后的页面。点「画笔」可继续改，「撤回全部」可撤销')
       return
     }
 
