@@ -15,11 +15,11 @@ import {
   isTinyImageSpan,
   looksLikePriceBleed,
 } from './hit-test.js'
-import { bindLasso, isAddMode, isColorMode, isLassoMode, isSubtractMode, setLassoMode, setSubtractMode } from './overlay.js'
+import { bindLasso, getStrokeColor, isAddMode, isColorMode, isLassoMode, isLayoutPen, isSubtractMode, LAYOUT_PENS, SELECT_COLOR, setLassoMode, setStrokeColor, setSubtractMode } from './overlay.js'
 import { applyScopeAfterSelect } from './scope.js'
 import { guessStrokePrompt } from './vision-tasks.js'
-import { dismissChanges } from './changes.js'
-import { clearLocalUndos, dismissCoach, getCard, idleCard, keepCardForAppend, markCrossOut, openPageRecolor, applyWrittenNote, paintLooksLikeCupShadow, resetCardForNewSelection, setPaintGesture } from './card-flow.js'
+import { ingestLayoutStroke } from './layout.js'
+import { clearLocalUndos, dismissCoach, getCard, idleCard, keepCardForAppend, markCrossOut, openPageRecolor, applyWrittenNote, paintLooksLikeCupShadow, resetCardForNewSelection, resetPagePaper, setPaintGesture } from './card-flow.js'
 import { addInkStroke, clearInk, hasInk, isLikelyInk, onInkRecognized } from './ink.js'
 import { exitToView } from './view-mode.js'
 import {
@@ -81,6 +81,7 @@ document.querySelectorAll('[data-demo-page]').forEach((btn) => {
     idleCard()
     clearInk()
     clearLocalUndos()
+    resetPagePaper()
     applyDemoPage(editor, id)
     document.querySelectorAll('[data-demo-page]').forEach((el) => {
       el.classList.toggle('is-on', el.getAttribute('data-demo-page') === id)
@@ -137,15 +138,57 @@ document.getElementById('btn-api')?.addEventListener('click', async () => {
 })
 
 document.getElementById('btn-lasso')?.addEventListener('click', () => {
-  if (isSubtractMode() || isAddMode() || isColorMode()) setLassoMode(true)
-  else setLassoMode(!isLassoMode())
+  if (isSubtractMode() || isAddMode() || isColorMode() || isLayoutPen()) {
+    setStrokeColor(SELECT_COLOR)
+    setLassoMode(true)
+  } else setLassoMode(!isLassoMode())
 })
 document.getElementById('btn-subtract')?.addEventListener('click', () => {
   setSubtractMode(!isSubtractMode())
 })
 
+function bindPenColors() {
+  const host = document.getElementById('pen-colors')
+  if (!host) return
+  const selectGroup = document.createElement('div')
+  selectGroup.className = 'pen-group'
+  const selectCap = document.createElement('span')
+  selectCap.className = 'pen-group-label'
+  selectCap.textContent = '圈选批注'
+  selectGroup.append(selectCap)
+  const layoutGroup = document.createElement('div')
+  layoutGroup.className = 'pen-group'
+  const layoutCap = document.createElement('span')
+  layoutCap.className = 'pen-group-label'
+  layoutCap.textContent = '调整布局'
+  layoutGroup.append(layoutCap)
+  for (const pen of LAYOUT_PENS) {
+    const b = document.createElement('button')
+    b.type = 'button'
+    b.className = `pen-chip${pen.id === 'select' ? ' is-on' : ''}`
+    b.dataset.pen = pen.hex
+    b.dataset.penId = pen.id
+    b.title = pen.id === 'select' ? '圈选批注：圈要改的字或图' : `调整布局 · ${pen.label}笔：先圈模块，再用同一颜色圈落点`
+    b.setAttribute('aria-label', pen.id === 'select' ? '圈选批注' : `调整布局 ${pen.label}`)
+    b.style.setProperty('--pen', pen.hex)
+    b.addEventListener('click', () => {
+      setStrokeColor(pen.hex)
+      setLassoMode(true)
+      toast(
+        pen.id === 'select'
+          ? '蓝笔是圈选批注，圈要改的字或图'
+          : `${pen.label}笔用来调整布局：先圈模块，再用同一颜色圈落点，不会画出画面`,
+      )
+    })
+    if (pen.id === 'select') selectGroup.append(b)
+    else layoutGroup.append(b)
+  }
+  host.append(selectGroup, layoutGroup)
+}
+bindPenColors()
+
 document.getElementById('btn-recolor')?.addEventListener('click', () => {
-  if (openPageRecolor(editor)) toast('已圈出色词和杯子。点一套配色，或改成同一颜色')
+  if (openPageRecolor(editor)) toast('点一套配色：标题、正文、杯子、纸面会各用一色。再点某一块可单独改')
   else toast('页上没有现成色词。先圈要改颜色的字或图，再在旁边写「色」')
 })
 
@@ -322,13 +365,14 @@ bindLasso({
       !subtract &&
       !add &&
       !color &&
+      !isLayoutPen() &&
       hasInk() &&
       isLikelyInk(rawPoints, { hasSelection: true, hasNewContent: false })
     ) {
       addInkStroke(rawPoints)
       return false
     }
-    const indentSpan = !subtract && !add && !color ? indentSpanFromStroke(rawPoints, polygon) : null
+    const indentSpan = !subtract && !add && !color && !isLayoutPen() ? indentSpanFromStroke(rawPoints, polygon) : null
     if (indentSpan) {
       const existing = getSnapshot().spans.filter((s) => s.indentMark)
       clearInk()
@@ -362,6 +406,7 @@ bindLasso({
       !subtract &&
       !add &&
       !color &&
+      !isLayoutPen() &&
       !asShadow &&
       isLikelyInk(rawPoints, {
         hasSelection: selected.length > 0,
@@ -370,6 +415,26 @@ bindLasso({
     ) {
       addInkStroke(rawPoints)
       return false
+    }
+    if (isLayoutPen() && !subtract && !add && !color) {
+      clearInk()
+      const result = ingestLayoutStroke(editor, {
+        color: getStrokeColor(),
+        polygon,
+        rawPoints,
+        textHits,
+        imageHits,
+      })
+      keepCardForAppend()
+      dismissCoach()
+      if (result.phase === 'source') {
+        toast(`${result.label}笔已圈中「${result.preview}」。再用同一颜色圈要放到的位置`)
+      } else if (result.phase === 'paired') {
+        toast(`${result.label}笔已标明落点。可换一支颜色再挪另一块，或点「移到画出的位置」`)
+      } else {
+        toast(`${result.label}笔请先圈要挪的字或图，再圈它要去的位置`)
+      }
+      return
     }
     if (!(shift || subtract || add || color)) clearInk()
     const apply = (images) =>
@@ -406,7 +471,7 @@ window.addEventListener(
       return
     }
     const target = e.target instanceof Element ? e.target : e.target.parentElement
-    if (target?.closest('.chrome-layer, .inspector, .topbar, .suggest, .toolbar, .novice-card, .coach, .change-badge')) return
+    if (target?.closest('.chrome-layer, .inspector, .topbar, .suggest, .toolbar, .novice-card, .coach, .change-badge, .scheme-tag')) return
 
     const hasSpans = getSnapshot().spans.length > 0
     const changing = hasChanges()

@@ -110,10 +110,10 @@ function colorizeMasked(image, maskCanvas, rgb) {
     const b = data[i + 2]
     const luma = 0.299 * r + 0.587 * g + 0.114 * b
     const scale = luma / tLuma
-    const t = (a / 255) * 0.9
-    data[i] = clampByte(r * (1 - t) + tr * scale * t)
-    data[i + 1] = clampByte(g * (1 - t) + tg * scale * t)
-    data[i + 2] = clampByte(b * (1 - t) + tb * scale * t)
+    const t = (a / 255) * 0.95
+    data[i] = clampByte(r * (1 - t) + tr * Math.max(0.35, scale) * t)
+    data[i + 1] = clampByte(g * (1 - t) + tg * Math.max(0.35, scale) * t)
+    data[i + 2] = clampByte(b * (1 - t) + tb * Math.max(0.35, scale) * t)
   }
   ctx.putImageData(imgData, 0, 0)
   return out.toDataURL('image/png')

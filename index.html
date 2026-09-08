@@ -16,6 +16,7 @@
           <button type="button" class="mode-btn is-on" data-demo-page="a">页 A</button>
           <button type="button" class="mode-btn" data-demo-page="b">页 B</button>
           <button type="button" id="btn-lasso" class="mode-btn" aria-pressed="false">画笔</button>
+          <div class="pen-colors" id="pen-colors" role="group" aria-label="笔的颜色"></div>
           <button type="button" id="btn-subtract" class="mode-btn" aria-pressed="false">减选</button>
           <button type="button" id="btn-recolor" class="mode-btn">换配色</button>
           <button type="button" id="btn-undo" class="mode-btn" hidden>撤回全部</button>
@@ -29,7 +30,7 @@
             松手自动贴物体
           </label>
           <p class="hint">
-            涂过字或图，再在旁边写出要做什么　写错 <kbd>Backspace</kbd>　选区上打 <kbd>×</kbd>　<kbd>Shift</kbd> 加上　<kbd>Alt</kbd> 减选　<kbd>Esc</kbd> 清掉　<kbd>Ctrl+Z</kbd> 撤回
+            蓝笔圈选批注；红/绿/橙/青笔调整布局（先圈模块再圈落点）。写错 <kbd>Backspace</kbd>　选区上打 <kbd>×</kbd>　<kbd>Shift</kbd> 加上　<kbd>Alt</kbd> 减选　<kbd>Esc</kbd> 清掉　<kbd>Ctrl+Z</kbd> 撤回
           </p>
         </div>
       </header>

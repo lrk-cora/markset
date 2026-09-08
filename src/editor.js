@@ -3,6 +3,7 @@ import Image from '@tiptap/extension-image'
 import StarterKit from '@tiptap/starter-kit'
 import { Plugin, PluginKey } from '@tiptap/pm/state'
 import { Decoration, DecorationSet } from '@tiptap/pm/view'
+import { schemeTextFill } from './colors.js'
 import { getSnapshot } from './store.js'
 
 const BlockId = Extension.create({
@@ -19,6 +20,23 @@ const BlockId = Extension.create({
           },
         },
       },
+      {
+        types: ['paragraph', 'heading'],
+        attributes: {
+          inkColor: {
+            default: null,
+            parseHTML: (el) => el.getAttribute('data-ink-color'),
+            renderHTML: (attrs) => {
+              if (!attrs.inkColor) return {}
+              const fill = schemeTextFill(attrs.inkColor)
+              return {
+                'data-ink-color': attrs.inkColor,
+                style: `--ink-tint:${fill};color:${fill}`,
+              }
+            },
+          },
+        },
+      },
     ]
   },
 })
@@ -28,7 +46,7 @@ const Placed = Extension.create({
   addGlobalAttributes() {
     return [
       {
-        types: ['paragraph'],
+        types: ['paragraph', 'heading'],
         attributes: {
           placed: {
             default: null,
@@ -133,6 +151,31 @@ export const TextAnno = Mark.create({
   renderHTML({ HTMLAttributes }) {
     const kind = HTMLAttributes.kind || 'underline'
     return ['span', { 'data-text-anno': kind, class: `text-anno is-${kind}` }, 0]
+  },
+})
+
+export const TextTint = Mark.create({
+  name: 'textTint',
+  addAttributes() {
+    return {
+      color: { default: '' },
+      fill: { default: '' },
+    }
+  },
+  parseHTML() {
+    return [
+      {
+        tag: 'span[data-text-tint]',
+        getAttrs: (el) => ({
+          color: el.getAttribute('data-text-tint') || '',
+          fill: el.style?.color || '',
+        }),
+      },
+    ]
+  },
+  renderHTML({ HTMLAttributes }) {
+    const { color, fill, ...rest } = HTMLAttributes
+    return ['span', { ...rest, 'data-text-tint': color || '', style: fill ? `color:${fill}` : undefined }, 0]
   },
 })
 
@@ -296,6 +339,7 @@ export function createEditor(element) {
       BlockId,
       Placed,
       TextAnno,
+      TextTint,
       SelectionHighlight,
     ],
     editorProps: {

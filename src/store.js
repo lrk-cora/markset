@@ -144,6 +144,16 @@ export function replaceSpans(spans) {
   emit()
 }
 
+export function upsertSpan(matchFn, span) {
+  const next = [...state.spans]
+  const i = next.findIndex(matchFn)
+  if (i >= 0) next[i] = { ...next[i], ...span, markId: next[i].markId, willEdit: true }
+  else next.push({ ...span, willEdit: true })
+  state.spans = withMarks(tagFrozen(next))
+  state.suggest = []
+  emit()
+}
+
 function unionTextSpan(a, b, doc) {
   const from = Math.min(a.from, b.from)
   const to = Math.max(a.to, b.to)

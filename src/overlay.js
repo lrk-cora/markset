@@ -4,10 +4,21 @@ import { ping } from './store.js'
 const MIN_PATH = 28
 const START_MOVE = 8
 
+export const SELECT_COLOR = '#3c6fd4'
+
+export const LAYOUT_PENS = [
+  { id: 'select', hex: SELECT_COLOR, label: '圈选' },
+  { id: 'red', hex: '#d94c3d', label: '红' },
+  { id: 'green', hex: '#2f8f5b', label: '绿' },
+  { id: 'orange', hex: '#e08b3c', label: '橙' },
+  { id: 'teal', hex: '#2a9aa0', label: '青' },
+]
+
 let lassoMode = false
 let subtractMode = false
 let addMode = false
 let colorMode = false
+let strokeColor = SELECT_COLOR
 
 export function isLassoMode() {
   return lassoMode
@@ -25,6 +36,30 @@ export function isColorMode() {
   return colorMode
 }
 
+export function getStrokeColor() {
+  return strokeColor
+}
+
+export function isLayoutPen() {
+  return strokeColor.toLowerCase() !== SELECT_COLOR.toLowerCase()
+}
+
+export function layoutPenOf(hex = strokeColor) {
+  return LAYOUT_PENS.find((p) => p.hex.toLowerCase() === String(hex || '').toLowerCase()) || null
+}
+
+export function setStrokeColor(hex) {
+  strokeColor = hex || SELECT_COLOR
+  if (isLayoutPen()) {
+    lassoMode = true
+    subtractMode = false
+    addMode = false
+    colorMode = false
+  }
+  syncButtons()
+  ping()
+}
+
 function syncButtons() {
   document.body.classList.toggle('is-armed', lassoMode)
   document.body.classList.toggle('is-subtract', subtractMode)
@@ -40,6 +75,10 @@ function syncButtons() {
     sub.setAttribute('aria-pressed', String(subtractMode))
     sub.classList.toggle('is-on', subtractMode)
   }
+  document.querySelectorAll('[data-pen]').forEach((el) => {
+    const hex = el.getAttribute('data-pen') || ''
+    el.classList.toggle('is-on', hex.toLowerCase() === strokeColor.toLowerCase())
+  })
 }
 
 export function setLassoMode(on) {
@@ -101,7 +140,7 @@ export function setColorMode(on) {
 
 function uiTarget(e) {
   const el = e.target instanceof Element ? e.target : e.target.parentElement
-  return el?.closest?.('.hl-handle, .img-handle, .badge, .toolbar, .topbar, .inspector, .suggest, .confirm, .change-badge')
+  return el?.closest?.('.hl-handle, .img-handle, .badge, .scheme-tag, .toolbar, .topbar, .inspector, .suggest, .confirm, .change-badge')
 }
 
 let paintMarks = []
@@ -140,6 +179,14 @@ function renderPaintMarks() {
   }
 }
 
+function drawColor({ erase, shiftHeld } = {}) {
+  if (erase) return '#b44532'
+  if (colorMode) return '#7b4cc4'
+  if (isLayoutPen()) return strokeColor
+  if (addMode || shiftHeld) return '#2f8f5b'
+  return strokeColor
+}
+
 export function bindLasso({ onBegin, onMove, onFinish, onCancel }) {
   const svg = document.getElementById('lasso-layer')
   let drawing = false
@@ -163,7 +210,7 @@ export function bindLasso({ onBegin, onMove, onFinish, onCancel }) {
   function draw(pts) {
     if (!pts.length) return
     const erase = subtractHeld || subtractMode
-    const color = erase ? '#b44532' : colorMode ? '#7b4cc4' : addMode || shiftHeld ? '#2f8f5b' : '#3c6fd4'
+    const color = drawColor({ erase, shiftHeld })
     if (!line) {
       line = document.createElementNS('http://www.w3.org/2000/svg', 'polyline')
       line.setAttribute('fill', 'none')
@@ -212,9 +259,9 @@ export function bindLasso({ onBegin, onMove, onFinish, onCancel }) {
       crossOut: looksLikeXStroke(points),
       rawPoints: points.map((p) => ({ x: p.x, y: p.y })),
     })
-    const color = subtractHeld || subtractMode ? '#b44532' : colorMode ? '#7b4cc4' : addMode || shiftHeld ? '#2f8f5b' : '#3c6fd4'
+    const color = drawColor({ erase: subtractHeld || subtractMode, shiftHeld })
     if (persist !== false) {
-      keepPaintMark(points, { append: shiftHeld && !subtractHeld, color })
+      keepPaintMark(points, { append: (shiftHeld && !subtractHeld) || isLayoutPen(), color })
     }
     clearSvg()
   }

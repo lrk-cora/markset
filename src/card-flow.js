@@ -1,8 +1,8 @@
-import { COLORS, COLOR_SCHEMES } from './colors.js'
+import { COLORS, COLOR_SCHEMES, paperFill } from './colors.js'
 import { DEMO_CUP, getDemoPage, pageRelativeRect } from './editor.js'
 import { COLOR_TERMS } from './forbidden.js'
 import { aabb, convexHull, intersectBoxes, pathLength, strokeToPolygon } from './geometry.js'
-import { findSameText, imageSpanFromNaturalBox } from './hit-test.js'
+import { imageSpanFromNaturalBox } from './hit-test.js'
 import { collectOutsideEdits } from './scope.js'
 import {
   canUndoInsert,
@@ -15,9 +15,20 @@ import {
   toggleBackground,
   undoLastInsert,
 } from './store.js'
+import { applyLayoutMoves, layoutSourceWaiting, looksLikeLayout } from './layout.js'
 import { clearPaintMarks, setSubtractMode } from './overlay.js'
 import { redoChange, restoreChange } from './changes.js'
 import { clearInk, hasInk, undoLastInkStroke } from './ink.js'
+import {
+  applyPageScheme,
+  assignSchemeToModules,
+  collectSchemeModules,
+  getPagePaper,
+  listColorBlocks,
+  resetPagePaper,
+  schemeById,
+  setPagePaper,
+} from './scheme.js'
 
 const COACH_KEY = 'markset-coach-done'
 
@@ -42,6 +53,8 @@ const LOCAL_ANNO = new Set(['underline', 'wavy', 'strike', 'box', 'highlight', '
 
 const LOCAL_LABELS = {
   indent: '空两格',
+  'move-layout': '挪位置',
+  'move-nudge': '对齐间距',
   shadow: '阴影',
   underline: '下划线',
   wavy: '波浪线',
@@ -52,6 +65,7 @@ const LOCAL_LABELS = {
   frame: '方框',
   line: '线条',
   'clear-anno': '去掉批注',
+  scheme: '配色',
 }
 
 let localUndos = []
@@ -70,6 +84,7 @@ function snapshotLocal(editor, label) {
     imgFilter: img?.style.filter || '',
     imgShadow: img?.dataset.marksetShadow || '',
     decoHtml: host?.innerHTML || '',
+    pagePaper: getPagePaper(),
   })
 }
 
@@ -111,6 +126,8 @@ export function undoLastLocalAction(editor) {
     const host = decoHost()
     if (host) host.innerHTML = snap.decoHtml
   }
+  if ('pagePaper' in snap) setPagePaper(snap.pagePaper)
+  clearSchemeUi()
   if (ui.step === 'values' || ui.step === 'review') {
     ui.step = 'propose'
     ui.intent = null
@@ -122,6 +139,8 @@ export function undoLastLocalAction(editor) {
 export function clearLocalUndos() {
   localUndos = []
 }
+
+export { resetPagePaper }
 
 const NAME_IDEAS = ['海盐杯', '雾青杯', '白瓷杯', '岩灰杯', '青竹杯', '暖岩杯', '雪釉杯']
 const LINE_IDEAS = ['出行不易洒', '适合热饮', '杯口厚实，手感好', '附赠杯盖，方便携带']
@@ -137,6 +156,10 @@ let ui = {
   productName: '',
   color: '',
   scheme: '',
+  schemeAssign: null,
+  schemeSlot: null,
+  schemeModules: [],
+  pageRecolor: false,
   moreText: '',
   printFit: '',
   nameIdea: 0,
@@ -165,6 +188,13 @@ function writeCoachDone() {
   }
 }
 
+function clearSchemeUi() {
+  ui.scheme = ''
+  ui.schemeAssign = null
+  ui.schemeSlot = null
+  ui.schemeModules = []
+}
+
 function emit() {
   ping()
 }
@@ -190,6 +220,10 @@ export function resetCardForNewSelection() {
   ui.productName = ''
   ui.color = ''
   ui.scheme = ''
+  ui.schemeAssign = null
+  ui.schemeSlot = null
+  ui.schemeModules = []
+  ui.pageRecolor = false
   ui.moreText = ''
   ui.printFit = ''
   ui.hintUnderOn = true
@@ -206,6 +240,7 @@ export function keepCardForAppend() {
 export function startReview() {
   ui.step = 'review'
   ui.intent = null
+  ui.schemeSlot = null
 }
 
 export function idleCard() {
@@ -215,8 +250,10 @@ export function idleCard() {
   ui.noteText = ''
   ui.noteConfident = false
   ui.lastPaint = null
+  clearSchemeUi()
   clearInk()
   clearPaintMarks()
+  emit()
 }
 
 export function setPaintGesture(pts, { silent = false } = {}) {
@@ -534,6 +571,8 @@ function proposeOptions(spans, editor) {
     return bits
   }
 
+  if (looksLikeLayout(spans)) add('move-layout', '移到画出的位置')
+  if (looksLikeLayout(spans)) add('move-nudge', '微调对齐和间距')
   if (looksLikeIndent(spans)) add('indent', '这段空两格')
   if (looksLikeShadow(spans, editor)) {
     const packed = cupScreenBox(editor)
@@ -599,8 +638,13 @@ function applyCommandText() {
   else if (ui.intent === 'border') replaceCommandText('加上边框、logo 或线条')
   else if (ui.intent === 'soften') replaceCommandText('减弱阴影和装饰，不要改杯子本身')
   else if (ui.intent === 'scheme') {
-    const sch = COLOR_SCHEMES.find((s) => s.id === ui.scheme)
-    replaceCommandText(sch ? `改成${sch.label}配色：${sch.colors.join('、')}` : '改配色')
+    const sch = schemeById(ui.scheme)
+    const a = ui.schemeAssign
+    const mods = ui.schemeModules || []
+    if (a && mods.length) {
+      const bits = mods.map((m) => `${m.label.split(' · ')[0]}${a[m.id] ? a[m.id] : ''}`)
+      replaceCommandText(`配色 ${sch?.label || ''}：${bits.join('、')}`)
+    } else replaceCommandText(sch ? `改成${sch.label}配色：${sch.colors.join('、')}` : '改配色')
   } else if (ui.intent === 'print-short') replaceCommandText(`${ui.productName.trim() || '简称'}，杯面用简称`)
   else if (ui.intent === 'print-shrink') replaceCommandText(`${ui.productName.trim()}，缩小写进像素`)
   else {
@@ -633,7 +677,7 @@ function heading(step, intent) {
   if (intent === 'name' || intent === 'print-short') return '改成什么名字'
   if (intent === 'color') return '改成什么颜色'
   if (intent === 'name-color') return '新品名和颜色'
-  if (intent === 'scheme') return '选一套配色'
+  if (intent === 'scheme') return ui.schemeAssign ? '已按模块上色，点旁边的标签可单独改' : '选一套配色'
   if (intent === 'insert-text') return '要插入的文字'
   if (intent === 'custom') return '写成什么样'
   if (intent === 'anchor') return '照着这里改别处'
@@ -786,6 +830,7 @@ function pickOption(id, deps, editor) {
       deps.toast('先在杯子旁涂一块再加阴影')
       return
     }
+    clearPaintMarks()
     deps.toast('已按你画的形状加上投影。可点「撤回刚才」')
     startReview()
     emit()
@@ -793,6 +838,7 @@ function pickOption(id, deps, editor) {
   }
   if (LOCAL_ANNO.has(id) || id === 'clear-anno') {
     if (withLocalUndo(editor, localLabel(id), () => applyLocalAnno(id, editor))) {
+      clearPaintMarks()
       deps.toast(id === 'clear-anno' ? '已去掉这些批注。可撤回' : '已加上。可点「撤回刚才」')
       ui.intent = id
       ui.step = 'values'
@@ -804,6 +850,7 @@ function pickOption(id, deps, editor) {
   }
   if (id === 'indent') {
     if (withLocalUndo(editor, '空两格', () => applyIndent(editor))) {
+      clearPaintMarks()
       deps.toast('已空两格。可撤回，或点「同样的也改」套到全页')
       ui.intent = 'indent'
       ui.step = 'values'
@@ -811,6 +858,23 @@ function pickOption(id, deps, editor) {
       return
     }
     deps.toast('靠近段首再画两个小格')
+    return
+  }
+  if (id === 'move-layout' || id === 'move-nudge') {
+    const snap = id === 'move-nudge'
+    let count = 0
+    const ok = withLocalUndo(editor, snap ? '对齐间距' : '挪位置', () => {
+      count = applyLayoutMoves(editor, { snap })
+      return count
+    })
+    if (!ok) {
+      deps.toast('先用一支颜色圈模块，再用同一颜色圈要去的位置')
+      return
+    }
+    clearPaintMarks()
+    deps.toast(snap ? `已挪好 ${count} 处并对齐。可撤回` : `已按画出的位置挪了 ${count} 处。可撤回`)
+    startReview()
+    emit()
     return
   }
   ui.intent = id
@@ -1071,12 +1135,17 @@ function applyIndentAll(editor) {
 }
 
 export function openPageRecolor(editor) {
-  const occupied = []
   const found = []
-  for (const term of COLOR_TERMS) {
-    const hits = findSameText(editor.view, term, occupied)
-    found.push(...hits)
-    occupied.push(...hits)
+  for (const block of listColorBlocks(editor)) {
+    found.push({
+      kind: 'text',
+      block_id: block.blockId,
+      from: block.from,
+      to: block.to,
+      text: block.text,
+      start: 0,
+      end: block.text.length,
+    })
   }
   const img = editor.view.dom.querySelector('img[data-block-id="img-1"]')
   const cup = DEMO_CUP[getDemoPage()]?.cup
@@ -1093,10 +1162,97 @@ export function openPageRecolor(editor) {
   replaceSpans(found)
   ui.note = 'color'
   ui.noteText = '色'
-  ui.step = 'propose'
-  ui.intent = null
+  ui.intent = 'scheme'
+  ui.step = 'values'
+  ui.pageRecolor = true
+  ui.scheme = ''
+  ui.schemeAssign = null
+  ui.schemeSlot = null
+  ui.schemeModules = []
   emit()
   return true
+}
+
+let schemeGen = 0
+
+async function commitScheme(editor, { follow = false, slot = null, label } = {}) {
+  if (!ui.schemeAssign) return false
+  let modules = ui.schemeModules || []
+  if (follow) {
+    modules = collectSchemeModules(editor, { pageWide: true })
+    const sch = schemeById(ui.scheme)
+    if (sch) ui.schemeAssign = assignSchemeToModules(sch, modules)
+    ui.schemeModules = modules
+  }
+  if (!modules.length) return false
+  const slotMod = slot ? modules.find((m) => m.id === slot) : null
+  snapshotLocal(editor, label || (slotMod ? `配色·${slotMod.label}` : '配色'))
+  const gen = ++schemeGen
+  try {
+    const ok = await applyPageScheme(editor, {
+      assign: ui.schemeAssign,
+      modules,
+      slot,
+    })
+    if (gen !== schemeGen) return false
+    if (!ok) {
+      localUndos.pop()
+      return false
+    }
+    emit()
+    return true
+  } catch {
+    if (gen === schemeGen) localUndos.pop()
+    return false
+  }
+}
+
+export function toggleSchemeSlot(id) {
+  ui.schemeSlot = ui.schemeSlot === id ? null : id
+  emit()
+}
+
+export function closeSchemeSlot() {
+  if (!ui.schemeSlot) return
+  ui.schemeSlot = null
+  emit()
+}
+
+function schemeColorFor(module) {
+  const sch = schemeById(ui.scheme)
+  if (!sch) return null
+  const fresh = assignSchemeToModules(sch, ui.schemeModules || [])
+  if (module.kind === 'paper') return fresh.paper || fresh[module.id]
+  return fresh[module.id] || null
+}
+
+export function restoreSchemeModuleColor(editor, moduleId, toast) {
+  if (!ui.schemeAssign) return
+  const active = (ui.schemeModules || []).find((m) => m.id === moduleId)
+  const colorId = active ? schemeColorFor(active) : null
+  if (!active || !colorId) {
+    closeSchemeSlot()
+    return
+  }
+  setSchemeModuleColor(editor, moduleId, colorId, toast, { restore: true })
+}
+
+export function setSchemeModuleColor(editor, moduleId, colorId, toast, { restore = false } = {}) {
+  if (!ui.schemeAssign) return
+  const modules = ui.schemeModules || []
+  const active = modules.find((m) => m.id === moduleId)
+  if (!active) return
+  const next = { ...ui.schemeAssign }
+  if (active.kind === 'paper') {
+    next.paper = paperFill(colorId)
+    next[active.id] = next.paper
+  } else next[active.id] = colorId
+  ui.schemeAssign = next
+  if (active.kind === 'image') ui.color = colorId
+  ui.schemeSlot = null
+  commitScheme(editor, { slot: active.id }).then((ok) => {
+    toast?.(ok ? (restore ? `已恢复${active.label}` : `已改${active.label}`) : '这一块没改上')
+  })
 }
 
 function runIntent(editor, deps, scope) {
@@ -1109,6 +1265,27 @@ function runIntent(editor, deps, scope) {
     startReview()
     emit()
     deps.toast(scope === 'follow' ? '已套到全页段落。可撤回' : '只改了这一段。可撤回')
+    return
+  }
+  if (ui.intent === 'scheme') {
+    const run = async () => {
+      if (scope === 'follow' && !ui.pageRecolor) {
+        const ok = await commitScheme(editor, { follow: true, label: '配色（全页）' })
+        if (!ok) {
+          deps.toast('先点一套配色')
+          return
+        }
+        deps.toast('已套到全页标题、正文、杯子和纸面。可撤回')
+      } else if (!ui.schemeAssign) {
+        deps.toast('先点一套配色')
+        return
+      } else {
+        deps.toast('已按模块上色。点模块旁的颜色标签可单独改')
+      }
+      startReview()
+      emit()
+    }
+    run()
     return
   }
   if (LOCAL_ANNO.has(ui.intent) || ui.intent === 'clear-anno') {
@@ -1153,6 +1330,10 @@ function fillPropose(bar, spans, editor, deps) {
       : ui.note
         ? `写成「${ui.noteText}」不太确定，先按这个猜。不对就擦掉再写。`
         : '字没认清，先给通用项。可擦掉再写，或在旁边再写一两个字。'
+  } else if (looksLikeLayout(spans)) {
+    hint.textContent = '同一颜色圈了模块和它要去的位置。点「移到画出的位置」。还可换一支颜色再挪另一块。'
+  } else if (layoutSourceWaiting(spans)) {
+    hint.textContent = `已用${layoutSourceWaiting(spans)}笔圈中要挪的模块。再用同一颜色圈它要去的位置。`
   } else if (spans.filter((s) => s.indentMark).length === 1) {
     hint.textContent = '再在段前画一个小方格，就会空两格。不用按 Shift。'
   } else if (looksLikeIndent(spans)) {
@@ -1201,7 +1382,8 @@ function fillPropose(bar, spans, editor, deps) {
     return
   }
   for (const [id, label] of options) {
-    const primary = (id === 'indent' || id === 'shadow') && options[0][0] === id
+    const primary =
+      (id === 'indent' || id === 'shadow' || id === 'move-layout') && options[0][0] === id
     row.append(btn(label, { primary, on: ui.intent === id }, () => pickOption(id, deps, editor)))
   }
   bar.append(row)
@@ -1349,6 +1531,12 @@ function fillValues(bar, editor, deps) {
   }
 
   if (ui.intent === 'scheme') {
+    const note = document.createElement('p')
+    note.className = 'card-note'
+    note.textContent = ui.pageRecolor
+      ? '点一套风格：圈中的每一段字、杯子、纸面会分到这套里的几种颜色。单独微调请点模块旁的颜色标签。'
+      : '点一套风格：你圈到的每一段字会分到这套里的几种颜色。单独微调请点模块旁的颜色标签。'
+    bar.append(note)
     const row = document.createElement('div')
     row.className = 'scheme-list'
     for (const sch of COLOR_SCHEMES) {
@@ -1362,7 +1550,7 @@ function fillValues(bar, editor, deps) {
       for (const id of sch.colors) {
         const d = document.createElement('i')
         const c = COLORS.find((x) => x.id === id)
-        d.style.background = c?.fill || '#888'
+        d.style.background = c?.fill || id
         d.title = id
         dots.append(d)
       }
@@ -1370,19 +1558,51 @@ function fillValues(bar, editor, deps) {
       b.addEventListener('click', (e) => {
         e.stopPropagation()
         ui.scheme = sch.id
-        ui.color = sch.colors[0]
-        emit()
+        ui.schemeModules = collectSchemeModules(editor, { pageWide: ui.pageRecolor })
+        if (!ui.schemeModules.length) {
+          deps.toast('先圈要改的字或图')
+          return
+        }
+        ui.schemeAssign = assignSchemeToModules(sch, ui.schemeModules)
+        ui.schemeSlot = null
+        const imgMod = ui.schemeModules.find((m) => m.kind === 'image')
+        ui.color = imgMod ? ui.schemeAssign[imgMod.id] : sch.colors[0]
+        commitScheme(editor, { label: sch.label }).then((ok) => {
+          deps.toast(ok ? `已套上「${sch.label}」。点模块旁的颜色标签可单独改` : '这套配色没套上')
+        })
       })
       row.append(b)
     }
     bar.append(row)
-    followActions(bar, editor, deps, () => {
-      if (!ui.scheme) {
-        deps.toast('先点一套配色')
-        return false
-      }
-      return true
-    })
+
+    if (ui.schemeAssign) {
+      const hint = document.createElement('p')
+      hint.className = 'card-note'
+      hint.textContent = '要单独改某一段，点它旁边的颜色标签。'
+      bar.append(hint)
+    }
+
+    if (ui.pageRecolor) {
+      bar.append(
+        btn('完成', { primary: true }, () => {
+          if (!ui.schemeAssign) {
+            deps.toast('先点一套配色')
+            return
+          }
+          startReview()
+          emit()
+        }),
+        btn('上一步', {}, goBack),
+      )
+    } else {
+      followActions(bar, editor, deps, () => {
+        if (!ui.scheme) {
+          deps.toast('先点一套配色')
+          return false
+        }
+        return true
+      })
+    }
     return
   }
 

@@ -103,6 +103,51 @@ body.is-lassoing {
   color: #1b3a7a;
 }
 
+.pen-colors {
+  display: inline-flex;
+  align-items: stretch;
+  gap: 10px;
+}
+
+.pen-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 8px 2px 6px;
+  border: 1px solid #e4d9ca;
+  border-radius: 8px;
+  background: #fff;
+}
+
+.pen-group-label {
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.pen-chip {
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 2px solid #fff;
+  border-radius: 50%;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.22);
+  background: var(--pen, var(--blue));
+  cursor: pointer;
+}
+
+.pen-chip.is-on {
+  box-shadow: 0 0 0 2px var(--blue);
+}
+
+.pen-chip[data-pen-id='select'] {
+  box-shadow: inset 0 0 0 2px #fff, 0 0 0 1px rgba(0, 0, 0, 0.22);
+}
+
+.pen-chip[data-pen-id='select'].is-on {
+  box-shadow: inset 0 0 0 2px #fff, 0 0 0 2px var(--blue);
+}
+
 .allow-models {
   display: flex;
   align-items: center;
@@ -422,6 +467,14 @@ kbd {
   letter-spacing: 0.04em;
 }
 
+#editor .ProseMirror [data-ink-color] {
+  color: var(--ink-tint) !important;
+}
+
+#editor .ProseMirror [data-text-tint] {
+  color: inherit;
+}
+
 #editor .ProseMirror p {
   margin: 0 0 16px;
   font-size: 17px;
@@ -429,6 +482,7 @@ kbd {
 }
 
 #editor .ProseMirror p.is-placed,
+#editor .ProseMirror h1.is-placed,
 #editor .ProseMirror img.is-placed {
   position: absolute;
   margin: 0;
@@ -658,7 +712,10 @@ kbd {
 
 .scheme-list {
   display: grid;
+  grid-template-columns: 1fr 1fr;
   gap: 6px;
+  max-height: 240px;
+  overflow: auto;
 }
 
 .scheme-card {
@@ -667,8 +724,13 @@ kbd {
   justify-content: space-between;
   gap: 8px;
   height: auto !important;
-  padding: 8px 10px !important;
+  padding: 7px 8px !important;
   text-align: left;
+}
+
+.scheme-card strong {
+  font-size: 12px;
+  font-weight: 650;
 }
 
 .scheme-dots {
@@ -681,6 +743,139 @@ kbd {
   height: 14px;
   border-radius: 50%;
   box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.12);
+}
+
+.scheme-tag {
+  position: fixed;
+  z-index: 45;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  pointer-events: auto;
+}
+
+.scheme-tag.is-flip {
+  transform: translateX(-100%);
+  align-items: flex-end;
+}
+
+.scheme-tag-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 22px;
+  padding: 0 8px 0 6px;
+  border: 1px solid rgba(29, 25, 22, 0.14);
+  border-radius: 999px;
+  background: #fff;
+  color: #1d1916;
+  font: 11px/1 var(--sans);
+  font-weight: 650;
+  cursor: pointer;
+  box-shadow: 0 1px 4px rgba(29, 25, 22, 0.12);
+}
+
+.scheme-tag-btn.is-on {
+  border-color: var(--blue);
+  background: var(--blue-soft);
+}
+
+.scheme-tag-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.16);
+}
+
+.scheme-tag-palette {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  width: 220px;
+  max-height: 280px;
+  overflow: auto;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #fff;
+  box-shadow: 0 8px 24px rgba(29, 25, 22, 0.16);
+}
+
+.scheme-tag-cap-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  margin-bottom: 2px;
+}
+
+.scheme-tag-cap {
+  width: auto;
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.3;
+  color: var(--muted);
+}
+
+.scheme-tag-close,
+.scheme-tag-reset {
+  height: 22px;
+  padding: 0 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fff;
+  font: 11px var(--sans);
+  cursor: pointer;
+}
+
+.scheme-tag-reset {
+  width: 100%;
+  height: 28px;
+  margin-top: 2px;
+}
+
+.scheme-tag-chip {
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 2px solid #fff;
+  border-radius: 50%;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.18);
+  cursor: pointer;
+}
+
+.scheme-tag-chip.is-on {
+  box-shadow: 0 0 0 2px var(--blue);
+}
+
+.scheme-tag-custom {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  margin-top: 4px;
+  padding: 6px 8px;
+  border: 1px dashed var(--line);
+  border-radius: 8px;
+  background: #faf7f2;
+  font: 12px var(--sans);
+  cursor: pointer;
+}
+
+.scheme-tag-custom.is-on {
+  border-color: var(--blue);
+  background: var(--blue-soft);
+}
+
+.scheme-tag-custom input[type='color'] {
+  width: 28px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
 }
 
 .card-title {

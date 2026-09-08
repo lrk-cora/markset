@@ -6,6 +6,7 @@ import { applyScopeAfterSelect, visibleSuggests } from './scope.js'
 import { snapExistingMark } from './contour.js'
 import { runWriteback } from './writeback.js'
 import { redoChange, restoreChange } from './changes.js'
+import { colorFill, paperFill, parseHexColor, pickerSwatches } from './colors.js'
 import {
   addCoachMarks,
   canUndoLocal,
@@ -15,8 +16,13 @@ import {
   idleCard,
   peekLocalUndoAt,
   peekLocalUndoLabel,
+  closeSchemeSlot,
+  restoreSchemeModuleColor,
+  setSchemeModuleColor,
+  toggleSchemeSlot,
   undoLastLocalAction,
 } from './card-flow.js'
+import { moduleSwatch } from './scheme.js'
 import { clearInk, hasInk, undoLastInkStroke } from './ink.js'
 import {
   appendSpans,
@@ -228,6 +234,11 @@ function addSlot(layer, span, boxes, anchors) {
   box.style.top = `${span.screenRect.y}px`
   box.style.width = `${span.screenRect.w}px`
   box.style.height = `${span.screenRect.h}px`
+  if (span.layoutColor) {
+    box.style.setProperty('--slot', span.layoutColor)
+    box.style.outlineColor = span.layoutColor
+    box.style.background = `${span.layoutColor}22`
+  }
   layer.append(box)
   boxes.push(span.screenRect)
   anchors[span.markId] = { x: span.screenRect.x, y: span.screenRect.y }
@@ -519,6 +530,148 @@ function changeAnchor(view, item) {
   }
 }
 
+function schemeModuleAnchor(editor, module) {
+  if (module.kind === 'paper') {
+    const page = document.querySelector('.page')
+    if (!page) return null
+    const r = page.getBoundingClientRect()
+    return { x: r.right - 12, y: r.top + 12, flip: true }
+  }
+  if (module.kind === 'image') {
+    const img = document.querySelector(`img[data-block-id="${module.blockId || 'img-1'}"]`)
+    if (!img) return null
+    const r = img.getBoundingClientRect()
+    return { x: r.right + 6, y: r.top }
+  }
+  try {
+    let node = null
+    if (module.blockId) {
+      node = editor.view.dom.querySelector(`[data-block-id="${CSS.escape(module.blockId)}"]`)
+    }
+    if (!node && module.from != null) {
+      const d = editor.view.domAtPos(module.from)
+      const el = d.node.nodeType === 1 ? d.node : d.node.parentElement
+      node = el?.closest?.('p, h1, h2, h3, li, [data-block-id]') || el
+    }
+    const r = node?.getBoundingClientRect?.()
+    if (r && r.width) return { x: Math.max(8, r.left - 68), y: r.top }
+    const c = editor.view.coordsAtPos(module.from)
+    return { x: Math.max(8, c.left - 68), y: c.top }
+  } catch {
+    return null
+  }
+}
+
+function addSchemeTags(layer, editor) {
+  const card = getCard()
+  if (card.intent !== 'scheme' || card.step !== 'values') return
+  if (!card.schemeAssign || !card.schemeModules?.length) return
+  for (const module of card.schemeModules) {
+    const anchor = schemeModuleAnchor(editor, module)
+    if (!anchor) continue
+    const sw = moduleSwatch(card.schemeAssign, module)
+    const open = card.schemeSlot === module.id
+    const tag = document.createElement('div')
+    tag.className = `scheme-tag${open ? ' is-open' : ''}${anchor.flip ? ' is-flip' : ''}`
+    const x = Math.min(Math.max(8, anchor.x), window.innerWidth - 96)
+    const y = Math.min(Math.max(48, anchor.y), window.innerHeight - 36)
+    tag.style.left = `${x}px`
+    tag.style.top = `${y}px`
+
+    const btn = document.createElement('button')
+    btn.type = 'button'
+    btn.className = `scheme-tag-btn${open ? ' is-on' : ''}`
+    btn.title = `单独改：${module.label}`
+    const dot = document.createElement('i')
+    dot.className = 'scheme-tag-dot'
+    dot.style.background = sw.fill
+    const name = document.createElement('span')
+    name.textContent = sw.name
+    btn.append(dot, name)
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation()
+      toggleSchemeSlot(module.id)
+    })
+    tag.append(btn)
+
+    if (open) {
+      const pal = document.createElement('div')
+      pal.className = 'scheme-tag-palette'
+      const cap = document.createElement('div')
+      cap.className = 'scheme-tag-cap-row'
+      const capText = document.createElement('p')
+      capText.className = 'scheme-tag-cap'
+      capText.textContent = '只改这里'
+      const cancel = document.createElement('button')
+      cancel.type = 'button'
+      cancel.className = 'scheme-tag-close'
+      cancel.textContent = '取消'
+      cancel.title = '关掉色板，不改颜色'
+      cancel.addEventListener('click', (e) => {
+        e.stopPropagation()
+        closeSchemeSlot()
+      })
+      cap.append(capText, cancel)
+      pal.append(cap)
+      const currentId = module.kind === 'paper' ? card.schemeAssign.paper || '' : card.schemeAssign[module.id] || ''
+      const currentFill = (
+        module.kind === 'paper'
+          ? String(currentId).startsWith('#')
+            ? currentId
+            : paperFill(currentId)
+          : colorFill(currentId)
+      ).toLowerCase()
+      for (const swatch of pickerSwatches()) {
+        const chip = document.createElement('button')
+        chip.type = 'button'
+        chip.className = 'scheme-tag-chip'
+        const fill = module.kind === 'paper' ? paperFill(swatch.id) : swatch.fill
+        const selected =
+          module.kind === 'paper'
+            ? fill.toLowerCase() === currentFill
+            : String(currentId) === swatch.id || fill.toLowerCase() === currentFill
+        if (selected) chip.classList.add('is-on')
+        chip.style.background = fill
+        chip.title = swatch.id
+        chip.setAttribute('aria-label', swatch.id)
+        chip.addEventListener('click', (e) => {
+          e.stopPropagation()
+          setSchemeModuleColor(editor, module.id, swatch.id, toast)
+        })
+        pal.append(chip)
+      }
+      const custom = document.createElement('label')
+      custom.className = `scheme-tag-custom${String(currentId).startsWith('#') ? ' is-on' : ''}`
+      const picker = document.createElement('input')
+      picker.type = 'color'
+      picker.value = parseHexColor(currentFill) || '#5884b0'
+      picker.title = '打开调色盘'
+      picker.addEventListener('pointerdown', (e) => e.stopPropagation())
+      picker.addEventListener('click', (e) => e.stopPropagation())
+      picker.addEventListener('change', () => {
+        setSchemeModuleColor(editor, module.id, picker.value, toast)
+      })
+      const customName = document.createElement('span')
+      customName.textContent = '调色盘'
+      custom.append(picker, customName)
+      pal.append(custom)
+      const reset = document.createElement('button')
+      reset.type = 'button'
+      reset.className = 'scheme-tag-reset'
+      reset.textContent = '恢复这套色'
+      reset.title = '这一块改回刚才那套风格的颜色'
+      reset.addEventListener('click', (e) => {
+        e.stopPropagation()
+        restoreSchemeModuleColor(editor, module.id, toast)
+      })
+      pal.append(reset)
+      tag.append(pal)
+    }
+
+    layer.append(tag)
+  }
+}
+
 function addChangeBadges(layer, editor) {
   const snap = getSnapshot()
   for (const item of snap.changes || []) {
@@ -673,6 +826,7 @@ export function renderChrome(editor) {
 
   addCoachMarks(layer, editor)
   addChangeBadges(layer, editor)
+  addSchemeTags(layer, editor)
   renderList(editor)
   inspector.textContent = JSON.stringify(toSpec(), null, 2)
   syncUndoButton()
@@ -724,6 +878,11 @@ export function bindChromeKeys(editor) {
 
   window.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') {
+      if (getCard().schemeSlot) {
+        e.preventDefault()
+        closeSchemeSlot()
+        return
+      }
       clearAll()
       idleCard()
       clearInk()
@@ -748,6 +907,17 @@ export function bindChromeKeys(editor) {
       if (performUndo(editor)) e.preventDefault()
     }
   })
+
+  window.addEventListener(
+    'pointerdown',
+    (e) => {
+      if (!getCard().schemeSlot) return
+      const el = e.target instanceof Element ? e.target : e.target.parentElement
+      if (el?.closest?.('.scheme-tag')) return
+      closeSchemeSlot()
+    },
+    true,
+  )
 
   window.addEventListener(
     'pointermove',
