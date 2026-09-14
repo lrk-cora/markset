@@ -32,17 +32,23 @@ function regionSpan(view, region, extra = {}) {
 }
 
 function demo() {
-  return DEMO_CUP[getDemoPage()] || DEMO_CUP.a
+  const page = getDemoPage()
+  if (page !== 'a' && page !== 'b') return null
+  return DEMO_CUP[page] || null
 }
 
 /** Letters on the mug. Stand-in until planner A returns a print bbox. */
 export function collectPrintStandIn(view) {
-  return regionSpan(view, demo().print, { printStandIn: true })
+  const region = demo()?.print
+  if (!region) return null
+  return regionSpan(view, region, { printStandIn: true })
 }
 
 /** Mug body for recoloring. */
 export function collectCupBody(view) {
-  return regionSpan(view, demo().cup, { cupBody: true })
+  const region = demo()?.cup
+  if (!region) return null
+  return regionSpan(view, region, { cupBody: true })
 }
 
 export function resolvePrintRegions(view, planOps) {

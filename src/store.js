@@ -155,6 +155,15 @@ export function upsertSpan(matchFn, span) {
 }
 
 function unionTextSpan(a, b, doc) {
+  if (a.webId || b.webId) {
+    return {
+      ...a,
+      ...b,
+      webId: a.webId || b.webId,
+      screenRect: b.screenRect || a.screenRect,
+      willEdit: true,
+    }
+  }
   const from = Math.min(a.from, b.from)
   const to = Math.max(a.to, b.to)
   const start = Math.min(a.start ?? 0, b.start ?? 0)

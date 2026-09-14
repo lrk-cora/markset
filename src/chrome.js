@@ -1,4 +1,5 @@
 import { insertImageAt, insertParagraphAt, newBlockId, pageRelativeRect } from './editor.js'
+import { liveScreenRect } from './web-doc.js'
 import { blockRange } from './hit-test.js'
 import { tintedMaskCanvas } from './mask.js'
 import { isLassoMode } from './overlay.js'
@@ -149,6 +150,8 @@ export function toast(message, ms = 2200) {
 }
 
 function textAnchor(view, span) {
+  const box = liveScreenRect(span)
+  if (box) return { x: box.x, y: box.y }
   try {
     const coords = view.coordsAtPos(span.from)
     return { x: coords.left, y: coords.top }
@@ -210,6 +213,10 @@ function suggestLabel(item) {
 }
 
 function addMask(layer, span, boxes, anchors) {
+  const live = liveScreenRect(span)
+  if (live) {
+    span = { ...span, screenRect: live, imageRect: span.kind === 'image' ? live : span.imageRect }
+  }
   if (span.maskCanvas && span.imageRect) {
     const overlay = tintedMaskCanvas(span.maskCanvas)
     overlay.className = `image-mask-canvas${span.willEdit === false ? ' is-off' : ''}`
@@ -296,6 +303,17 @@ function resizeBox(orig, dir, dx, dy) {
 }
 
 function addHandles(layer, view, span) {
+  const live = liveScreenRect(span)
+  if (span.webId && live) {
+    const h = document.createElement('div')
+    h.className = 'slot-mask'
+    h.style.left = `${live.x}px`
+    h.style.top = `${live.y}px`
+    h.style.width = `${live.w}px`
+    h.style.height = `${live.h}px`
+    layer.append(h)
+    return
+  }
   try {
     const start = view.coordsAtPos(span.from)
     const end = view.coordsAtPos(span.to)
@@ -472,7 +490,7 @@ function renderList(editor) {
       check.type = 'checkbox'
       check.checked = span.willEdit !== false
       check.disabled = Boolean(span.frozen)
-      check.title = span.frozen ? '禁改区：价格 / 物流 / 专利' : '将改'
+      check.title = span.frozen ? '禁改区：价格 / 物流 / 专利' : '勾上才改这一块。取消勾则不改。'
       check.addEventListener('change', () => toggleWillEdit(span.markId))
       const name = document.createElement('strong')
       name.textContent = `#${span.markId}`
@@ -718,24 +736,38 @@ export function renderChrome(editor) {
   const snap = getSnapshot()
   const anchors = {}
   const boxes = []
+  const corners = {}
 
   layer.replaceChildren()
 
   for (const span of snap.spans) {
-    if (span.kind === 'image') addMask(layer, span, boxes, anchors)
-    else if (span.kind === 'slot') addSlot(layer, span, boxes, anchors)
-    else {
+    if (span.kind === 'image') {
+      addMask(layer, span, boxes, anchors)
+      const box = span.screenRect || span.imageRect
+      if (box) corners[span.markId] = { x: box.x, y: box.y }
+    } else if (span.kind === 'slot') addSlot(layer, span, boxes, anchors)
+    else if (span.webId || (span.screenRect && span.from == null)) {
+      const box = liveScreenRect(span)
+      if (box) {
+        addHandles(layer, editor.view, span)
+        boxes.push(box)
+        anchors[span.markId] = { x: box.x, y: box.y }
+        corners[span.markId] = { x: box.x, y: box.y }
+      }
+    } else {
       anchors[span.markId] = textAnchor(editor.view, span)
       addHandles(layer, editor.view, span)
       try {
         const a = editor.view.coordsAtPos(span.from)
         const b = editor.view.coordsAtPos(span.to)
-        boxes.push({
+        const box = {
           x: Math.min(a.left, b.left),
           y: Math.min(a.top, b.top),
           w: Math.abs(b.left - a.left) || 40,
           h: Math.max(a.bottom, b.bottom) - Math.min(a.top, b.top),
-        })
+        }
+        boxes.push(box)
+        corners[span.markId] = { x: box.x, y: box.y }
       } catch {
         /* ignore */
       }
@@ -745,20 +777,19 @@ export function renderChrome(editor) {
   setAnchors(anchors)
 
   for (const span of snap.spans) {
-    const anchor = anchors[span.markId]
-    if (!anchor) continue
+    if (span.kind !== 'text' && span.kind !== 'image') continue
+    const corner = corners[span.markId] || anchors[span.markId]
+    if (!corner) continue
     const badge = document.createElement('div')
     badge.className = `badge${span.willEdit === false ? ' is-off' : ''}`
-    badge.style.left = `${anchor.x}px`
-    badge.style.top = `${anchor.y}px`
+    badge.style.left = `${corner.x}px`
+    badge.style.top = `${corner.y}px`
 
     const check = document.createElement('input')
     check.type = 'checkbox'
     check.checked = span.willEdit !== false
     check.disabled = Boolean(span.frozen)
-    check.title = span.frozen
-      ? '禁改区'
-      : '将改：这次要不要改这一项。不要用 × 只去掉桌子。'
+      check.title = span.frozen ? '禁改区' : '勾上才改这一块。取消勾则不改。'
     check.addEventListener('click', (e) => e.stopPropagation())
     check.addEventListener('change', (e) => {
       e.stopPropagation()
@@ -807,7 +838,8 @@ export function renderChrome(editor) {
     layer.append(s)
   }
 
-  if (snap.spans.length || (snap.changes || []).length || canUndoLocal()) {
+  const card = getCard()
+  if (snap.spans.length || (snap.changes || []).length || (canUndoLocal() && !card.hideCard)) {
     const bar = document.createElement('div')
     bar.className = 'toolbar novice-card'
     bar.append(bindToolbarMove(bar))

@@ -1,0 +1,427 @@
+
+
+<!DOCTYPE html>
+<html lang="zh-cn">
+<head>
+
+<meta charset="utf-8">
+<meta name="robots" content="all" />
+<meta name="author" content="w3school.com.cn" />
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/5.15.4/css/all.min.css">
+
+<link rel="stylesheet" type="text/css" href="/lib/css/typography.css?v=6" />
+<link rel="stylesheet" type="text/css" href="/lib/css/layout.css?v=6" />
+<link rel="stylesheet" type="text/css" href="/lib/css/nav.css?v=8" />
+<link rel="stylesheet" type="text/css" href="/lib/css/fonts.css?v=6" />
+<link rel="stylesheet" type="text/css" href="/lib/css/cssdemo.css?v=5" />
+
+<script src="/lib/cc/prism2.js?v=2"></script>
+<link rel="stylesheet" href="/lib/cc/prism.css?v=2">
+
+<link rel="preload" href="/lib/fonts/fontawesome.woff2?14663396" as="font" type="font/woff2" crossorigin> 
+<link rel="preload" href="/lib/fonts/source-code-pro-v14-latin-regular.woff2" as="font" type="font/woff2" crossorigin> 
+<link rel="preload" href="/lib/fonts/roboto-mono-v13-latin-500.woff2" as="font" type="font/woff2" crossorigin> 
+<link rel="preload" href="/lib/fonts/source-sans-pro-v14-latin-700.woff2" as="font" type="font/woff2" crossorigin> 
+<link rel="preload" href="/lib/fonts/source-sans-pro-v14-latin-600.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="/lib/fonts/SourceSansPro-Regular.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="/lib/fonts/freckle-face-v9-latin-regular.woff2" as="font" type="font/woff2" crossorigin>
+
+<meta name="title" property="og:title" content="W3School.com.cn">
+<meta name="Keywords" content="HTML、CSS、JavaScript、SQL、Python、Java、PHP、How to、C、C++、C#、Bootstrap、React、MySQL、jQuery、Excel、XML、Django、NumPy、Pandas、SciPy、NodeJS、TypeScript、Angular、AngularJS、PostgreSQL、MongoDB、ASP、AI、R、Go、Kotlin、Sass、VUE、Git、Bash、Rust、图形、算法、编程入门、Web 开发、数据科学、色彩、图标、代码游戏、编程、教程、培训、学习、测验、练习、课程、课时、参考手册、示例、源代码、演示、技巧、网站">
+<meta name="Description" content="提供结构清晰、通俗易懂的 Web 开发教程，内含海量实战示例，涵盖 HTML、CSS、JavaScript、SQL、Python、PHP、Bootstrap、Java、XML 等多种技术。">
+<meta property="og:image" content="https://www.w3school.com.cn/i/logo/og-1200x630.png">
+<meta property="og:image:type" content="image/png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:description" content="W3School 提供涵盖所有主流 Web 开发语言的免费在线教程、参考手册和练习题。内容包含 HTML、CSS、JavaScript、Python、SQL、Java 等众多热门技术领域。">
+<link rel="icon" href="https://www.w3school.com.cn/i/logo/favicon.svg">
+<link rel="apple-touch-icon" sizes="180x180" href="/i/logo/apple-touch-icon.png">
+<link rel="icon" type="image/png" sizes="96x96" href="/i/logo/favicon-96x96.png">
+<link rel="icon" type="image/png" sizes="64x64" href="/i/logo/favicon-64x64.png">
+<link rel="icon" type="image/png" sizes="48x48" href="/i/logo/favicon-48x48.png">
+<link rel="icon" type="image/png" sizes="32x32" href="/i/logo/favicon-32x32.png">
+<link rel="icon" type="image/png" sizes="16x16" href="/i/logo/favicon-16x16.png">
+<link rel="manifest" href="/site.webmanifest" crossorigin="use-credentials">
+<link rel="mask-icon" href="/i/logo/safari-pinned-tab.svg" color="#BD2D30">
+<meta name="msapplication-TileColor" content="#BD2D30">
+<meta name="theme-color" content="#ffffff">
+<meta name="format-detection" content="telephone=no">
+
+<!-- Global site tag (gtag.js) - Google Analytics -->
+<script async src="https://www.googletagmanager.com/gtag/js?id=UA-878633-1"></script>
+<script>
+  window.dataLayer = window.dataLayer || [];
+  function gtag(){dataLayer.push(arguments);}
+  gtag('js', new Date());
+
+  gtag('config', 'UA-878633-1');
+</script>
+
+
+<title>HTML 教程</title>
+
+
+</head>
+
+<body>
+
+
+
+<header class="header-container">
+<div class="header-content">
+<div class="header-logo-container">
+<a class="header-logo" href="/index.html" title="W3School 在线教程">W3School 在线教程</a>
+</div>
+</div>
+</header>
+
+
+<nav class="nav-top-container">
+<div class="nav-top-content">
+	<button class="menu-toggle" id="menuToggle"></button>
+	<button class="nav-top-controls nav-top-controls-prev" id="navPrev">&#10094;</button>
+	<menu class="nav-top-menu"  id="myTopnav">
+		<li><a href="/html/index.asp" title="HTML 教程">HTML</a></li>
+		<li><a href="/css/index.asp" title="CSS 教程">CSS</a></li>
+		<li><a href="/js/index.asp" title="JavaScript 教程">JAVASCRIPT</a></li>
+		<li><a href="/sql/index.asp" title="SQL 教程">SQL</a></li>
+		<li><a href="/python/index.asp" title="Python 教程">PYTHON</a></li>
+		<li><a href="/java/index.asp" title="Java 教程">JAVA</a></li>
+		<li><a href="/php/index.asp" title="PHP 教程">PHP</a></li>
+		<li><a href="/howto/index.asp" title="W3School 百宝箱">HOWTO</a></li>
+		<li><a href="/c/index.asp" title="C 教程">C</a></li>
+		<li><a href="/cpp/index.asp" title="C++ 教程">C++</a></li>
+		<li><a href="/cs/index.asp" title="C# 教程">C#</a></li>
+		<li><a href="/bootstrap5/index.asp" title="Bootstrap 教程">BOOTSTRAP</a></li>
+		<li><a href="/mysql/index.asp" title="MySQL 教程">MYSQL</a></li>
+		<li><a href="/jquery/index.asp" title="jQuery 教程">JQUERY</a></li>
+		<li><a href="/xml/index.asp" title="XML 教程">XML</a></li>
+		<li><a href="/numpy/index.asp" title="NumPy 教程">NUMPY</a></li>
+		<li><a href="/pandas/index.asp" title="Pandas 教程">PANDAS</a></li>
+		<li><a href="/typescript/index.asp" title="TypeScript 教程">TYPESCRIPT</a></li>
+		<li><a href="/angularjs/index.asp" title="AngularJS 教程">ANGULARJS</a></li>
+		<li><a href="/postgresql/index.asp" title="PostgreSQL 教程">POSTGRESQL</a></li>
+		<li><a href="/mongodb/index.asp" title="MongoDB 教程">MONGODB</a></li>
+		<li><a href="/asp/index.asp" title="ASP 教程">ASP</a></li>
+		<li><a href="/r/index.asp" title="R 教程">R</a></li>
+		<li><a href="/go/index.asp" title="Go 教程">GO</a></li>
+		<li><a href="/kotlin/index.asp" title="Kotlin 教程">KOTLIN</a></li>
+		<li><a href="/sass/index.asp" title="Sass 教程">SASS</a></li>
+		<li><a href="/scipy/index.asp" title="SciPy 教程">SCIPY</a></li>
+	</menu>
+	<button class="nav-top-controls nav-top-controls-next" id="navNext">&#10095;</button>
+</div>
+</nav>
+
+
+
+<main class="main-container">
+
+<aside class="nav-left-container">
+<div class="nav-left-content">
+
+<nav class="nav-left-course">
+<h2>HTML 教程</h2>
+<menu>
+<li><a class="active" href="/html/index.asp" title="HTML 教程">HTML 教程</a></li>
+<li><a href="/html/html_jianjie.asp" title="HTML 简介">HTML 简介</a></li>
+<li><a href="/html/html_editors.asp" title="HTML 编辑器">HTML 编辑器</a></li>
+<li><a href="/html/html_basic.asp" title="HTML 基础实例">HTML 基础</a></li>
+<li><a href="/html/html_elements.asp" title="HTML 元素">HTML 元素</a></li>
+<li><a href="/html/html_attributes.asp" title="HTML 属性">HTML 属性</a></li>
+<li><a href="/html/html_headings.asp" title="HTML 标题">HTML 标题</a></li>
+<li><a href="/html/html_paragraphs.asp" title="HTML 段落">HTML 段落</a></li>
+<li><a href="/html/html_styles.asp" title="HTML 样式">HTML 样式</a></li>
+<li><a href="/html/html_formatting.asp" title="HTML 文本格式化">HTML 格式化</a></li>
+<li><a href="/html/html_quotation_elements.asp" title="HTML 引文与引用元素">HTML 引用</a></li>
+<li><a href="/html/html_comments.asp" title="HTML 注释">HTML 注释</a></li>
+<li><a href="/html/html_colors.asp" title="HTML 颜色">HTML 颜色</a></li>
+<li><a href="/html/html_colors_rgb.asp" title="HTML RGB 与 RGBA 颜色">HTML RGB 颜色</a></li>
+<li><a href="/html/html_colors_hex.asp" title="HTML HEX 颜色">HTML HEX 颜色</a></li>
+<li><a href="/html/html_colors_hsl.asp" title="HTML HSL 与 HSLA 颜色">HTML HSL 颜色</a></li>
+<li><a href="/html/html_css.asp" title="HTML 样式 - CSS">HTML CSS</a></li>
+<li><a href="/html/html_links.asp" title="HTML 链接">HTML 链接</a></li>
+<li><a href="/html/html_links_colors.asp" title="HTML 链接 - 不同颜色">HTML 链接颜色</a></li>
+<li><a href="/html/html_links_bookmarks.asp" title="HTML 链接 - 创建书签">HTML 书签</a></li>
+<li><a href="/html/html_images.asp" title="HTML 图像">HTML 图像</a></li>
+<li><a href="/html/html_images_imagemap.asp" title="HTML 图像映射">HTML 图像映射</a></li>
+<li><a href="/html/html_images_background.asp" title="HTML 背景图像">HTML 背景图像</a></li>
+<li><a href="/html/html_images_picture.asp" title="HTML &lt;picture&gt; 元素">HTML &lt;picture&gt; 元素</a></li>
+<li><a href="/html/html_favicon.asp" title="HTML 网站图标">HTML 网站图标</a></li>
+<li><a href="/html/html_page_title.asp" title="HTML 页面标题">HTML 页面标题</a></li>
+<li><a href="/html/html_tables.asp" title="HTML 表格">HTML 表格</a></li>
+<li><a href="/html/html_table_borders.asp" title="HTML 表格边框">HTML 表格边框</a></li>
+<li><a href="/html/html_table_sizes.asp" title="HTML 表格尺寸">HTML 表格尺寸</a></li>
+<li><a href="/html/html_table_headers.asp" title="HTML 表格表头">HTML 表格表头</a></li>
+<li><a href="/html/html_table_padding_spacing.asp" title="HTML 表格内边距与间距">HTML 表格内边距与间距</a></li>
+<li><a href="/html/html_table_colspan_rowspan.asp" title="HTML 表格跨列与跨行">HTML 表格跨列与跨行</a></li>
+<li><a href="/html/html_table_styling.asp" title="HTML 表格样式">HTML 表格样式</a></li>
+<li><a href="/html/html_table_colgroup.asp" title="HTML 表格列组">HTML 表格列组</a></li>
+<li><a href="/html/html_lists.asp" title="HTML 列表">HTML 列表</a></li>
+<li><a href="/html/html_lists_unordered.asp" title="HTML 无序列表">HTML 无序列表</a></li>
+<li><a href="/html/html_lists_ordered.asp" title="HTML 有序列表">HTML 有序列表</a></li>
+<li><a href="/html/html_lists_description.asp" title="HTML 描述列表">HTML 描述列表</a></li>
+<li><a href="/html/html_blocks.asp" title="HTML 块级元素和行内元素">HTML 块级和行内元素</a></li>
+<li><a href="/html/html_div.asp" title="HTML Div 元素">HTML Div</a></li>
+<li><a href="/html/html_classes.asp" title="HTML class 属性">HTML 类</a></li>
+<li><a href="/html/html_id.asp" title="HTML id 属性">HTML Id</a></li>
+<li><a href="/html/html_buttons.asp" title="HTML 按钮">HTML 按钮</a></li>
+<li><a href="/html/html_iframe.asp" title="HTML Iframe">HTML Iframe</a></li>
+<li><a href="/html/html_script.asp" title="HTML JavaScript">HTML JavaScript</a></li>
+<li><a href="/html/html_filepaths.asp" title="HTML 文件路径">HTML 文件路径</a></li>
+<li><a href="/html/html_head.asp" title="HTML 头部元素">HTML 头部</a></li>
+<li><a href="/html/html_layout.asp" title="HTML 布局元素与技术">HTML 布局</a></li>
+<li><a href="/html/html_responsive.asp" title="HTML 响应式 Web 设计">HTML 响应式设计</a></li>
+<li><a href="/html/html_computercode_elements.asp" title="HTML 计算机代码">HTML 计算机代码</a></li>
+<li><a href="/html/html5_semantic_elements.asp" title="HTML 语义元素">HTML 语义</a></li>
+<li><a href="/html/html5_syntax.asp" title="HTML 样式指南和代码约定">HTML 样式指南</a></li>
+<li><a href="/html/html_entities.asp" title="HTML 实体">HTML 实体</a></li>
+<li><a href="/html/html_symbols.asp" title="HTML 符号">HTML 符号</a></li>
+<li><a href="/html/html_emoji.asp" title="在 HTML 中使用表情符号">HTML 表情符号</a></li>
+<li><a href="/html/html_charset.asp" title="HTML 编码（字符集）">HTML 字符集</a></li>
+<li><a href="/html/html_urlencode.asp" title="HTML URL 编码">HTML URL 编码</a></li>
+<li><a href="/html/html_xhtml.asp" title="HTML 与 XHTML 对比">HTML vs. XHTML</a></li>
+</menu>
+<h2>HTML 表单</h2>
+<menu>
+<li><a href="/html/html_forms.asp" title="HTML 表单">HTML 表单</a></li>
+<li><a href="/html/html_forms_attributes.asp" title="HTML 表单属性">HTML 表单属性</a></li>
+<li><a href="/html/html_form_elements.asp" title="HTML 表单元素">HTML 表单元素</a></li>
+<li><a href="/html/html_form_input_types.asp" title="HTML 输入类型">HTML 输入类型</a></li>
+<li><a href="/html/html_form_attributes.asp" title="HTML 输入属性">HTML 输入属性</a></li>
+<li><a href="/html/html_form_attributes_form.asp" title="HTML Input form* 属性">HTML Input 表单属性</a></li>
+</menu>
+<h2>HTML 图形</h2>
+<menu>
+<li><a href="/html/html5_canvas.asp" title="HTML Canvas">HTML Canvas</a></li>
+<li><a href="/html/html5_svg.asp" title="HTML SVG 图形">HTML SVG</a></li>
+</menu>
+<h2>HTML 媒体</h2>
+<menu>
+<li><a href="/html/html_media.asp" title="HTML 多媒体">HTML 媒体</a></li>
+<li><a href="/html/html_video.asp" title="HTML 视频">HTML 视频</a></li>
+<li><a href="/html/html_audio.asp" title="HTML 音频">HTML 音频</a></li>
+<li><a href="/html/html_object.asp" title="HTML 插件">HTML 插件</a></li>
+<li><a href="/html/html_youtube.asp" title="HTML YouTube 视频">HTML YouTube</a></li>
+</menu>
+<h2>HTML API</h2>
+<menu>
+<li><a href="/html/html5_api_whatis.asp" title="HTML - 什么是 Web API？">HTML Web API</a></li>
+<li><a href="/html/html5_geolocation.asp" title="HTML 地理定位 API">HTML 地理定位</a></li>
+<li><a href="/html/html5_draganddrop.asp" title="HTML 拖放 API">HTML 拖放</a></li>
+<li><a href="/html/html5_webstorage.asp" title="HTML Web 存储 API">HTML Web 存储</a></li>
+<li><a href="/html/html5_webworkers.asp" title="HTML Web Workers API">HTML Web Workers</a></li>
+<li><a href="/html/html5_serversentevents.asp" title="HTML 服务器发送事件 API">HTML SSE</a></li>
+</menu>
+<h2>实例/测验/总结</h2>
+<menu>
+<li><a href="/html/html_examples.asp" title="HTML 实例">HTML 实例</a></li>
+<li><a href="/html/html_quiz.asp" title="HTML 测验">HTML 测验</a></li>
+<li><a href="/html/html_accessibility.asp" title="HTML 可访问性">HTML 可访问性</a></li>
+<li><a href="/html/html_summary.asp" title="HTML 总结">HTML 总结</a></li>
+</menu>
+<h2>HTML 参考手册</h2>
+<menu>
+<li><a href="/tags/index.asp" title="HTML 元素参考手册">HTML 元素（字母排序）</a></li>
+<li><a href="/tags/html_ref_byfunc.asp" title="HTML 元素参考手册 - 功能排序">HTML 元素（功能排序）</a></li>
+<li><a href="/tags/html_ref_html_browsersupport.asp" title="HTML 参考手册 - 浏览器支持">HTML 浏览器支持</a></li>
+<li><a href="/tags/html_ref_standardattributes.asp" title="HTML 全局属性">HTML 全局属性</a></li>
+<li><a href="/tags/html_ref_eventattributes.asp" title="HTML 事件参考手册">HTML 事件</a></li>
+<li><a href="/tags/html_ref_colornames.asp" title="HTML 颜色名">HTML 颜色名</a></li>
+<li><a href="/tags/html_ref_canvas.asp" title="HTML Canvas 参考手册">HTML 画布</a></li>
+<li><a href="/tags/html_ref_audio_video_dom.asp" title="HTML 音频/视频参考手册">HTML 视频/音频</a></li>
+<li><a href="/tags/html_ref_charactersets.asp" title="HTML 字符集">HTML 字符集</a></li>
+<li><a href="/tags/html_ref_dtd.asp" title="HTML &lt;!DOCTYPE&gt;">HTML 文档类型</a></li>
+<li><a href="/tags/html_ref_urlencode.asp" title="HTML URL 编码">HTML URL 编码</a></li>
+<li><a href="/tags/html_ref_language_codes.asp" title="HTML 语言代码参考手册">HTML 语言代码</a></li>
+<li><a href="/tags/html_ref_country_codes.asp" title="HTML ISO 国家代码参考手册">HTML 国家代码</a></li>
+<li><a href="/tags/html_ref_httpmessages.asp" title="HTTP 状态消息">HTTP 消息</a></li>
+<li><a href="/tags/html_ref_httpmethods.asp" title="HTTP 请求方法">HTTP 方法</a></li>
+<li><a href="/tags/html_ref_keyboardshortcuts.asp" title="键盘快捷键">键盘快捷键</a></li>
+</menu>
+</nav>
+
+</div>
+</aside>
+
+
+<article class="main-content">
+
+
+<h1>HTML 教程</h1>
+
+<nav class="nav-prenext">
+<menu class="nav-prenext-menu">
+<li class="btn-pre"><a href="/html/index.asp" title="HTML 教程">HTML 教程</a></li>
+<li class="btn-next"><a href="/html/html_jianjie.asp" title="HTML 简介">HTML 简介</a></li>
+</menu>
+</nav>
+
+
+
+<section class="intro">
+<h2>学习 HTML</h2>
+
+<p>HTML 是构建网页的标准标记语言。</p>
+
+<p>通过 HTML 您可以创建属于自己的网站。</p>
+
+<p>HTML 简单易学 - 您会爱上它的！</p>
+
+<p><a class="btn" href="/html/html_jianjie.asp" title="HTML 教程">现在就开始学习 HTML</a></p>
+</section>
+
+
+
+<section>
+<h2>通过实例学习</h2>
+
+<p>通过我们的"亲自试一试"编辑器，您可以直接编辑 HTML 代码并在浏览器中实时查看运行效果：</p>
+
+<h3>实例</h3>
+
+<pre class="language-html">
+&lt;!DOCTYPE html&gt;
+&lt;html&gt;
+&lt;head&gt;
+&lt;title&gt;Page Title&lt;/title&gt;
+&lt;/head&gt;
+&lt;body&gt;
+
+&lt;h1&gt;This is a Heading&lt;/h1&gt;
+&lt;p&gt;This is a paragraph.&lt;/p&gt;
+
+&lt;/body&gt;
+&lt;/html&gt;
+</pre>
+
+<p class="tiy"><a target="_blank" href="/tiy/t.asp?f=tags_a_image">亲自试一试</a></p>
+
+<p>请点击"亲自试一试"按钮，查看实际运行效果！</p>
+</section>
+
+
+
+<section>
+<h2>HTML 实例</h2>
+
+<p>本教程通过丰富的实例演示，让您更直观地理解每个知识点。</p>
+
+<p><a class="btn" target="_blank" href="/html/html_examples.asp" title="HTML 实例">查看所有 HTML 实例</a></p>
+</section>
+
+
+<section>
+<h2>HTML 测验</h2>
+
+<p>通过我们的 HTML 能力测试，检验您的学习成果！</p>
+
+<p><a class="btn" href="/html/html_quiz.asp" title="HTML 测验">开始 HTML 测验</a></p>
+</section>
+
+
+<section>
+<h2>HTML 参考手册</h2>
+
+<p>W3School 为您提供完整的参考手册，包含：</p>
+
+<ul class="list-ref">
+<li><a href="/tags/index.asp" title="HTML 元素参考手册">HTML 元素</a></li>
+<li><a href="/tags/html_ref_html_browsersupport.asp" title="HTML 参考手册 - 浏览器支持">HTML 浏览器支持</a></li>
+<li><a href="/tags/html_ref_standardattributes.asp" title="HTML 全局属性">HTML 全局属性</a></li>
+<li><a href="/tags/html_ref_eventattributes.asp" title="HTML 事件参考手册">HTML 事件属性</a></li>
+<li><a href="/tags/html_ref_colornames.asp" title="HTML 颜色名">HTML 颜色名</a></li>
+<li><a href="/tags/html_ref_canvas.asp" title="HTML Canvas 参考手册">HTML 画布</a></li>
+<li><a href="/tags/html_ref_audio_video_dom.asp" title="HTML 音频/视频参考手册">HTML 视频/音频</a></li>
+<li><a href="/tags/html_ref_charactersets.asp" title="HTML 字符集">HTML 字符集</a></li>
+<li><a href="/tags/html_ref_dtd.asp" title="HTML &lt;!DOCTYPE&gt;">HTML 文档类型</a></li>
+<li><a href="/tags/html_ref_urlencode.asp" title="HTML URL 编码">HTML URL 编码</a></li>
+<li><a href="/tags/html_ref_language_codes.asp" title="HTML 语言代码参考手册">HTML 语言代码</a></li>
+<li><a href="/tags/html_ref_country_codes.asp" title="HTML ISO 国家代码参考手册">HTML 国家代码</a></li>
+<li><a href="/tags/html_ref_httpmessages.asp" title="HTTP 状态消息">HTTP 消息</a></li>
+<li><a href="/tags/html_ref_httpmethods.asp" title="HTTP 请求方法">HTTP 方法</a></li>
+<li><a href="/tags/html_ref_keyboardshortcuts.asp" title="键盘快捷键">键盘快捷键</a></li>
+</ul>
+</section>
+
+
+
+<nav class="nav-prenext">
+<menu class="nav-prenext-menu">
+<li class="btn-pre"><a href="/html/index.asp" title="HTML 教程">HTML 教程</a></li>
+<li class="btn-next"><a href="/html/html_jianjie.asp" title="HTML 简介">HTML 简介</a></li>
+</menu>
+</nav><section>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3381531532877742"
+     crossorigin="anonymous"></script>
+<!-- W3School 正文底部自适应 -->
+<ins class="adsbygoogle"
+     style="display:block"
+     data-ad-client="ca-pub-3381531532877742"
+     data-ad-slot="3120875591"
+     data-ad-format="auto"
+     data-full-width-responsive="true"></ins>
+<script>
+     (adsbygoogle = window.adsbygoogle || []).push({});
+</script>
+</section>
+
+</article>
+
+<aside class="sidebar">
+
+<nav class="nav-tools">
+<menu class="nav-tools-menu">
+<li class="btn-reference"><a href="/tags/index.asp">HTML 参考手册</a></li>
+<li class="btn-example"><a href="/html/html_examples.asp">HTML 实例</a></li>
+<li class="btn-quiz"><a href="/html/html_quiz.asp">HTML 测验</a></li>
+</menu>
+</nav>
+
+<div class="ad-aside">
+<div class="ad-aside-bar">
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3381531532877742"
+     crossorigin="anonymous"></script>
+<!-- W3School 侧栏广告自适应 -->
+
+<ins class="adsbygoogle ad-sidebar"
+     style="display:block"
+     data-ad-client="ca-pub-3381531532877742"
+     data-ad-slot="7684920060"
+</ins>
+<script>
+     (adsbygoogle = window.adsbygoogle || []).push({});
+</script>
+</div>
+</div>
+
+</aside>
+
+
+</main>
+
+
+<div class="menu-overlay" id="menuOverlay"></div>
+
+<script type="application/javascript" language="javascript" src="/lib/js/topnav.js?v=6"></script>
+<script type="application/javascript" language="javascript" src="/lib/js/nav.js?v=1"></script>
+
+<footer class="footer-container">
+<div>
+<a href="/about/index.asp" title="关于 W3School">关于 W3School</a>
+<a target="_blank" href="https://www.ykinvestment.com/">技术支持：赢科</a>
+<a target="_blank" href="http://beian.miit.gov.cn">蒙 ICP 备 06004630 号</a>
+</div>
+
+<div>
+W3School 的朋友：<a target="_blank" href="https://www.w3ctech.com/">w3ctech</a>
+<a target="_blank" href="https://wetest.qq.com/?from=links_w3school">WeTest</a>
+</div>
+</footer>
+
+</body>
+
+</html>

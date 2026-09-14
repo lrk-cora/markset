@@ -51,3 +51,20 @@ export function segmentImage({ imageDataUrl, box, points }) {
 export function planOps(payload) {
   return post('/api/plan', payload)
 }
+
+export async function importPage(payload) {
+  const headers = { 'Content-Type': 'application/json' }
+  if (clientGate) headers['X-MarkSet-Call'] = '1'
+  const res = await fetch('/api/import-page', {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(payload || {}),
+  })
+  const data = await res.json().catch(() => ({}))
+  if (!res.ok) {
+    const err = new Error(data.error || `导入失败 ${res.status}`)
+    err.code = data.code || String(res.status)
+    throw err
+  }
+  return data
+}

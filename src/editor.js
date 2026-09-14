@@ -41,6 +41,66 @@ const BlockId = Extension.create({
   },
 })
 
+function parsePlaced(el) {
+  if (el.hasAttribute('data-shift-dx')) {
+    return {
+      mode: 'shift',
+      dx: Number(el.getAttribute('data-shift-dx') || 0),
+      dy: Number(el.getAttribute('data-shift-dy') || 0),
+      sx: Number(el.getAttribute('data-shift-sx') || 1),
+      sy: Number(el.getAttribute('data-shift-sy') || 1),
+      x: Number(el.getAttribute('data-placed-x') || 0),
+      y: Number(el.getAttribute('data-placed-y') || 0),
+      w: Number(el.getAttribute('data-placed-w') || 0),
+      h: Number(el.getAttribute('data-placed-h') || 0),
+    }
+  }
+  if (!el.hasAttribute('data-placed-x')) return null
+  return {
+    x: Number(el.getAttribute('data-placed-x')),
+    y: Number(el.getAttribute('data-placed-y')),
+    w: Number(el.getAttribute('data-placed-w')),
+    h: Number(el.getAttribute('data-placed-h') || 0),
+  }
+}
+
+function shiftStyle(placed) {
+  const dx = placed.dx || 0
+  const dy = placed.dy || 0
+  const sx = placed.sx ?? 1
+  const sy = placed.sy ?? 1
+  return `transform:translate(${dx}px,${dy}px) scale(${sx},${sy});transform-origin:top left;`
+}
+
+function renderPlaced(placed, { text = false } = {}) {
+  if (!placed) return {}
+  if (placed.mode === 'shift') {
+    return {
+      class: 'is-shifted',
+      'data-shift-dx': String(placed.dx || 0),
+      'data-shift-dy': String(placed.dy || 0),
+      'data-shift-sx': String(placed.sx ?? 1),
+      'data-shift-sy': String(placed.sy ?? 1),
+      'data-placed-x': String(placed.x || 0),
+      'data-placed-y': String(placed.y || 0),
+      'data-placed-w': String(placed.w || 0),
+      'data-placed-h': String(placed.h || 0),
+      style: shiftStyle(placed),
+    }
+  }
+  const { x, y, w, h } = placed
+  return {
+    class: 'is-placed',
+    'data-placed-x': String(x),
+    'data-placed-y': String(y),
+    'data-placed-w': String(w),
+    'data-placed-h': String(h || 0),
+    style: text
+      ? `left:${x}px;top:${y}px;width:${w}px;${h ? `min-height:${h}px;` : ''}`
+      : undefined,
+  }
+}
+
 const Placed = Extension.create({
   name: 'placed',
   addGlobalAttributes() {
@@ -50,27 +110,8 @@ const Placed = Extension.create({
         attributes: {
           placed: {
             default: null,
-            parseHTML: (el) => {
-              if (!el.hasAttribute('data-placed-x')) return null
-              return {
-                x: Number(el.getAttribute('data-placed-x')),
-                y: Number(el.getAttribute('data-placed-y')),
-                w: Number(el.getAttribute('data-placed-w')),
-                h: Number(el.getAttribute('data-placed-h') || 0),
-              }
-            },
-            renderHTML: (attrs) => {
-              if (!attrs.placed) return {}
-              const { x, y, w, h } = attrs.placed
-              return {
-                class: 'is-placed',
-                'data-placed-x': String(x),
-                'data-placed-y': String(y),
-                'data-placed-w': String(w),
-                'data-placed-h': String(h || 0),
-                style: `left:${x}px;top:${y}px;width:${w}px;${h ? `min-height:${h}px;` : ''}`,
-              }
-            },
+            parseHTML: (el) => parsePlaced(el),
+            renderHTML: (attrs) => renderPlaced(attrs.placed, { text: true }),
           },
         },
       },
@@ -87,6 +128,14 @@ const DocImage = Image.extend({
         parseHTML: (el) => Number(el.getAttribute('width')) || 360,
         renderHTML: (attrs) => {
           const parts = [`width:${attrs.width}px`, `height:${attrs.height || attrs.width}px`]
+          if (attrs.placed?.mode === 'shift') {
+            parts.push(shiftStyle(attrs.placed).replace(/;$/, ''))
+            return {
+              width: attrs.width,
+              class: 'is-shifted',
+              style: parts.join(';'),
+            }
+          }
           if (attrs.placed) {
             parts.push(
               'position:absolute',
@@ -109,23 +158,15 @@ const DocImage = Image.extend({
       placed: {
         default: null,
         parseHTML: (el) => {
-          if (!el.hasAttribute('data-placed-x')) return null
-          return {
-            x: Number(el.getAttribute('data-placed-x')),
-            y: Number(el.getAttribute('data-placed-y')),
-            w: Number(el.getAttribute('data-placed-w')),
-            h: Number(el.getAttribute('data-placed-h') || 0),
-          }
+          return parsePlaced(el)
         },
         renderHTML: (attrs) => {
-          if (!attrs.placed) return {}
-          return {
-            class: 'is-placed',
-            'data-placed-x': String(attrs.placed.x),
-            'data-placed-y': String(attrs.placed.y),
-            'data-placed-w': String(attrs.placed.w),
-            'data-placed-h': String(attrs.placed.h || 0),
+          const html = renderPlaced(attrs.placed)
+          if (attrs.placed?.mode === 'shift' && html?.style) {
+            const { style: _style, ...rest } = html
+            return rest
           }
+          return html
         },
       },
     }
@@ -236,9 +277,18 @@ export const DEMO_CUP = {
 }
 
 let currentDemoPage = 'a'
+let importedMeta = null
 
 export function getDemoPage() {
   return currentDemoPage
+}
+
+export function getImportedMeta() {
+  return importedMeta
+}
+
+export function isDemoPage() {
+  return currentDemoPage === 'a' || currentDemoPage === 'b'
 }
 
 function cupSrc(pageId = 'a') {
@@ -315,9 +365,119 @@ export const DEMO_KICKER = {
 
 export function applyDemoPage(editor, pageId = 'a') {
   currentDemoPage = pageId === 'b' ? 'b' : 'a'
+  importedMeta = null
+  document.querySelector('.page')?.classList.remove('is-import', 'is-web-doc')
+  const host = document.getElementById('web-doc-host')
+  if (host) host.hidden = true
   editor.commands.setContent(demoDoc(currentDemoPage))
   const kicker = document.getElementById('page-kicker')
   if (kicker) kicker.textContent = DEMO_KICKER[currentDemoPage] || DEMO_KICKER.a
+}
+
+function textNode(text) {
+  const t = String(text || '').trim()
+  return t ? [{ type: 'text', text: t }] : []
+}
+
+export function importedDoc(page) {
+  const content = []
+  let heads = 0
+  let paras = 0
+  let imgs = 0
+  let usedPrice = false
+  let usedShip = false
+  for (const block of page?.blocks || []) {
+    if (block.type === 'heading') {
+      const text = textNode(block.text)
+      if (!text.length) continue
+      heads += 1
+      content.push({
+        type: 'heading',
+        attrs: { level: 1, blockId: heads === 1 ? 'h-1' : `h-${heads}` },
+        content: text,
+      })
+      continue
+    }
+    if (block.type === 'image' && block.src) {
+      imgs += 1
+      content.push({
+        type: 'image',
+        attrs: {
+          src: block.src,
+          alt: block.alt || page.title || '导入的图',
+          blockId: imgs === 1 ? 'img-1' : `img-${imgs}`,
+          width: block.width || 360,
+          height: block.height || 280,
+        },
+      })
+      continue
+    }
+    const text = textNode(block.text)
+    if (!text.length) continue
+    paras += 1
+    const raw = String(block.text || '')
+    let id = `p-${paras}`
+    if (!usedPrice && /¥\s*\d+|售价/.test(raw)) {
+      id = 'p-price'
+      usedPrice = true
+    } else if (!usedShip && /发货|物流|顺延/.test(raw)) {
+      id = 'p-ship'
+      usedShip = true
+    }
+    content.push({
+      type: 'paragraph',
+      attrs: { blockId: id },
+      content: text,
+    })
+  }
+  if (!content.length) {
+    content.push({
+      type: 'paragraph',
+      attrs: { blockId: 'p-1' },
+      content: [{ type: 'text', text: '这个网页没有读出可用内容。' }],
+    })
+  }
+  return { type: 'doc', content }
+}
+
+export async function applyImportedPage(editor, page) {
+  const { blocksToHtml, mountWebDoc, screenshotToHtml, unmountWebDoc } = await import('./web-doc.js')
+  currentDemoPage = 'import'
+  importedMeta = {
+    title: page?.title || '',
+    sourceUrl: page?.sourceUrl || '',
+    siteName: page?.siteName || '',
+  }
+  const host = (() => {
+    try {
+      return page?.sourceUrl ? new URL(page.sourceUrl).hostname : ''
+    } catch {
+      return ''
+    }
+  })()
+  const kicker = document.getElementById('page-kicker')
+  if (kicker) kicker.textContent = `导入 · ${page?.title || '未命名'}${host ? ` · ${host}` : ''}`
+
+  const html =
+    String(page?.snapshotHtml || '').trim() ||
+    (page?.blocks?.length ? blocksToHtml(page) : '') ||
+    (page?.screenshotDataUrl ? screenshotToHtml(page.screenshotDataUrl, page.title) : '')
+  editor.commands.setContent({
+    type: 'doc',
+    content: [
+      {
+        type: 'paragraph',
+        attrs: { blockId: 'p-import' },
+        content: [{ type: 'text', text: page?.title || '导入的网页' }],
+      },
+    ],
+  })
+  if (html && mountWebDoc(html, importedMeta)) {
+    return page?.snapshotHtml ? 'html' : page?.screenshotDataUrl && !page?.blocks?.length ? 'snapshot' : 'html'
+  }
+  unmountWebDoc()
+  editor.commands.setContent(importedDoc(page))
+  return 'blocks'
 }
 
 export function createEditor(element) {
@@ -377,8 +537,10 @@ export function posBeforeBlockAtY(view, clientY) {
 }
 
 export function pageRelativeRect(screenRect) {
-  const host =
-    document.querySelector('#editor .ProseMirror') || document.querySelector('.page')
+  const frame = document.getElementById('web-doc-frame')
+  const host = document.querySelector('.page.is-web-doc') && frame
+    ? frame
+    : document.querySelector('#editor .ProseMirror') || document.querySelector('.page')
   if (!host || !screenRect) return null
   const box = host.getBoundingClientRect()
   const style = getComputedStyle(host)

@@ -1,10 +1,44 @@
-import { pageRelativeRect } from './editor.js'
 import { aabb } from './geometry.js'
-import { isTinyImageSpan } from './hit-test.js'
 import { layoutPenOf } from './overlay.js'
 import { getSnapshot, upsertSpan } from './store.js'
 
+function overlapArea(a, b) {
+  if (!a || !b) return 0
+  const x = Math.max(a.x, b.x)
+  const y = Math.max(a.y, b.y)
+  const r = Math.min(a.x + a.w, b.x + b.w)
+  const bot = Math.min(a.y + a.h, b.y + b.h)
+  return Math.max(0, r - x) * Math.max(0, bot - y)
+}
+
+function smallestHit(items) {
+  const hits = (items || []).filter((c) => c)
+  if (!hits.length) return null
+  hits.sort((a, b) => {
+    const aa = (a.screenRect?.w || 1) * (a.screenRect?.h || 1)
+    const ba = (b.screenRect?.w || 1) * (b.screenRect?.h || 1)
+    return aa - ba
+  })
+  return hits[0]
+}
+
+function pickLayoutSource(box, texts, images) {
+  const textHits = (texts || []).filter((c) => overlapArea(c.screenRect, box) > 12)
+  if (textHits.length) return smallestHit(textHits)
+  const imageHits = (images || []).filter((c) => overlapArea(c.screenRect, box) > 12)
+  return smallestHit(imageHits) || smallestHit(images) || smallestHit(texts)
+}
+
+function isImageRegion(span) {
+  if (span?.kind !== 'image') return false
+  const sr = span.screenRect
+  const ir = span.imageRect
+  if (!sr || !ir) return Boolean(span.bbox || span.mode === 'region')
+  return sr.w * sr.h < ir.w * ir.h * 0.72
+}
+
 function moduleScreenRect(view, span) {
+  if (span?.webId && span.screenRect) return span.screenRect
   if (span?.kind === 'image' && span.screenRect) return span.screenRect
   if (span?.block_id) {
     const el = view.dom.querySelector(`[data-block-id="${CSS.escape(span.block_id)}"]`)
@@ -29,11 +63,14 @@ function moduleScreenRect(view, span) {
 }
 
 function farFrom(span, box) {
+  const overlap = overlapArea(span?.screenRect, box)
+  const boxArea = Math.max(1, (box?.w || 0) * (box?.h || 0))
+  if (overlap / boxArea > 0.4) return false
   const a = span?.screenRect
   if (!a || !box) return true
   const dx = box.x + box.w / 2 - (a.x + a.w / 2)
   const dy = box.y + box.h / 2 - (a.y + a.h / 2)
-  return Math.hypot(dx, dy) > 56
+  return Math.hypot(dx, dy) > 36
 }
 
 export function collectLayoutPairs(spans = getSnapshot().spans) {
@@ -41,7 +78,10 @@ export function collectLayoutPairs(spans = getSnapshot().spans) {
   for (const span of spans || []) {
     if (!span.layoutColor) continue
     const g = byColor.get(span.layoutColor) || { sources: [], dests: [] }
-    if (span.layoutRole === 'source') g.sources.push(span)
+    if (span.layoutRole === 'source') {
+      if (span.willEdit === false) continue
+      g.sources.push(span)
+    }
     else if (span.layoutRole === 'dest') g.dests.push(span)
     byColor.set(span.layoutColor, g)
   }
@@ -56,6 +96,13 @@ export function collectLayoutPairs(spans = getSnapshot().spans) {
       blockId: src.block_id,
       from: src.from,
       dest: dest.screenRect,
+      sourceRect: src.screenRect,
+      bbox: src.bbox,
+      imageRect: src.imageRect,
+      naturalSize: src.naturalSize,
+      text: src.text,
+      webId: src.webId || null,
+      region: isImageRegion(src),
       label: src.kind === 'image' ? '图' : String(src.text || '这段').slice(0, 8),
       pen: layoutPenOf(color)?.label || '这支笔',
     })
@@ -65,6 +112,10 @@ export function collectLayoutPairs(spans = getSnapshot().spans) {
 
 export function looksLikeLayout(spans) {
   return collectLayoutPairs(spans).length > 0
+}
+
+export function hasLayoutWork(spans = getSnapshot().spans) {
+  return (spans || []).some((s) => s.layoutColor)
 }
 
 export function layoutSourceWaiting(spans = getSnapshot().spans) {
@@ -82,64 +133,100 @@ export function layoutSourceWaiting(spans = getSnapshot().spans) {
   return ''
 }
 
-function findNodePos(editor, pair) {
-  let found = null
-  editor.state.doc.descendants((node, pos) => {
-    if (found != null) return false
-    if (pair.blockId && node.attrs?.blockId === pair.blockId) {
-      found = pos
-      return false
-    }
-    return true
-  })
-  if (found != null) return found
-  if (pair.from == null) return null
-  try {
-    const $pos = editor.state.doc.resolve(pair.from)
-    for (let d = $pos.depth; d > 0; d -= 1) {
-      if ($pos.node(d).isTextblock || $pos.node(d).type.name === 'image') return $pos.before(d)
-    }
-  } catch {
-    /* ignore */
+function toEditorRect(rect) {
+  const host = document.querySelector('#editor .ProseMirror') || document.querySelector('.page')
+  if (!host || !rect) return null
+  const box = host.getBoundingClientRect()
+  const x = Math.round(rect.x - box.left)
+  const y = Math.round(rect.y - box.top)
+  const w = Math.round(rect.w)
+  const h = Math.round(rect.h)
+  return {
+    x: Math.max(0, x),
+    y: Math.max(0, y),
+    w: Math.max(8, Math.min(w, Math.round(box.width - Math.max(0, x)))),
+    h: Math.max(8, Math.min(h, Math.round(box.height - Math.max(0, y)))),
   }
-  return null
 }
 
-function clampPlacedToPage(placed) {
-  const page = document.querySelector('.page')
-  const host = document.querySelector('#editor .ProseMirror') || page
-  if (!page || !host || !placed) return placed
-  const pb = page.getBoundingClientRect()
-  const hb = host.getBoundingClientRect()
-  const style = getComputedStyle(page)
-  const padL = parseFloat(style.paddingLeft) || 0
-  const padR = parseFloat(style.paddingRight) || 0
-  const padT = parseFloat(style.paddingTop) || 0
-  const padB = parseFloat(style.paddingBottom) || 0
-  const minX = pb.left + padL - hb.left
-  const minY = pb.top + padT - hb.top
-  const maxX = pb.right - padR - hb.left
-  const maxY = pb.bottom - padB - hb.top
-  const roomW = Math.max(48, maxX - minX)
-  const roomH = Math.max(24, maxY - minY)
-  const w = Math.min(Math.max(48, placed.w || 48), roomW)
-  const h = Math.min(Math.max(24, placed.h || 24), roomH)
-  const x = Math.min(Math.max(minX, placed.x), maxX - w)
-  const y = Math.min(Math.max(minY, placed.y), maxY - h)
-  return { x: Math.round(x), y: Math.round(y), w: Math.round(w), h: Math.round(h) }
+function blockEl(view, node, pos) {
+  const id = node.attrs?.blockId
+  if (id) {
+    const el = view.dom.querySelector(`[data-block-id="${CSS.escape(id)}"]`)
+    if (el) return el
+  }
+  return view.nodeDOM(pos)
 }
 
-function snapRect(rect) {
-  const x = Math.round(rect.x / 8) * 8
-  const y = Math.round(rect.y / 8) * 8
-  return { ...rect, x, y }
+function collectBlockRects(view) {
+  const rects = []
+  view.state.doc.forEach((node, pos) => {
+    if (!['paragraph', 'heading', 'image'].includes(node.type.name)) return
+    const el = blockEl(view, node, pos)
+    const r = el?.getBoundingClientRect?.()
+    if (!r || r.width < 2 || r.height < 2) return
+    rects.push({
+      pos,
+      node,
+      screen: { x: r.left, y: r.top, w: r.width, h: r.height },
+    })
+  })
+  return rects
+}
+
+function matchPairBlock(rects, pair) {
+  if (pair.blockId) {
+    const hit = rects.find((r) => r.node.attrs?.blockId === pair.blockId)
+    if (hit) return hit
+  }
+  if (pair.from == null) return null
+  return rects.find((r) => r.pos <= pair.from && r.pos + r.node.nodeSize > pair.from) || null
+}
+
+function shiftFrom(src, dest) {
+  return {
+    mode: 'shift',
+    dx: Math.round(dest.x - src.x),
+    dy: Math.round(dest.y - src.y),
+    sx: 1,
+    sy: 1,
+    x: dest.x,
+    y: dest.y,
+    w: dest.w,
+    h: dest.h,
+  }
+}
+
+export function applyLayoutMoves(editor) {
+  const view = editor?.view
+  if (!view) return 0
+  const pairs = collectLayoutPairs()
+  if (!pairs.length) return 0
+  const rects = collectBlockRects(view)
+  let tr = view.state.tr
+  let n = 0
+
+  for (const pair of pairs) {
+    const dest = toEditorRect(pair.dest)
+    const hit = dest ? matchPairBlock(rects, pair) : null
+    const src = hit ? toEditorRect(pair.sourceRect) || toEditorRect(hit.screen) : null
+    if (!hit || !src) continue
+    tr = tr.setNodeMarkup(hit.pos, null, {
+      ...hit.node.attrs,
+      placed: shiftFrom(src, dest),
+    })
+    n += 1
+  }
+  if (!n) return 0
+  view.dispatch(tr)
+  return n
 }
 
 export function ingestLayoutStroke(editor, { color, polygon, rawPoints, textHits, imageHits }) {
   const box = aabb(rawPoints?.length ? rawPoints : polygon)
   const texts = textHits?.found || []
-  const images = (imageHits?.found || []).filter((s) => !isTinyImageSpan(s))
-  const content = images[0] || texts[0]
+  const images = [...(imageHits?.found || []), ...(imageHits?.suggest || [])]
+  const content = pickLayoutSource(box, texts, images)
   const spans = getSnapshot().spans
   const existingSrc = spans.find((s) => s.layoutColor === color && s.layoutRole === 'source')
   const pen = layoutPenOf(color)
@@ -147,14 +234,13 @@ export function ingestLayoutStroke(editor, { color, polygon, rawPoints, textHits
   const wantDest = Boolean(existingSrc && (!content || farFrom(existingSrc, box)))
 
   if (wantDest) {
-    const destRect = content?.kind === 'image' && content.screenRect ? content.screenRect : box
     upsertSpan(
       (s) => s.layoutColor === color && s.layoutRole === 'dest',
       {
         kind: 'slot',
         layoutColor: color,
         layoutRole: 'dest',
-        screenRect: destRect,
+        screenRect: box,
         poly: polygon,
         paintMark: true,
         why: 'layout-dest',
@@ -182,41 +268,4 @@ export function ingestLayoutStroke(editor, { color, polygon, rawPoints, textHits
     kind: content.kind,
     preview: content.kind === 'image' ? '图' : String(content.text || '这段').slice(0, 8),
   }
-}
-
-export function applyLayoutMoves(editor, { snap = false } = {}) {
-  const pairs = collectLayoutPairs()
-  if (!pairs.length || !editor) return false
-  const dests = pairs.map((p) => (snap ? snapRect(p.dest) : { ...p.dest }))
-  if (snap && dests.length > 1) {
-    for (let i = 1; i < dests.length; i += 1) {
-      if (Math.abs(dests[i].x - dests[0].x) <= 28) dests[i].x = dests[0].x
-    }
-  }
-  let tr = editor.state.tr
-  let n = 0
-  pairs.forEach((pair, i) => {
-    const pos = findNodePos(editor, pair)
-    if (pos == null) return
-    const node = tr.doc.nodeAt(pos)
-    if (!node) return
-    const dest = dests[i]
-    const placed = pageRelativeRect(dest)
-    if (!placed) return
-    const srcEl = pair.blockId
-      ? editor.view.dom.querySelector(`[data-block-id="${CSS.escape(pair.blockId)}"]`)
-      : null
-    const srcBox = srcEl?.getBoundingClientRect()
-    const next = clampPlacedToPage({
-      x: placed.x,
-      y: placed.y,
-      w: Math.round(srcBox?.width || (pair.kind === 'image' ? node.attrs.width || placed.w : placed.w)),
-      h: Math.round(srcBox?.height || placed.h),
-    })
-    tr = tr.setNodeMarkup(pos, null, { ...node.attrs, placed: next })
-    n += 1
-  })
-  if (!n) return false
-  editor.view.dispatch(tr)
-  return n
 }

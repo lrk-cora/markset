@@ -1,7 +1,7 @@
 import { COLORS, COLOR_SCHEMES, paperFill } from './colors.js'
 import { DEMO_CUP, getDemoPage, pageRelativeRect } from './editor.js'
 import { COLOR_TERMS } from './forbidden.js'
-import { aabb, convexHull, intersectBoxes, pathLength, strokeToPolygon } from './geometry.js'
+import { aabb, convexHull, intersectBoxes, looksLikeDrawnLine, pathLength, strokeToPolygon } from './geometry.js'
 import { imageSpanFromNaturalBox } from './hit-test.js'
 import { collectOutsideEdits } from './scope.js'
 import {
@@ -15,7 +15,17 @@ import {
   toggleBackground,
   undoLastInsert,
 } from './store.js'
-import { applyLayoutMoves, layoutSourceWaiting, looksLikeLayout } from './layout.js'
+import { applyLayoutMoves, hasLayoutWork, layoutSourceWaiting, looksLikeLayout } from './layout.js'
+import {
+  applyWebAnno,
+  applyWebAnnoAll,
+  applyWebIndent,
+  applyWebLayoutMoves,
+  applyWebShadow,
+  isWebDocActive,
+  restoreWebHtml,
+  snapshotWebHtml,
+} from './web-doc.js'
 import { clearPaintMarks, setSubtractMode } from './overlay.js'
 import { redoChange, restoreChange } from './changes.js'
 import { clearInk, hasInk, undoLastInkStroke } from './ink.js'
@@ -49,7 +59,30 @@ const FOLLOW_INTENTS = new Set([
   'bold',
 ])
 
-const LOCAL_ANNO = new Set(['underline', 'wavy', 'strike', 'box', 'highlight', 'bold', 'frame', 'line'])
+const LINE_STYLE_DEFS = [
+  { id: 'line', label: '直线' },
+  { id: 'wavy', label: '波浪线' },
+  { id: 'line-double', label: '两条直线' },
+  { id: 'line-thick', label: '粗直线' },
+  { id: 'line-thin', label: '细直线' },
+  { id: 'line-strike', label: '删除线' },
+]
+
+const LINE_KIND_IDS = LINE_STYLE_DEFS.flatMap((s) => [s.id, `${s.id}-h`, `${s.id}-v`])
+
+const LOCAL_ANNO = new Set([
+  'underline',
+  'wavy',
+  'strike',
+  'box',
+  'highlight',
+  'bold',
+  'frame',
+  'circle',
+  ...LINE_KIND_IDS,
+])
+
+const PAGE_LINE = new Set(LINE_KIND_IDS)
 
 const LOCAL_LABELS = {
   indent: '空两格',
@@ -63,7 +96,24 @@ const LOCAL_LABELS = {
   highlight: '高亮',
   bold: '加粗',
   frame: '方框',
-  line: '线条',
+  line: '直线',
+  'line-thin': '细直线',
+  'line-thick': '粗直线',
+  'line-double': '两条直线',
+  'line-h': '水平直线',
+  'line-v': '垂直直线',
+  'wavy-h': '水平波浪线',
+  'wavy-v': '垂直波浪线',
+  'line-double-h': '水平两条直线',
+  'line-double-v': '垂直两条直线',
+  'line-thick-h': '水平粗直线',
+  'line-thick-v': '垂直粗直线',
+  'line-thin-h': '水平细直线',
+  'line-thin-v': '垂直细直线',
+  'line-strike': '删除线',
+  'line-strike-h': '水平删除线',
+  'line-strike-v': '垂直删除线',
+  circle: '圈',
   'clear-anno': '去掉批注',
   scheme: '配色',
 }
@@ -85,7 +135,12 @@ function snapshotLocal(editor, label) {
     imgShadow: img?.dataset.marksetShadow || '',
     decoHtml: host?.innerHTML || '',
     pagePaper: getPagePaper(),
+    webHtml: isWebDocActive() ? snapshotWebHtml() : null,
   })
+}
+
+export function rememberLocal(editor, label) {
+  snapshotLocal(editor, label)
 }
 
 function withLocalUndo(editor, label, fn) {
@@ -127,6 +182,7 @@ export function undoLastLocalAction(editor) {
     if (host) host.innerHTML = snap.decoHtml
   }
   if ('pagePaper' in snap) setPagePaper(snap.pagePaper)
+  if (snap.webHtml != null) restoreWebHtml(snap.webHtml)
   clearSchemeUi()
   if (ui.step === 'values' || ui.step === 'review') {
     ui.step = 'propose'
@@ -170,6 +226,7 @@ let ui = {
   hintUnderOn: true,
   hintOverOn: true,
   lastPaint: null,
+  hideCard: false,
 }
 
 function readCoachDone() {
@@ -228,9 +285,11 @@ export function resetCardForNewSelection() {
   ui.printFit = ''
   ui.hintUnderOn = true
   ui.hintOverOn = true
+  ui.hideCard = false
 }
 
 export function keepCardForAppend() {
+  ui.hideCard = false
   if (ui.step === 'idle' || ui.step === 'review') {
     ui.step = 'propose'
     ui.intent = null
@@ -243,13 +302,14 @@ export function startReview() {
   ui.schemeSlot = null
 }
 
-export function idleCard() {
+export function idleCard({ accept = false } = {}) {
   ui.step = 'idle'
   ui.intent = null
   ui.note = ''
   ui.noteText = ''
   ui.noteConfident = false
   ui.lastPaint = null
+  if (accept) ui.hideCard = true
   clearSchemeUi()
   clearInk()
   clearPaintMarks()
@@ -419,7 +479,39 @@ function hasColorHint(texts) {
   return texts.some((s) => COLOR_TERMS.some((c) => (s.text || '').includes(c)))
 }
 
+function looksLikePageLine(spans = getSnapshot().spans) {
+  if (ui.lastPaint?.length && looksLikeDrawnLine(ui.lastPaint)) return true
+  return (spans || []).some((s) => s.lineMark)
+}
+
+function looksLikeCircledRegion(spans = getSnapshot().spans) {
+  if (looksLikePageLine(spans) || looksLikeIndent(spans) || looksLikeLayout(spans)) return false
+  if (ui.lastPaint?.length >= 8) return true
+  return (spans || []).some((s) => s.paintMark && s.kind === 'slot')
+}
+
+function addLineStyleChoices(add) {
+  for (const s of LINE_STYLE_DEFS) add(s.id, s.label)
+  for (const s of LINE_STYLE_DEFS) add(`${s.id}-h`, `水平${s.label}`)
+  for (const s of LINE_STYLE_DEFS) add(`${s.id}-v`, `垂直${s.label}`)
+}
+
+function parseLineKind(kind) {
+  if (kind.endsWith('-h')) return { style: kind.slice(0, -2), axis: 'h' }
+  if (kind.endsWith('-v')) return { style: kind.slice(0, -2), axis: 'v' }
+  return { style: kind, axis: null }
+}
+
+function isPageLineChoice(id) {
+  const { style, axis } = parseLineKind(id)
+  if (!LINE_STYLE_DEFS.some((s) => s.id === style)) return false
+  if (axis) return true
+  if (style === 'wavy') return looksLikePageLine()
+  return true
+}
+
 function looksLikeIndent(spans) {
+  if (looksLikePageLine(spans)) return false
   const marks = spans.filter((s) => s.indentMark)
   if (marks.length >= 2) return true
   if (spans.some((s) => s.kind === 'image' || s.kind === 'text')) return false
@@ -454,23 +546,50 @@ function addDecorChoices(add, { texts, images, slots, empty }) {
     add('underline', '加上下划线')
     add('wavy', '加上波浪线')
     add('box', '加上一个框')
+    add('circle', '加上一个圈')
     add('highlight', '加上高亮')
     add('strike', '加上删除线')
-    add('bold', '加粗这段')
+    add('longer', '扩写圈中文字')
   }
   if (images.length) {
     add('shadow', '给这张图加阴影')
     add('frame', '给图加上边框')
     add('deco', '加标注或图案')
-    add('border', '加边框、logo、线条')
   }
   if (slots.length || empty) {
+    add('frame', '加上一个框')
+    add('circle', '加上一个圈')
     add('insert-text', '插入一段文字')
     add('insert-image', '插入图片')
-    add('frame', '加上一个框')
-    add('line', '加上一条线')
-    add('wavy', '加上波浪线')
-    add('deco', '加标注或图案')
+  }
+}
+
+function addChangeChoices(add, { texts, images }) {
+  const name = hasNameHint(texts)
+  const color = hasColorHint(texts) || images.length
+  const pattern = images.length
+  if (name && color && pattern) {
+    add('name', '只改名字')
+    add('color', '只改颜色')
+    add('pattern', '只改图案')
+  } else {
+    if (name) add('name', '改名字')
+    if (color) add('color', '改颜色')
+    if (name && color) add('name-color', '改名字和颜色')
+    if (pattern && !color) add('pattern', '改图案')
+  }
+  if (texts.length) {
+    add('polish', '润色这段')
+    add('spoken', '改成更口语')
+    add('formal', '改成更正式')
+    add('bold', '改成加粗')
+    add('shorter', '写短一点')
+  }
+  add('custom', '换成我写的 / 换成我描述的样子')
+  if (images.length) add('anchor', '照着这里改别处')
+  if (name && ui.productName.trim().length > 4) {
+    add('print-short', '杯面用简称')
+    add('print-shrink', '缩小写进像素')
   }
 }
 
@@ -481,6 +600,11 @@ function proposeOptions(spans, editor) {
   const bits = []
   const add = (id, label) => {
     if (!bits.some((b) => b[0] === id)) bits.push([id, label])
+  }
+
+  if (hasLayoutWork(spans) || looksLikeLayout(spans) || layoutSourceWaiting(spans)) {
+    if (looksLikeLayout(spans)) add('move-layout', '移到画出的位置')
+    return bits
   }
 
   if (note === 'delete') {
@@ -509,8 +633,24 @@ function proposeOptions(spans, editor) {
   }
 
   if (note === 'add') {
+    if (looksLikePageLine(spans)) {
+      addLineStyleChoices(add)
+      return bits
+    }
+    if (looksLikeCircledRegion(spans)) {
+      add('frame', '加上一个框')
+      add('circle', '加上一个圈')
+      add('shadow', '加上阴影')
+      if (texts.length) add('longer', '扩写圈中文字')
+      if (slots.length || empty) {
+        add('insert-text', '插入一段文字')
+        add('insert-image', '插入图片')
+      }
+      if (images.length) add('shadow', '给这张图加阴影')
+      if (texts.length && images.length) add('fuse', '把圈中的字融入图')
+      return bits
+    }
     addDecorChoices(add, { texts, images, slots, empty: empty || !texts.length && !images.length })
-    if (texts.length) add('longer', '扩写圈中文字')
     if (texts.length && images.length) add('fuse', '把圈中的字融入图')
     if (looksLikeShadow(spans, editor)) {
       const packed = cupScreenBox(editor)
@@ -529,32 +669,8 @@ function proposeOptions(spans, editor) {
   }
 
   if (note === 'change') {
-    const name = hasNameHint(texts)
-    const color = hasColorHint(texts) || images.length
-    const pattern = images.length
-    if (name && color && pattern) {
-      add('name', '只改名字')
-      add('color', '只改颜色')
-      add('pattern', '只改图案')
-    } else {
-      if (name) add('name', '改名字')
-      if (color) add('color', '改颜色')
-      if (name && color) add('name-color', '改名字和颜色')
-    }
-    add('custom', '换成我写的 / 换成我描述的样子')
-    if (texts.length) {
-      add('polish', '润色')
-      add('spoken', '改成更口语')
-      add('formal', '改成更正式')
-      add('bold', '加粗这段')
-      add('underline', '加上下划线')
-    }
-    addDecorChoices(add, { texts, images, slots, empty })
-    if (images.length) add('anchor', '照着这里改别处')
-    if (name && ui.productName.trim().length > 4) {
-      add('print-short', '杯面用简称')
-      add('print-shrink', '缩小写进像素')
-    }
+    addChangeChoices(add, { texts, images })
+    if (!bits.length) add('custom', '换成我写的 / 换成我描述的样子')
     return bits
   }
 
@@ -571,9 +687,21 @@ function proposeOptions(spans, editor) {
     return bits
   }
 
-  if (looksLikeLayout(spans)) add('move-layout', '移到画出的位置')
-  if (looksLikeLayout(spans)) add('move-nudge', '微调对齐和间距')
   if (looksLikeIndent(spans)) add('indent', '这段空两格')
+  if (looksLikePageLine(spans)) {
+    addLineStyleChoices(add)
+    return bits
+  }
+  if (looksLikeCircledRegion(spans)) {
+    if (looksLikeShadow(spans, editor)) {
+      const packed = cupScreenBox(editor)
+      add('shadow', shadowOptionLabel(ui.lastPaint, packed?.cup))
+    }
+    add('frame', '加上一个框')
+    add('circle', '加上一个圈')
+    add('shadow', '加上阴影')
+    return bits
+  }
   if (looksLikeShadow(spans, editor)) {
     const packed = cupScreenBox(editor)
     add('shadow', shadowOptionLabel(ui.lastPaint, packed?.cup))
@@ -772,6 +900,18 @@ export function addCoachMarks(layer, editor) {
 
 function fillHints(bar, _editor, spans) {
   const { images } = selectionKinds(spans)
+  const shapeOnly =
+    looksLikePageLine(spans) ||
+    looksLikeCircledRegion(spans) ||
+    looksLikeLayout(spans) ||
+    Boolean(layoutSourceWaiting(spans))
+  const modules = spans.filter((s) => (s.kind === 'text' || s.kind === 'image') && !s.frozen)
+  if (!shapeOnly && modules.length > 1) {
+    const row = document.createElement('p')
+    row.className = 'card-hint'
+    row.textContent = '每块左上角有勾，默认全选。取消勾则不改那一块。'
+    bar.append(row)
+  }
   const indentWaiting = spans.filter((s) => s.indentMark).length === 1
   if (indentWaiting) {
     const row = document.createElement('p')
@@ -779,7 +919,7 @@ function fillHints(bar, _editor, spans) {
     row.textContent = '再在段前画一个小方格，就会空两格。'
     bar.append(row)
   }
-  const under = underSelectHint(spans)
+  const under = shapeOnly ? '' : underSelectHint(spans)
   if (ui.hintUnderOn && under) {
     const row = document.createElement('p')
     row.className = 'card-hint'
@@ -826,7 +966,14 @@ function pickOption(id, deps, editor) {
     return
   }
   if (id === 'shadow') {
-    if (!withLocalUndo(editor, '阴影', () => applyShadow(editor))) {
+    if (!withLocalUndo(editor, '阴影', () => {
+      if (isWebDocActive()) {
+        const pts = ui.lastPaint
+        if (pts?.length >= 6 && applyShapedShadow(pts, editor)) return true
+        return applyWebShadow()
+      }
+      return applyShadow(editor)
+    })) {
       deps.toast('先在杯子旁涂一块再加阴影')
       return
     }
@@ -840,6 +987,11 @@ function pickOption(id, deps, editor) {
     if (withLocalUndo(editor, localLabel(id), () => applyLocalAnno(id, editor))) {
       clearPaintMarks()
       deps.toast(id === 'clear-anno' ? '已去掉这些批注。可撤回' : '已加上。可点「撤回刚才」')
+      if (isPageLineChoice(id) || id === 'circle' || id === 'frame') {
+        startReview()
+        emit()
+        return
+      }
       ui.intent = id
       ui.step = 'values'
       emit()
@@ -860,19 +1012,18 @@ function pickOption(id, deps, editor) {
     deps.toast('靠近段首再画两个小格')
     return
   }
-  if (id === 'move-layout' || id === 'move-nudge') {
-    const snap = id === 'move-nudge'
+  if (id === 'move-layout') {
     let count = 0
-    const ok = withLocalUndo(editor, snap ? '对齐间距' : '挪位置', () => {
-      count = applyLayoutMoves(editor, { snap })
+    const ok = withLocalUndo(editor, '挪位置', () => {
+      count = isWebDocActive() ? applyWebLayoutMoves() : applyLayoutMoves(editor)
       return count
     })
     if (!ok) {
-      deps.toast('先用一支颜色圈模块，再用同一颜色圈要去的位置')
+      deps.toast('先用一支颜色圈模块，再用同一颜色圈它要去的位置')
       return
     }
     clearPaintMarks()
-    deps.toast(snap ? `已挪好 ${count} 处并对齐。可撤回` : `已按画出的位置挪了 ${count} 处。可撤回`)
+    deps.toast(`已移到画出的位置，共 ${count} 处。可撤回`)
     startReview()
     emit()
     return
@@ -958,8 +1109,180 @@ function paintRect() {
   return null
 }
 
+function decoPoint(p) {
+  const host = decoHost()
+  if (!host || !p) return null
+  const box = host.getBoundingClientRect()
+  return { x: p.x - box.left, y: p.y - box.top }
+}
+
+function clampDecoPoint(p) {
+  const page = document.querySelector('.page')
+  const host = decoHost()
+  if (!page || !host || !p) return p
+  const pb = page.getBoundingClientRect()
+  const hb = host.getBoundingClientRect()
+  const style = getComputedStyle(page)
+  const padL = parseFloat(style.paddingLeft) || 8
+  const padR = parseFloat(style.paddingRight) || 8
+  const padT = parseFloat(style.paddingTop) || 8
+  const padB = parseFloat(style.paddingBottom) || 8
+  const minX = pb.left + padL - hb.left
+  const minY = pb.top + padT - hb.top
+  const maxX = pb.right - padR - hb.left
+  const maxY = pb.bottom - padB - hb.top
+  return {
+    x: Math.min(Math.max(minX, p.x), maxX),
+    y: Math.min(Math.max(minY, p.y), maxY),
+  }
+}
+
+function wavyPath(x1, y1, x2, y2, amp = 5, wave = 16) {
+  const dx = x2 - x1
+  const dy = y2 - y1
+  const len = Math.hypot(dx, dy) || 1
+  const px = -dy / len
+  const py = dx / len
+  const steps = Math.max(10, Math.round(len / 8))
+  let d = `M${x1} ${y1}`
+  for (let i = 1; i <= steps; i += 1) {
+    const t = i / steps
+    const s = Math.sin((len / wave) * t * Math.PI)
+    d += ` L${x1 + dx * t + px * s * amp} ${y1 + dy * t + py * s * amp}`
+  }
+  return d
+}
+
+function snapLineToAxis(a, b, axis) {
+  const len = Math.max(48, Math.hypot(b.x - a.x, b.y - a.y))
+  if (axis === 'h') {
+    const y = Math.round((a.y + b.y) / 2)
+    let x2 = b.x
+    if (Math.abs(x2 - a.x) < 12) x2 = a.x + (b.x >= a.x ? len : -len)
+    return [{ x: a.x, y }, { x: x2, y }]
+  }
+  if (axis === 'v') {
+    const x = Math.round((a.x + b.x) / 2)
+    let y2 = b.y
+    if (Math.abs(y2 - a.y) < 12) y2 = a.y + (b.y >= a.y ? len : -len)
+    return [{ x, y: a.y }, { x, y: y2 }]
+  }
+  return [a, b]
+}
+
+function applyDrawnLine(kind) {
+  const host = decoHost()
+  if (!host) return false
+  const { style, axis } = parseLineKind(kind)
+  const pts = ui.lastPaint
+  let a
+  let b
+  if (pts?.length >= 2) {
+    a = decoPoint(pts[0])
+    b = decoPoint(pts[pts.length - 1])
+  } else {
+    const rect = paintRect()
+    if (!rect) return false
+    a = decoPoint({ x: rect.x, y: rect.y + rect.h / 2 })
+    b = decoPoint({ x: rect.x + rect.w, y: rect.y + rect.h / 2 })
+  }
+  if (!a || !b) return false
+  a = clampDecoPoint(a)
+  b = clampDecoPoint(b)
+  if (axis) {
+    const snapped = snapLineToAxis(a, b, axis)
+    a = clampDecoPoint(snapped[0])
+    b = clampDecoPoint(snapped[1])
+  }
+  if (Math.hypot(b.x - a.x, b.y - a.y) < 12) return false
+  const pad = 18
+  const minX = Math.min(a.x, b.x) - pad
+  const minY = Math.min(a.y, b.y) - pad
+  const w = Math.abs(b.x - a.x) + pad * 2
+  const h = Math.abs(b.y - a.y) + pad * 2
+  const x1 = a.x - minX
+  const y1 = a.y - minY
+  const x2 = b.x - minX
+  const y2 = b.y - minY
+  const el = document.createElement('div')
+  el.className = `page-deco is-stroke is-${kind}`
+  el.style.left = `${minX}px`
+  el.style.top = `${minY}px`
+  el.style.width = `${Math.max(8, w)}px`
+  el.style.height = `${Math.max(8, h)}px`
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg')
+  svg.setAttribute('viewBox', `0 0 ${Math.max(8, w)} ${Math.max(8, h)}`)
+  svg.setAttribute('preserveAspectRatio', 'none')
+  const addPath = (d, width) => {
+    const path = document.createElementNS('http://www.w3.org/2000/svg', 'path')
+    path.setAttribute('d', d)
+    path.setAttribute('fill', 'none')
+    path.setAttribute('stroke', '#3c6fd4')
+    path.setAttribute('stroke-width', String(width))
+    path.setAttribute('stroke-linecap', 'round')
+    path.setAttribute('stroke-linejoin', 'round')
+    svg.append(path)
+  }
+  if (style === 'wavy') addPath(wavyPath(x1, y1, x2, y2), 2.4)
+  else if (style === 'line-double') {
+    const dx = x2 - x1
+    const dy = y2 - y1
+    const len = Math.hypot(dx, dy) || 1
+    const ox = (-dy / len) * 3.4
+    const oy = (dx / len) * 3.4
+    addPath(`M${x1 + ox} ${y1 + oy} L${x2 + ox} ${y2 + oy}`, 2.1)
+    addPath(`M${x1 - ox} ${y1 - oy} L${x2 - ox} ${y2 - oy}`, 2.1)
+  } else {
+    const width = style === 'line-thin' ? 1.35 : style === 'line-thick' ? 7 : style === 'line-strike' ? 2.2 : 2.6
+    addPath(`M${x1} ${y1} L${x2} ${y2}`, width)
+  }
+  el.append(svg)
+  host.append(el)
+  return true
+}
+
+function applyPageCircle() {
+  const host = decoHost()
+  if (!host) return false
+  const rect = ui.lastPaint?.length ? aabb(ui.lastPaint) : paintRect()
+  if (!rect || rect.w < 12 || rect.h < 12) return false
+  const tl = decoPoint({ x: rect.x, y: rect.y })
+  const br = decoPoint({ x: rect.x + rect.w, y: rect.y + rect.h })
+  if (!tl || !br) return false
+  const a = clampDecoPoint(tl)
+  const b = clampDecoPoint(br)
+  const pad = 8
+  const minX = Math.min(a.x, b.x) - pad
+  const minY = Math.min(a.y, b.y) - pad
+  const w = Math.abs(b.x - a.x) + pad * 2
+  const h = Math.abs(b.y - a.y) + pad * 2
+  const el = document.createElement('div')
+  el.className = 'page-deco is-stroke is-circle'
+  el.style.left = `${minX}px`
+  el.style.top = `${minY}px`
+  el.style.width = `${Math.max(16, w)}px`
+  el.style.height = `${Math.max(16, h)}px`
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg')
+  svg.setAttribute('viewBox', `0 0 ${Math.max(16, w)} ${Math.max(16, h)}`)
+  svg.setAttribute('preserveAspectRatio', 'none')
+  const ellipse = document.createElementNS('http://www.w3.org/2000/svg', 'ellipse')
+  ellipse.setAttribute('cx', String(w / 2))
+  ellipse.setAttribute('cy', String(h / 2))
+  ellipse.setAttribute('rx', String(Math.max(8, w / 2 - pad)))
+  ellipse.setAttribute('ry', String(Math.max(8, h / 2 - pad)))
+  ellipse.setAttribute('fill', 'none')
+  ellipse.setAttribute('stroke', '#3c6fd4')
+  ellipse.setAttribute('stroke-width', '2.4')
+  svg.append(ellipse)
+  el.append(svg)
+  host.append(el)
+  return true
+}
+
 function applyPageDeco(kind, editor) {
-  let rect = paintRect()
+  if (PAGE_LINE.has(kind)) return applyDrawnLine(kind)
+  if (kind === 'circle') return applyPageCircle()
+  let rect = ui.lastPaint?.length ? aabb(ui.lastPaint) : paintRect()
   if (!rect && kind === 'frame') {
     const img = editor?.view?.dom?.querySelector('img[data-block-id="img-1"]')
     if (img) {
@@ -970,42 +1293,24 @@ function applyPageDeco(kind, editor) {
   if (!rect) return false
   const host = decoHost()
   if (!host) return false
-  const placed = pageRelativeRect(rect)
-  if (!placed) return false
-  const decoKind = kind === 'line' ? 'line' : kind === 'wavy' ? 'wavy' : 'frame'
+  const tl = decoPoint({ x: rect.x, y: rect.y })
+  const br = decoPoint({ x: rect.x + rect.w, y: rect.y + rect.h })
+  if (!tl || !br) return false
+  const a = clampDecoPoint(tl)
+  const b = clampDecoPoint(br)
   const el = document.createElement('div')
-  el.className = `page-deco is-${decoKind}`
-  el.style.left = `${placed.x}px`
-  el.style.width = `${Math.max(24, placed.w)}px`
-  if (decoKind === 'line') {
-    el.style.top = `${placed.y + placed.h}px`
-  } else if (decoKind === 'wavy') {
-    el.style.top = `${placed.y + Math.max(0, placed.h - 6)}px`
-    el.style.height = '12px'
-    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg')
-    const w = Math.max(24, placed.w)
-    svg.setAttribute('viewBox', `0 0 ${w} 12`)
-    svg.setAttribute('preserveAspectRatio', 'none')
-    const path = document.createElementNS('http://www.w3.org/2000/svg', 'path')
-    let d = 'M0 6'
-    for (let x = 8; x <= w + 4; x += 8) d += ` Q${x - 4} ${x % 16 ? 2 : 10} ${x} 6`
-    path.setAttribute('d', d)
-    path.setAttribute('fill', 'none')
-    path.setAttribute('stroke', '#3c6fd4')
-    path.setAttribute('stroke-width', '2')
-    path.setAttribute('stroke-linecap', 'round')
-    svg.append(path)
-    el.append(svg)
-  } else {
-    el.style.top = `${placed.y}px`
-    el.style.height = `${Math.max(18, placed.h)}px`
-  }
+  el.className = 'page-deco is-frame'
+  el.style.left = `${Math.min(a.x, b.x)}px`
+  el.style.top = `${Math.min(a.y, b.y)}px`
+  el.style.width = `${Math.max(24, Math.abs(b.x - a.x))}px`
+  el.style.height = `${Math.max(18, Math.abs(b.y - a.y))}px`
   host.append(el)
   return true
 }
 
 function applyTextAnno(editor, kind) {
-  const texts = getSnapshot().spans.filter((s) => s.kind === 'text' && s.from != null && s.to != null)
+  if (isWebDocActive() && applyWebAnno(kind)) return true
+  const texts = getSnapshot().spans.filter((s) => s.kind === 'text' && s.willEdit !== false && s.from != null && s.to != null)
   const markType = editor?.schema?.marks?.textAnno
   if (markType && texts.length) {
     let { tr } = editor.state
@@ -1021,7 +1326,12 @@ function applyTextAnno(editor, kind) {
 }
 
 function clearTextAnno(editor) {
-  const texts = getSnapshot().spans.filter((s) => s.kind === 'text' && s.from != null && s.to != null)
+  if (isWebDocActive() && applyWebAnno('clear-anno')) {
+    const host = document.querySelector('.page-deco-host')
+    if (host && host.childNodes.length) host.replaceChildren()
+    return true
+  }
+  const texts = getSnapshot().spans.filter((s) => s.kind === 'text' && s.willEdit !== false && s.from != null && s.to != null)
   const markType = editor?.schema?.marks?.textAnno
   let changed = false
   if (markType && texts.length) {
@@ -1041,6 +1351,14 @@ function clearTextAnno(editor) {
 }
 
 function applyTextAnnoAll(editor, kind) {
+  if (isWebDocActive()) {
+    if (kind === 'frame' || kind === 'line') {
+      applyPageDeco(kind, editor)
+      return
+    }
+    applyWebAnnoAll(kind)
+    return
+  }
   if (kind === 'frame' || kind === 'line') {
     applyPageDeco(kind, editor)
     return
@@ -1062,13 +1380,22 @@ function applyTextAnnoAll(editor, kind) {
 }
 
 function applyLocalAnno(id, editor) {
-  if (id === 'clear-anno') return clearTextAnno(editor)
-  if (id === 'frame' || id === 'line') return applyPageDeco(id, editor)
-  if (id === 'wavy') {
-    const { texts } = selectionKinds()
-    if (texts.length) return applyTextAnno(editor, 'wavy')
-    return applyPageDeco('wavy', editor)
+  if (isWebDocActive()) {
+    if (id === 'clear-anno') return clearTextAnno(editor)
+    if (id === 'frame') return applyWebAnno('frame') || applyPageDeco('frame', editor)
+    if (id === 'circle') return applyWebAnno('circle') || applyPageCircle()
+    if (isPageLineChoice(id)) return applyDrawnLine(id)
+    if (id === 'box') {
+      const { texts } = selectionKinds()
+      if (texts.length) return applyTextAnno(editor, 'box')
+      return applyPageDeco('frame', editor)
+    }
+    return applyTextAnno(editor, id)
   }
+  if (id === 'clear-anno') return clearTextAnno(editor)
+  if (id === 'frame') return applyPageDeco('frame', editor)
+  if (id === 'circle') return applyPageCircle()
+  if (isPageLineChoice(id)) return applyDrawnLine(id)
   if (id === 'box') {
     const { texts } = selectionKinds()
     if (texts.length) return applyTextAnno(editor, 'box')
@@ -1112,6 +1439,7 @@ function indentStartPos(editor, spans) {
 }
 
 function applyIndent(editor) {
+  if (isWebDocActive()) return applyWebIndent()
   const spans = getSnapshot().spans
   const start = indentStartPos(editor, spans)
   if (start == null) return false
@@ -1121,6 +1449,10 @@ function applyIndent(editor) {
 }
 
 function applyIndentAll(editor) {
+  if (isWebDocActive()) {
+    applyWebIndent({ all: true })
+    return
+  }
   const starts = []
   editor.state.doc.descendants((node, pos) => {
     if (!node.isTextblock || !node.textContent) return true
@@ -1324,22 +1656,26 @@ function fillPropose(bar, spans, editor, deps) {
   bar.append(title)
   const hint = document.createElement('p')
   hint.className = 'card-note'
-  if (ui.noteText) {
+  if (looksLikeLayout(spans) || layoutSourceWaiting(spans)) {
+    hint.textContent = looksLikeLayout(spans)
+      ? '同一颜色圈了模块和它要去的位置。点「移到画出的位置」，会按落点大小放进去。'
+      : `已用${layoutSourceWaiting(spans)}笔圈中要挪的模块。再用同一颜色圈它要去的位置。`
+  } else if (ui.noteText) {
     hint.textContent = ui.noteConfident
       ? `看成「${ui.noteText}」，按这个猜下面几项。点一项继续。写错可擦掉。`
       : ui.note
         ? `写成「${ui.noteText}」不太确定，先按这个猜。不对就擦掉再写。`
         : '字没认清，先给通用项。可擦掉再写，或在旁边再写一两个字。'
-  } else if (looksLikeLayout(spans)) {
-    hint.textContent = '同一颜色圈了模块和它要去的位置。点「移到画出的位置」。还可换一支颜色再挪另一块。'
-  } else if (layoutSourceWaiting(spans)) {
-    hint.textContent = `已用${layoutSourceWaiting(spans)}笔圈中要挪的模块。再用同一颜色圈它要去的位置。`
   } else if (spans.filter((s) => s.indentMark).length === 1) {
     hint.textContent = '再在段前画一个小方格，就会空两格。不用按 Shift。'
   } else if (looksLikeIndent(spans)) {
     hint.textContent = '两个格子表示这段空两格。点下面确认。'
+  } else if (looksLikePageLine(spans)) {
+    hint.textContent = '看成一条线。可选直线、波浪线、删除线，或水平 / 垂直。'
+  } else if (looksLikeCircledRegion(spans)) {
+    hint.textContent = '圈了一块。没写字的话，可加上一个框、一个圈，或加阴影。'
   } else if (spans.some((s) => s.paintMark) && !spans.some((s) => s.kind === 'text' || s.kind === 'image')) {
-    hint.textContent = '没涂到字或杯子。可加阴影、空两格，或加框、线、插入文字。'
+    hint.textContent = '没涂到字或杯子。可加阴影、空两格，或加框、圈、插入文字。'
   } else {
     hint.textContent = '用鼠标或笔在旁边写一两个字（删、改、色、加…）。写错点擦掉。没写则按你涂到的内容猜。'
   }
@@ -1383,7 +1719,7 @@ function fillPropose(bar, spans, editor, deps) {
   }
   for (const [id, label] of options) {
     const primary =
-      (id === 'indent' || id === 'shadow' || id === 'move-layout') && options[0][0] === id
+      (id === 'indent' || id === 'shadow' || id === 'move-layout' || id === 'line') && options[0][0] === id
     row.append(btn(label, { primary, on: ui.intent === id }, () => pickOption(id, deps, editor)))
   }
   bar.append(row)
@@ -1739,11 +2075,12 @@ function fillReview(bar, editor, deps) {
 export function fillNoviceCard(bar, editor, deps) {
   const snap = getSnapshot()
   const spans = snap.spans
+  if (ui.hideCard && !spans.length && !(snap.changes || []).length) return
   const showReview = ui.step === 'review' || (!spans.length && snap.changes.length)
   if (showReview && ui.step !== 'review') ui.step = 'review'
 
   if (!spans.length && !showReview) {
-    if (canUndoLocal()) {
+    if (canUndoLocal() && !ui.hideCard) {
       const title = document.createElement('div')
       title.className = 'card-title'
       title.textContent = '刚才的操作可以撤回'

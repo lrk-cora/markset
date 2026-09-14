@@ -27,7 +27,8 @@ export function inferAnchorFact(spans = [], commandText = '') {
   const hasImage = spans.some((s) => s.kind === 'image')
   const page = getDemoPage()
   let color = colorInSel
-  if (!color && hasImage) color = page === 'b' ? '雾蓝' : '暖茶'
+  if (!color && hasImage && page === 'b') color = '雾蓝'
+  else if (!color && hasImage && page === 'a') color = '暖茶'
   return { color, product: null, source: colorInSel ? 'selection' : hasImage ? 'image' : 'none' }
 }
 

@@ -13,7 +13,8 @@ import { exitToView } from './view-mode.js'
 import { inferAnchorFact, inferCommandText, parseCommand } from './plan-local.js'
 import { attachImageOpsFromBboxes, collectCupBody, collectPrintStandIn } from './print-region.js'
 import { collectOutsideEdits } from './scope.js'
-import { startReview } from './card-flow.js'
+import { rememberLocal, startReview } from './card-flow.js'
+import { isWebDocActive, runWebWriteback } from './web-doc.js'
 import { getSnapshot, ping, targets, undoLastWrite } from './store.js'
 
 let running = false
@@ -68,6 +69,20 @@ async function resolveOps(ctx) {
 
 export async function runWriteback(kind, editor, notify) {
   if (running) return
+  if (isWebDocActive()) {
+    running = true
+    try {
+      const ok = await runWebWriteback(kind, notify, {
+        onBefore: (label) => rememberLocal(editor, label),
+      })
+      if (ok) startReview()
+    } catch (err) {
+      notify(err.message || '改网页失败')
+    } finally {
+      running = false
+    }
+    return
+  }
   const picked = targets().filter((s) => s.kind !== 'slot')
   const scoped = picked.filter((s) => !s.frozen && !isForbiddenSpan(s))
   if (!picked.length) {

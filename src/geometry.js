@@ -69,6 +69,23 @@ export function looksLikeXStroke(pts) {
   return len > diag * 1.55
 }
 
+/** Long stroke that is a line (not a closed lasso, X, or small box). */
+export function looksLikeDrawnLine(pts) {
+  if (!pts || pts.length < 6) return false
+  if (looksLikeBoxStroke(pts) || looksLikeXStroke(pts)) return false
+  const box = aabb(pts)
+  const len = pathLength(pts)
+  const chord = dist(pts[0], pts[pts.length - 1])
+  const long = Math.max(box.w, box.h)
+  const short = Math.min(box.w, box.h)
+  if (long < 48 || chord < 40) return false
+  const aspect = long / Math.max(1, short)
+  if (aspect < 2.2 && short > 28) return false
+  if (len > chord * 2.6) return false
+  if (chord < len * 0.32) return false
+  return true
+}
+
 /** Small near-closed square/rectangle, e.g. two boxes drawn before a paragraph. */
 export function looksLikeBoxStroke(pts) {
   if (!pts || pts.length < 5) return false

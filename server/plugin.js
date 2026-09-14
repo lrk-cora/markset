@@ -1,3 +1,5 @@
+import { importPageRequest, maybeSmartArrange } from './import-page.js'
+
 function send(res, status, body) {
   const json = JSON.stringify(body)
   res.statusCode = status
@@ -304,6 +306,8 @@ export function marksetApi(env) {
               dashscope: !miss.dashscope,
               fal: !miss.fal,
               allowCalls: env.MARKSET_ALLOW_MODEL_CALLS === '1',
+              importPage: true,
+              renderedImport: Boolean(env.BROWSERLESS_API_KEY || env.BROWSERLESS_TOKEN),
               ...models(env),
               hints: keyHints(env),
             })
@@ -317,6 +321,31 @@ export function marksetApi(env) {
 
           const body = await readBody(req)
           const miss = missing(env)
+
+          if (url === '/api/import-page') {
+            let page = await importPageRequest(body, env)
+            if (body?.smart) {
+              if (!allowModelCalls(env, req)) {
+                page.warnings = [
+                  ...(page.warnings || []),
+                  '智能整理未执行：请勾选「允许调用云端模型」，且 .env 中 MARKSET_ALLOW_MODEL_CALLS=1',
+                ]
+              } else if (miss.dashscope) {
+                page.warnings = [...(page.warnings || []), '智能整理未执行：未填 DASHSCOPE_API_KEY']
+              } else {
+                try {
+                  page = await maybeSmartArrange(page, {
+                    chatFn: (opts) => dashChat(env, opts),
+                    model: models(env).rewriteModel,
+                  })
+                } catch {
+                  page.warnings = [...(page.warnings || []), '智能整理失败，已用抓取结果']
+                }
+              }
+            }
+            send(res, 200, page)
+            return
+          }
 
           if (!allowModelCalls(env, req)) {
             send(res, 403, {
@@ -346,7 +375,7 @@ export function marksetApi(env) {
 
           send(res, 404, { error: 'not found' })
         } catch (err) {
-          send(res, err.status || 500, { error: redact(err.message, env) })
+          send(res, err.status || 500, { error: redact(err.message, env), code: err.code })
         }
       })
     },

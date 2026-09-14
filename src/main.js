@@ -1,9 +1,9 @@
 import './styles.css'
-import { applyDemoPage, createEditor, refreshDecorations } from './editor.js'
+import { applyDemoPage, applyImportedPage, createEditor, refreshDecorations } from './editor.js'
 import { bindChromeKeys, renderChrome, toast } from './chrome.js'
-import { fetchHealth, isClientModelGateOn, setClientModelGate } from './api.js'
+import { fetchHealth, importPage, isClientModelGateOn, setClientModelGate } from './api.js'
 import { canSnap, consumePackagingHint, consumeSkipObjectSnap, peekPackagingHint, peekSkipObjectSnap, setSnapOn, snapImageHits } from './contour.js'
-import { aabb, looksLikeBoxStroke } from './geometry.js'
+import { aabb, looksLikeBoxStroke, looksLikeDrawnLine } from './geometry.js'
 import {
   contentImageHits,
   findIndentTarget,
@@ -19,7 +19,8 @@ import { bindLasso, getStrokeColor, isAddMode, isColorMode, isLassoMode, isLayou
 import { applyScopeAfterSelect } from './scope.js'
 import { guessStrokePrompt } from './vision-tasks.js'
 import { ingestLayoutStroke } from './layout.js'
-import { clearLocalUndos, dismissCoach, getCard, idleCard, keepCardForAppend, markCrossOut, openPageRecolor, applyWrittenNote, paintLooksLikeCupShadow, resetCardForNewSelection, resetPagePaper, setPaintGesture } from './card-flow.js'
+import { exportWebDoc, hitWebDoc, isWebDocActive, unmountWebDoc } from './web-doc.js'
+import { clearLocalUndos, dismissCoach, getCard, idleCard, keepCardForAppend, markCrossOut, openPageRecolor, applyWrittenNote, paintLooksLikeCupShadow, resetCardForNewSelection, resetPagePaper, setPaintGesture, canUndoLocal } from './card-flow.js'
 import { addInkStroke, clearInk, hasInk, isLikelyInk, onInkRecognized } from './ink.js'
 import { exitToView } from './view-mode.js'
 import {
@@ -83,11 +84,69 @@ document.querySelectorAll('[data-demo-page]').forEach((btn) => {
     clearLocalUndos()
     resetPagePaper()
     applyDemoPage(editor, id)
+    unmountWebDoc()
     document.querySelectorAll('[data-demo-page]').forEach((el) => {
       el.classList.toggle('is-on', el.getAttribute('data-demo-page') === id)
     })
     toast(id === 'b' ? '已换到页 B：杯身已是雾蓝，说明还写着红色 / 原木' : '已换到页 A：标题、正文、规格都有「原木杯」')
   })
+})
+
+function resetWorkspace() {
+  clearAll()
+  idleCard()
+  clearInk()
+  clearLocalUndos()
+  resetPagePaper()
+  unmountWebDoc()
+}
+
+async function loadImported(payload, waitText) {
+  toast(waitText)
+  const page = await importPage(payload)
+  resetWorkspace()
+  const mode = await applyImportedPage(editor, page)
+  currentPage = 'import'
+  document.querySelectorAll('[data-demo-page]').forEach((el) => el.classList.remove('is-on'))
+  const extra = (page.warnings || []).filter(Boolean).slice(0, 2).join('；')
+  const head =
+    mode === 'html'
+      ? `已导入「${page.title}」，可圈选修改，导出仍是网页`
+      : mode === 'snapshot'
+        ? `已用整页图放入「${page.title}」，导出仍是含该图的网页`
+        : `未能保住版式，已放入「${page.title}」的文字和图片`
+  toast(extra ? `${head}。${extra}` : `${head}`)
+}
+
+document.getElementById('btn-import-html')?.addEventListener('click', () => {
+  const input = document.createElement('input')
+  input.type = 'file'
+  input.accept = '.html,.htm,text/html'
+  input.addEventListener('change', async () => {
+    const file = input.files?.[0]
+    if (!file) return
+    try {
+      const html = await file.text()
+      if (!html.trim()) {
+        toast('这个文件是空的')
+        return
+      }
+      await loadImported(
+        {
+          html,
+        },
+        '正在读入 HTML…',
+      )
+    } catch (err) {
+      toast(err.message || '没能读入这个 HTML')
+    }
+  })
+  input.click()
+})
+
+document.getElementById('btn-export-html')?.addEventListener('click', () => {
+  if (exportWebDoc()) toast('已导出为网页文件，可用浏览器打开')
+  else toast('先导入 HTML 文件，再导出')
 })
 
 document.getElementById('allow-models')?.addEventListener('change', (e) => {
@@ -194,6 +253,12 @@ document.getElementById('btn-recolor')?.addEventListener('click', () => {
 
 let ignoreClickUntil = 0
 
+function sameTextHit(a, b) {
+  if (a.kind !== 'text' || b.kind !== 'text') return false
+  if (a.webId && b.webId) return a.webId === b.webId
+  return a.from === b.from && a.to === b.to
+}
+
 function finishSelect(extra = []) {
   return applyScopeAfterSelect(editor.view, extra)
 }
@@ -203,15 +268,25 @@ function hintAfterSelect(spans) {
 }
 
 function emptyPaintSpan(rawPoints, polygon) {
-  const box = aabb(rawPoints?.length ? rawPoints : polygon)
-  if (!(box.w > 6 && box.h > 6)) return null
+  const pts = rawPoints?.length ? rawPoints : polygon
+  const box = aabb(pts)
+  const asLine = looksLikeDrawnLine(rawPoints)
+  const long = Math.max(box.w, box.h)
+  if (!asLine && !(box.w > 6 && box.h > 6)) return null
+  if (asLine && long < 24) return null
   return {
     kind: 'slot',
     screenRect: box,
     poly: polygon,
     paintMark: true,
-    why: 'paint-empty',
+    lineMark: Boolean(asLine),
+    why: asLine ? 'paint-line' : 'paint-empty',
   }
+}
+
+function emptyPaintToast(slot) {
+  if (slot?.lineMark) return '看成一条线。可选沿你画的方向，或水平 / 垂直的直线、波浪线、双线和粗细'
+  return '没涂到字或杯子。可加阴影、空两格，或加框 / 线 / 插入'
 }
 
 function applyHits(textHits, imageHits, polygon, { append, subtract, add, color, rawPoints }) {
@@ -276,7 +351,7 @@ function applyHits(textHits, imageHits, polygon, { append, subtract, add, color,
         toast('已加上包装上的字（不贴物体）', 4200)
         finishSelect(suggests)
       } else {
-        toast(addedImg ? '已另作编号加上这块图（一张图两件货用 Shift 再圈）' : extra.some((s) => s.paintMark) ? '已记下这笔。没涂到字或杯子' : '已加上')
+        toast(addedImg ? '已另作编号加上这块图（一张图两件货用 Shift 再圈）' : extra.some((s) => s.lineMark) ? emptyPaintToast(extra.find((s) => s.lineMark)) : extra.some((s) => s.paintMark) ? '已记下这笔。没涂到字或杯子' : '已加上')
         finishSelect(suggests)
         hintAfterSelect(extra)
       }
@@ -295,14 +370,14 @@ function applyHits(textHits, imageHits, polygon, { append, subtract, add, color,
       appendSpans([slot], editor.state.doc)
       keepCardForAppend()
       dismissCoach()
-      toast('没涂到字或杯子。可加阴影、空两格，或加框 / 线 / 插入')
+      toast(emptyPaintToast(slot))
       return
     }
     if (slot) {
       replaceSpans([slot])
       resetCardForNewSelection()
       dismissCoach()
-      toast('没涂到字或杯子。可加阴影、空两格，或加框 / 线 / 插入')
+      toast(emptyPaintToast(slot))
       return
     }
     if (suggests.length) {
@@ -325,10 +400,25 @@ function applyHits(textHits, imageHits, polygon, { append, subtract, add, color,
 }
 
 function indentSpanFromStroke(rawPoints, polygon) {
+  if (looksLikeDrawnLine(rawPoints)) return null
   const box = aabb(rawPoints)
   const compact =
     box.w >= 10 && box.h >= 10 && box.w <= 110 && box.h <= 110 && box.w / Math.max(1, box.h) >= 0.4 && box.w / Math.max(1, box.h) <= 2.5
   if (!looksLikeBoxStroke(rawPoints) && !compact) return null
+  if (isWebDocActive()) {
+    const hits = hitWebDoc(polygon)
+    const text = hits.texts.found[0] || getSnapshot().spans.find((s) => s.kind === 'text' && s.webId)
+    if (!text?.webId) return null
+    return {
+      kind: 'slot',
+      indentMark: true,
+      webId: text.webId,
+      block_id: text.block_id,
+      screenRect: box,
+      poly: polygon,
+      why: 'indent-box',
+    }
+  }
   let para = findIndentTarget(editor.view, box)
   const existing = getSnapshot().spans.filter((s) => s.indentMark || (s.paintMark && s.screenRect && s.screenRect.w <= 110))
   if (!para && existing.length) {
@@ -391,14 +481,15 @@ bindLasso({
       return
     }
     if (rawPoints?.length) setPaintGesture(rawPoints, { silent: true })
-    const textHits = hitText(editor.view, polygon, { skipCovered: shift && !subtract })
-    const rawImageHits = hitImages(editor.view, polygon)
+    const webHits = isWebDocActive() ? hitWebDoc(polygon) : null
+    const textHits = webHits ? webHits.texts : hitText(editor.view, polygon, { skipCovered: shift && !subtract })
+    const rawImageHits = webHits ? webHits.images : hitImages(editor.view, polygon)
     const imageHits = subtract || add || color ? rawImageHits : contentImageHits(rawImageHits)
     const hasImage = imageHits.found.length + imageHits.suggest.length > 0
     const selected = getSnapshot().spans
-    const newText = textHits.found.filter((s) => !selected.some((c) => c.kind === 'text' && c.from === s.from && c.to === s.to))
+    const newText = textHits.found.filter((s) => !selected.some((c) => sameTextHit(c, s)))
     const newImg = imageHits.found.filter(
-      (s) => !isTinyImageSpan(s) && !selected.some((c) => c.kind === 'image' && c.block_id === s.block_id),
+      (s) => !isTinyImageSpan(s) && !selected.some((c) => c.kind === 'image' && ((c.webId && s.webId && c.webId === s.webId) || c.block_id === s.block_id)),
     )
     const asShadow = paintLooksLikeCupShadow(rawPoints, editor)
     if (
@@ -423,7 +514,7 @@ bindLasso({
         polygon,
         rawPoints,
         textHits,
-        imageHits,
+        imageHits: rawImageHits,
       })
       keepCardForAppend()
       dismissCoach()
@@ -445,7 +536,7 @@ bindLasso({
         color,
         rawPoints,
       })
-    const skipSnap = peekSkipObjectSnap() && hasImage
+    const skipSnap = isWebDocActive() || (peekSkipObjectSnap() && hasImage)
     const hasBig = [...imageHits.found, ...imageHits.suggest].some((s) => !isTinyImageSpan(s))
     if (subtract || add || color || skipSnap || !canSnap() || !hasBig) {
       if (skipSnap) consumeSkipObjectSnap()
@@ -475,7 +566,13 @@ window.addEventListener(
 
     const hasSpans = getSnapshot().spans.length > 0
     const changing = hasChanges()
-    if (!isDrawing() && !hasSpans && !changing) return
+    if (!isDrawing() && !hasSpans && !changing) {
+      if (canUndoLocal() && !getCard().hideCard) {
+        idleCard({ accept: true })
+        toast('已收下这次修改')
+      }
+      return
+    }
 
     const image = hitImageAt(editor.view, e.clientX, e.clientY)
     const word = image ? null : hitWordAt(editor.view, e.clientX, e.clientY)
@@ -487,14 +584,18 @@ window.addEventListener(
       }
       if (changing) {
         dismissChanges()
-        idleCard()
-        toast('已收起改处标记。这是改后的页面。点「画笔」可继续改，「撤回全部」可撤销')
+        idleCard({ accept: true })
+        toast('已收下这次修改')
         return
       }
-      if (!hasSpans) return
+      if (!hasSpans) {
+        idleCard({ accept: true })
+        toast('已收下这次修改')
+        return
+      }
       exitToView()
-      idleCard()
-      toast('已结束编辑。这是改后的页面。点「画笔」可继续改，「撤回全部」可撤销')
+      idleCard({ accept: true })
+      toast('已收下这次修改')
       return
     }
 

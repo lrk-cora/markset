@@ -1,5 +1,5 @@
 import { COLOR_SCHEMES, colorFill, paperFill, schemeTextFill, swatchLabel } from './colors.js'
-import { DEMO_CUP, getDemoPage, setImageSrcByBlockId } from './editor.js'
+import { DEMO_CUP, getDemoPage, isDemoPage, setImageSrcByBlockId } from './editor.js'
 import { COLOR_TERMS, FORBIDDEN_BLOCKS } from './forbidden.js'
 import { imageSpanFromNaturalBox } from './hit-test.js'
 import { localPaintMasked } from './pending.js'
@@ -28,6 +28,7 @@ export function resetPagePaper() {
 }
 
 function originalCupSrc() {
+  if (!isDemoPage()) return ''
   const file = DEMO_CUP[getDemoPage()]?.file || DEMO_CUP.a.file
   return `${import.meta.env.BASE_URL}${file}?v=b-blank-3`
 }
@@ -58,6 +59,7 @@ function previewOf(text, fallback) {
 function textModuleSelected(block, spans) {
   return spans.some((s) => {
     if (s.kind !== 'text') return false
+    if (s.willEdit === false) return false
     if (s.block_id && block.blockId && s.block_id === block.blockId) return true
     if (s.from == null || s.to == null) return false
     return s.from < block.to && s.to > block.from
@@ -78,13 +80,22 @@ export function collectSchemeModules(editor, { pageWide = false } = {}) {
       label: `${isHead ? '标题' : '这段'} · ${previewOf(block.text, '文字')}`,
     })
   }
-  const imageOn = pageWide || spans.some((s) => s.kind === 'image')
-  if (imageOn) {
+  const imageOn = pageWide || spans.some((s) => s.kind === 'image' && s.willEdit !== false)
+  const firstImg = (() => {
+    let id = ''
+    editor.state.doc.descendants((node) => {
+      if (id || node.type.name !== 'image') return true
+      id = node.attrs?.blockId || ''
+      return false
+    })
+    return id
+  })()
+  if (imageOn && firstImg) {
     modules.push({
-      id: 'image:img-1',
+      id: `image:${firstImg}`,
       kind: 'image',
-      blockId: 'img-1',
-      label: '杯子',
+      blockId: firstImg,
+      label: isDemoPage() ? '杯子' : '图',
     })
   }
   if (pageWide) {
