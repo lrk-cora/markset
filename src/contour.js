@@ -162,7 +162,7 @@ async function snapOne(span, { polygon, point } = {}) {
 }
 
 export function canSnap() {
-  return snapOn && isClientModelGateOn() && !busy
+  return false
 }
 
 export async function snapImageHits(imageHits, { polygon, point } = {}, notify) {
@@ -192,38 +192,7 @@ export async function snapImageHits(imageHits, { polygon, point } = {}, notify) 
   }
 }
 
-export async function snapExistingMark(markId, notify) {
-  if (!isClientModelGateOn()) {
-    notify?.('先勾「允许调用云端模型」')
-    return false
-  }
-  if (busy) {
-    notify?.('正在贴轮廓，请稍候')
-    return false
-  }
-  const span = getSnapshot().spans.find((s) => s.markId === markId && s.kind === 'image')
-  if (!span) return false
-  if (isTinyImageSpan(span)) {
-    notify?.(`#${markId} 是很小一块，不贴物体（包装上的字请保持鼠标圈的范围）`)
-    return false
-  }
-  busy = true
-  notify?.(`正在把 #${markId} 贴到物体…`)
-  try {
-    const next = await snapOne(span, { polygon: span.polygon })
-    if (!replaceImageSpan(markId, next)) throw new Error('写回选区失败')
-    notify?.(`#${markId} 已贴到物体`)
-    return true
-  } catch (err) {
-    const msg =
-      err.code === 'calls_disabled'
-        ? '服务器禁止调用，选区仍是鼠标圈的范围'
-        : err.code === 'client-gate' || err.code === 'no_client_gate'
-          ? '未允许调用云端模型，选区仍是鼠标圈的范围'
-          : `#${markId} 未贴上，仍用鼠标圈的范围`
-    notify?.(msg)
-    return false
-  } finally {
-    busy = false
-  }
+export async function snapExistingMark(_markId, notify) {
+  notify?.('云端贴物体已关掉，请用鼠标圈选范围')
+  return false
 }

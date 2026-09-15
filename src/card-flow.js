@@ -1,7 +1,8 @@
-import { COLORS, COLOR_SCHEMES, paperFill } from './colors.js'
 import { DEMO_CUP, getDemoPage, pageRelativeRect } from './editor.js'
 import { COLOR_TERMS } from './forbidden.js'
-import { aabb, convexHull, intersectBoxes, looksLikeDrawnLine, pathLength, strokeToPolygon } from './geometry.js'
+import { parseCommand } from './plan-local.js'
+import { guessAnnotationIntent } from './vision-tasks.js'
+import { aabb, convexHull, dist, intersectBoxes, looksLikeDrawnLine, pathLength, strokeToPolygon } from './geometry.js'
 import { imageSpanFromNaturalBox } from './hit-test.js'
 import { collectOutsideEdits } from './scope.js'
 import {
@@ -21,14 +22,22 @@ import {
   applyWebAnnoAll,
   applyWebIndent,
   applyWebLayoutMoves,
+  applyWebReflect,
+  applyWebScale,
   applyWebShadow,
+  executeCircledOp,
   isWebDocActive,
+  listWebEdits,
+  popLastWebEdit,
+  redoWebEdit,
+  refreshWebTargetsFromDrawing,
+  restoreWebEdit,
   restoreWebHtml,
   snapshotWebHtml,
 } from './web-doc.js'
-import { clearPaintMarks, setSubtractMode } from './overlay.js'
+import { clearPaintMarks, getPaintMarks, keepPaintMark, setSubtractMode } from './overlay.js'
 import { redoChange, restoreChange } from './changes.js'
-import { clearInk, hasInk, undoLastInkStroke } from './ink.js'
+import { clearInk, getInkStrokes, readInkText } from './ink.js'
 import {
   applyPageScheme,
   assignSchemeToModules,
@@ -89,6 +98,8 @@ const LOCAL_LABELS = {
   'move-layout': '挪位置',
   'move-nudge': '对齐间距',
   shadow: '阴影',
+  'scale-down': '缩小',
+  'scale-up': '放大',
   underline: '下划线',
   wavy: '波浪线',
   strike: '删除线',
@@ -182,7 +193,10 @@ export function undoLastLocalAction(editor) {
     if (host) host.innerHTML = snap.decoHtml
   }
   if ('pagePaper' in snap) setPagePaper(snap.pagePaper)
-  if (snap.webHtml != null) restoreWebHtml(snap.webHtml)
+  if (snap.webHtml != null) {
+    restoreWebHtml(snap.webHtml)
+    popLastWebEdit()
+  }
   clearSchemeUi()
   if (ui.step === 'values' || ui.step === 'review') {
     ui.step = 'propose'
@@ -227,6 +241,32 @@ let ui = {
   hintOverOn: true,
   lastPaint: null,
   hideCard: false,
+  guesses: [],
+  guessing: false,
+  judged: false,
+  seenGuessLabels: [],
+}
+
+let guessToken = 0
+let guessRuntime = { editor: null, deps: null }
+
+export function clickGuessAt(index, editor, fromEl) {
+  const ed = editor || guessRuntime.editor
+  const deps = guessRuntime.deps
+  if (!ed || !deps) return
+  const list = ui.guesses.length ? ui.guesses : localGuesses(getSnapshot().spans, ed)
+  let guess = Number.isFinite(index) ? list[index] : null
+  if (fromEl?.dataset?.guessId) {
+    const id = fromEl.dataset.guessId
+    const label = fromEl.dataset.guessLabel || ''
+    guess = list.find((g) => g.id === id && (!label || g.label === label)) || guess || {
+      id,
+      label: label || id,
+      note: parseNote(label) || id,
+      command: '',
+    }
+  }
+  if (guess) applyGuess(guess, ed, deps)
 }
 
 function readCoachDone() {
@@ -267,7 +307,16 @@ export function dismissCoach() {
   emit()
 }
 
+function cancelGuesses() {
+  guessToken += 1
+  ui.guessing = false
+  ui.guesses = []
+  ui.judged = false
+  ui.seenGuessLabels = []
+}
+
 export function resetCardForNewSelection() {
+  cancelGuesses()
   ui.step = 'propose'
   ui.note = ''
   ui.noteText = ''
@@ -303,6 +352,7 @@ export function startReview() {
 }
 
 export function idleCard({ accept = false } = {}) {
+  cancelGuesses()
   ui.step = 'idle'
   ui.intent = null
   ui.note = ''
@@ -405,24 +455,89 @@ export function markCrossOut() {
 }
 
 function parseNote(text) {
-  const t = String(text || '').trim()
+  const t = String(text || '')
+    .replace(/\s+/g, '')
+    .trim()
   if (!t) return ''
-  if (t === '×' || t === 'x' || t === 'X' || /删|叉|去|消/.test(t)) return 'delete'
+  if (t === '×' || t === 'x' || t === 'X') return 'delete'
+  if (/倒影|镜像|反射/.test(t)) return 'reflect'
+  if (/阴影|投影|影子/.test(t)) return 'shadow'
+  if (/缩小|变小|小一点|缩小一点|更小/.test(t)) return 'scale-down'
+  if (/放大|变大|大一点|放大一点|更大/.test(t)) return 'scale-up'
+  if (/改颜色|改色|换色|变色|颜色|配色|上色|着色|染色/.test(t)) return 'color'
+  if (/色|彩/.test(t) && !/删|去|减/.test(t)) return 'color'
+  if (/删|叉|去|消|隐藏|去掉|删掉|不要了|抹掉|擦掉这个/.test(t)) return 'delete'
   if (/减|短|少|精简/.test(t)) return 'cut'
   if (/添|加|插|扩/.test(t)) return 'add'
-  if (/色|彩/.test(t)) return 'color'
   if (/改|换|变|润/.test(t)) return 'change'
   return 'custom'
 }
 
-export function applyWrittenNote(text, { confident = false } = {}) {
+export function applyWrittenNote(text, { confident = false, note, silent = false } = {}) {
   const t = String(text || '').trim()
   ui.noteText = t
-  ui.note = parseNote(t) || (t ? 'custom' : '')
-  ui.noteConfident = Boolean(confident && t)
+  ui.note = note || parseNote(t) || (t ? 'custom' : '')
+  ui.noteConfident = Boolean(confident && (t || note))
   ui.intent = null
   ui.step = 'propose'
-  emit()
+  if (!silent) emit()
+}
+
+export function shouldTreatStrokeAsInk(pts) {
+  if (ui.step !== 'propose') return false
+  const spans = getSnapshot().spans
+  if (!spans.some((s) => s.kind === 'text' || s.kind === 'image' || s.kind === 'slot')) return false
+  if (layoutSourceWaiting(spans) || looksLikeLayout(spans) || hasLayoutWork(spans)) return false
+  if (pts?.length >= 8) {
+    const box = aabb(pts)
+    const peri = 2 * (box.w + box.h)
+    const len = pathLength(pts)
+    const closed = dist(pts[0], pts[pts.length - 1]) < Math.max(box.w, box.h) * 0.35
+    if (closed && box.w > 36 && box.h > 28 && len < peri * 2.5) return false
+    const nearOld = spans.some((s) => {
+      const r = s.screenRect
+      if (!r) return false
+      return Boolean(intersectBoxes(box, { x: r.x - 40, y: r.y - 40, w: r.w + 80, h: r.h + 80 }))
+    })
+    if (!nearOld && box.w > 40 && box.h > 40) return false
+  }
+  return true
+}
+
+export function classifyDecorStroke(pts, spans = getSnapshot().spans) {
+  if (!pts?.length || pts.length < 8) return null
+  const box = aabb(pts)
+  const area = box.w * box.h
+  if (area < 360) return null
+  const targets = spans.filter((s) => (s.kind === 'image' || s.kind === 'text') && s.screenRect)
+  if (!targets.length) return null
+  const len = pathLength(pts)
+  const peri = 2 * (box.w + box.h)
+  const scribbly = len > peri * 1.18
+  const closed = dist(pts[0], pts[pts.length - 1]) < Math.max(box.w, box.h) * 0.28
+  let best = null
+  for (const s of targets) {
+    const r = s.screenRect
+    const overlap = intersectBoxes(box, r)
+    const oArea = overlap ? overlap.w * overlap.h : 0
+    const near =
+      box.x < r.x + r.w + 100 &&
+      box.x + box.w > r.x - 100 &&
+      box.y < r.y + r.h + 110 &&
+      box.y + box.h > r.y - 80
+    if (!near) continue
+    const cover = oArea / Math.max(1, area)
+    const cx = box.x + box.w / 2
+    const cy = box.y + box.h / 2
+    const below = cy > r.y + r.h * 0.7
+    const beside = cx < r.x + 16 || cx > r.x + r.w - 16
+    if (!best || cover < best.cover) best = { cover, below, beside, scribbly, closed, kind: s.kind }
+  }
+  if (!best) return null
+  if (best.cover > 0.42 && best.closed) return null
+  if (best.below && (best.scribbly || box.w >= box.h * 0.9)) return 'reflect'
+  if (best.scribbly || best.beside) return 'shadow'
+  return null
 }
 
 export function eraseWrittenNote() {
@@ -433,6 +548,333 @@ export function eraseWrittenNote() {
   ui.intent = null
   ui.step = 'propose'
   emit()
+}
+
+function mapNoteToIntent(note, label) {
+  const n = String(note || parseNote(label) || '').trim()
+  if (n === 'delete') return 'delete'
+  if (n === 'color') return 'color'
+  if (n === 'shadow') return 'shadow'
+  if (n === 'reflect') return 'reflect'
+  if (n === 'scale-down' || n === 'scale-up') return n
+  if (n === 'indent' || n === 'move') return n === 'move' ? 'move-layout' : 'indent'
+  if (n === 'cut') return 'shorter'
+  if (n === 'add') return 'frame'
+  if (n === 'change') return 'polish'
+  return 'custom'
+}
+
+const GUESS_IDS = new Set([
+  'delete',
+  'delete-image',
+  'delete-text',
+  'color',
+  'name',
+  'name-color',
+  'polish',
+  'custom',
+  'frame',
+  'circle',
+  'shadow',
+  'reflect',
+  'scale-down',
+  'scale-up',
+  'indent',
+  'move-layout',
+  'strike',
+  'longer',
+  'shorter',
+  'highlight',
+  'underline',
+  'wavy',
+  'bold',
+  'box',
+  'spoken',
+  'formal',
+  'scheme',
+  'trim',
+  'background',
+])
+
+const ID_ALIASES = {
+  remove: 'delete',
+  erase: 'delete',
+  删除: 'delete',
+  删掉: 'delete',
+  删: 'delete',
+  recolor: 'color',
+  'change-color': 'color',
+  改色: 'color',
+  改颜色: 'color',
+  颜色: 'color',
+  阴影: 'shadow',
+  倒影: 'reflect',
+  shrink: 'scale-down',
+  'scale-down': 'scale-down',
+  缩小: 'scale-down',
+  grow: 'scale-up',
+  放大: 'scale-up',
+  rewrite: 'polish',
+  改字: 'polish',
+}
+
+function canonicalizeGuessId(id, label, note) {
+  const raw = String(id || '').trim()
+  const alias = ID_ALIASES[raw] || ID_ALIASES[raw.toLowerCase()]
+  if (alias) return alias
+  if (GUESS_IDS.has(raw) || LOCAL_ANNO.has(raw)) return raw
+  return mapNoteToIntent(note, label)
+}
+
+function normalizeGuessItem(item) {
+  if (!item) return null
+  if (typeof item === 'string') {
+    const label = item.trim()
+    if (!label) return null
+    const note = parseNote(label)
+    return { id: mapNoteToIntent(note, label), label, note, command: '' }
+  }
+  const label = String(item.label || item.guess || item.text || '').trim()
+  const note = String(item.note || parseNote(label) || '').trim()
+  const command = String(item.command || '').trim()
+  const fromText = mapNoteToIntent(note, label)
+  let id = canonicalizeGuessId(item.id || item.intent, label, note)
+  if ((id === 'custom' || id === 'polish' || id === 'shorter') && fromText !== 'custom') id = fromText
+  if (fromText === 'scale-down' || fromText === 'scale-up' || fromText === 'delete' || fromText === 'shadow' || fromText === 'reflect') {
+    id = fromText
+  }
+  if (!label && !id) return null
+  return { id, label: label || localLabel(id) || '按这个改', note, command }
+}
+
+function ptsToPoly(pts) {
+  if (!pts?.length) return null
+  return pts.length >= 3 ? strokeToPolygon(pts) : pts
+}
+
+function collectDrawingPolys() {
+  const polys = []
+  const add = (pts) => {
+    const poly = ptsToPoly(pts)
+    if (poly?.length) polys.push(poly)
+  }
+  add(ui.lastPaint)
+  for (const mark of getPaintMarks()) add(mark.points)
+  for (const stroke of getInkStrokes()) add(stroke)
+  for (const span of getSnapshot().spans) {
+    if (span.poly?.length) polys.push(span.poly)
+  }
+  return polys
+}
+
+function ensureTargetsForGuess() {
+  if (!isWebDocActive()) {
+    return getSnapshot().spans.filter((s) => s.kind === 'text' || s.kind === 'image')
+  }
+  const extra = refreshWebTargetsFromDrawing(collectDrawingPolys())
+  const slots = getSnapshot().spans.filter((s) => s.kind === 'slot' || s.indentMark)
+  const seen = new Set()
+  const merged = []
+  for (const span of [...extra, ...getSnapshot().spans]) {
+    if (!span?.webId || span.kind === 'slot') continue
+    if (seen.has(span.webId)) continue
+    seen.add(span.webId)
+    merged.push(span)
+  }
+  replaceSpans([...merged, ...slots])
+  return merged
+}
+
+function localGuesses(spans, editor) {
+  if (layoutSourceWaiting(spans) && !looksLikeLayout(spans) && !hasLayoutWork(spans)) {
+    return [{ id: '', label: '再用同一颜色圈要放到的位置', note: '', command: '', wait: true }]
+  }
+  const opts = proposeOptions(spans, editor)
+  const out = opts.slice(0, 4).map(([id, label]) => ({ id, label, note: ui.note, command: '' }))
+  if (looksLikeLayout(spans) || hasLayoutWork(spans)) return out
+  const extra = [
+    { id: 'delete', label: '删掉圈中这块', note: 'delete', command: '' },
+    { id: 'color', label: '改圈中内容的颜色', note: 'color', command: '' },
+    { id: 'custom', label: '按批注改成我要的样子', note: 'custom', command: '' },
+  ]
+  for (const g of extra) {
+    if (out.length >= 4) break
+    if (!out.some((x) => x.id === g.id)) out.push(g)
+  }
+  return out
+}
+
+export function requestIntentGuesses(editor, { more = false } = {}) {
+  const token = ++guessToken
+  ui.step = 'propose'
+  ui.intent = null
+  ui.guessing = true
+  if (!more) {
+    ui.guesses = []
+    ui.judged = false
+    ui.seenGuessLabels = []
+  }
+  emit()
+  runIntentGuesses(editor, token, { more })
+}
+
+export function scheduleIntentGuesses(editor) {
+  requestIntentGuesses(editor, { more: false })
+}
+
+async function runIntentGuesses(editor, token, { more = false } = {}) {
+  const seen = new Set((ui.seenGuessLabels || []).map((s) => String(s).trim()))
+  const local = localGuesses(getSnapshot().spans, editor).filter((g) => !seen.has(g.label))
+  if (token !== guessToken) return
+  try {
+    const localInk = readInkText()
+    if (localInk.text) applyWrittenNote(localInk.text, { confident: localInk.confident, silent: true })
+    const handwriting = [ui.noteText, localInk.text].filter(Boolean).join('')
+    const hit = await guessAnnotationIntent(editor, null, {
+      silent: true,
+      more,
+      exclude: [...seen],
+      handwriting,
+    })
+    if (token !== guessToken) return
+    let next = (hit?.guesses || []).map(normalizeGuessItem).filter(Boolean)
+    next = next.filter((g) => g.label && !seen.has(g.label))
+    if (!next.length) next = local.slice(0, 4)
+    ui.guesses = next.slice(0, 4)
+    ui.judged = true
+    ui.seenGuessLabels = [...seen, ...ui.guesses.map((g) => g.label)]
+    if (hit?.command) replaceCommandText(hit.command)
+    if (hit?.note) ui.note = hit.note
+    if (hit?.text) ui.noteText = hit.text
+    ui.noteConfident = Boolean(hit?.text || next.length)
+  } catch {
+    if (token !== guessToken) return
+    ui.guesses = local.slice(0, 4)
+    ui.judged = true
+    ui.seenGuessLabels = [...seen, ...ui.guesses.map((g) => g.label)]
+  } finally {
+    if (token === guessToken) {
+      ui.guessing = false
+      emit()
+      const msg = more
+        ? ui.guesses.length
+          ? '又给出几条。点一项执行，或再要几条'
+          : '没有更多新的推测了'
+        : ui.guesses.length
+          ? '判断好了。点一项执行；不满意可再要几条'
+          : '没看懂这次笔迹，可再画一点后重新判断'
+      guessRuntime.deps?.toast?.(msg)
+    }
+  }
+}
+
+function guessNeedsValue(id, command) {
+  if (String(id).startsWith('delete')) return false
+  if (LOCAL_ANNO.has(id) || id === 'clear-anno' || id === 'indent' || id === 'move-layout' || id === 'shadow' || id === 'reflect' || id === 'scale-down' || id === 'scale-up' || id === 'trim' || id === 'background') {
+    return false
+  }
+  if (id === 'scheme' || id === 'insert-text' || id === 'insert-image') return true
+  if (needsColor(id) && !ui.color && !command) return true
+  if (needsName(id) && !ui.productName.trim() && !command) return true
+  if (id === 'custom' && !command && !ui.moreText.trim() && !ui.noteText.trim()) return true
+  return false
+}
+
+let lastGuessAt = 0
+
+function applyGuess(guess, editor, deps) {
+  if (guess?.wait || !guess?.id) {
+    deps?.toast?.('这一条还不能执行，换一条或再给几条')
+    return
+  }
+  if (performance.now() - lastGuessAt < 350) return
+  lastGuessAt = performance.now()
+  guessToken += 1
+  window.clearTimeout(scheduleIntentGuesses.timer)
+  ui.guessing = false
+  for (const stroke of getInkStrokes()) {
+    if (stroke?.length >= 2) keepPaintMark(stroke, { append: true, color: '#1d1916' })
+  }
+  const targetsNow = ensureTargetsForGuess()
+  clearInk()
+  const id = canonicalizeGuessId(guess.id, guess.label, guess.note)
+  const label = String(guess.label || '').trim()
+  const command = String(guess.command || '').trim()
+  ui.note = guess.note || parseNote(label) || ui.note
+  ui.noteText = label || command || ui.noteText
+  ui.noteConfident = true
+  const parsed = parseCommand([command, label, ui.noteText].filter(Boolean).join(' '))
+  if (parsed.color) ui.color = parsed.color
+  if (parsed.product && needsName(id)) ui.productName = parsed.product
+  if (id === 'custom') ui.moreText = command || label
+  if (command) replaceCommandText(command)
+  else if (label) replaceCommandText(label)
+
+  if (isWebDocActive()) {
+    const webOp = String(id).startsWith('delete')
+      ? id
+      : LOCAL_ANNO.has(id) || id === 'clear-anno' || id === 'shadow' || id === 'reflect' || id === 'scale-down' || id === 'scale-up' || id === 'color'
+        ? id
+        : ''
+    if (webOp) {
+      if (webOp === 'color' && !parsed.color && !ui.color) {
+        ui.intent = 'color'
+        ui.step = 'values'
+        emit()
+        deps.toast('点色板里的颜色，页面会马上改')
+        return
+      }
+      deps.toast(`正在执行：${label || localLabel(id)}`)
+      const result = executeCircledOp(webOp, {
+        color: parsed.color || ui.color,
+        label: label || localLabel(id),
+        onBefore: (lab) => rememberLocal(editor, lab),
+      })
+      if (!result.ok) {
+        deps.toast(result.reason || '没有改到圈中的内容')
+        emit()
+        return
+      }
+      startReview()
+      emit()
+      deps.toast(result.message)
+      return
+    }
+  }
+
+  if (
+    LOCAL_ANNO.has(id) ||
+    id === 'clear-anno' ||
+    id === 'indent' ||
+    id === 'move-layout' ||
+    id === 'shadow' ||
+    id === 'reflect' ||
+    id === 'scale-down' ||
+    id === 'scale-up' ||
+    id === 'trim' ||
+    id === 'background'
+  ) {
+    deps.toast(`正在执行：${label || localLabel(id)}`)
+    pickOption(id, deps, editor)
+    return
+  }
+
+  ui.intent = id
+  const valueHint = parsed.color || parsed.product || ui.color || (id === 'custom' ? command : '')
+  if (guessNeedsValue(id, valueHint)) {
+    ui.step = 'values'
+    emit()
+    deps.toast(needsColor(id) ? '点色板里的颜色，页面会马上改' : '还差一个值，填完就会改页面')
+    return
+  }
+  if (isWebDocActive() && !targetsNow.length && String(id).startsWith('delete')) {
+    deps.toast('圈的位置没对上网页元素。请贴着图标或文字再画一圈')
+    emit()
+    return
+  }
+  applyCommandText()
+  deps.toast(`正在执行：${label || localLabel(id) || '这项操作'}`)
+  runIntent(editor, deps, 'inside')
 }
 
 function selectionKinds(spans = getSnapshot().spans) {
@@ -486,7 +928,12 @@ function looksLikePageLine(spans = getSnapshot().spans) {
 
 function looksLikeCircledRegion(spans = getSnapshot().spans) {
   if (looksLikePageLine(spans) || looksLikeIndent(spans) || looksLikeLayout(spans)) return false
-  if (ui.lastPaint?.length >= 8) return true
+  if (ui.lastPaint?.length >= 10) {
+    const pts = ui.lastPaint
+    const box = aabb(pts)
+    const closed = dist(pts[0], pts[pts.length - 1]) < Math.max(box.w, box.h) * 0.3
+    return closed && box.w > 22 && box.h > 22
+  }
   return (spans || []).some((s) => s.paintMark && s.kind === 'slot')
 }
 
@@ -612,8 +1059,9 @@ function proposeOptions(spans, editor) {
       add('delete', '字和图一起删')
       add('delete-text', '删掉这些字')
       add('delete-image', '删掉这块图')
-    } else if (images.length) add('delete-image', '删掉这块图')
-    else add('delete-text', '删掉这些字')
+    } else if (images.length) add('delete-image', '删掉圈中这块')
+    else if (texts.length) add('delete-text', '删掉这些字')
+    else add('delete', '删掉圈中这块')
     if (texts.length) add('strike', '划掉这些字')
     add('delete-deco', '去掉圈里的装饰/标注')
     add('clear-anno', '去掉下划线/框/高亮')
@@ -660,6 +1108,14 @@ function proposeOptions(spans, editor) {
     return bits
   }
 
+  if (note === 'shadow' || note === 'reflect') {
+    if (note === 'reflect') add('reflect', '加上倒影')
+    else add('shadow', '加上阴影')
+    add(note === 'reflect' ? 'shadow' : 'reflect', note === 'reflect' ? '加上阴影' : '加上倒影')
+    add('custom', '按我写的改')
+    return bits
+  }
+
   if (note === 'color') {
     if (texts.length + images.length >= 2) add('scheme', '用配色套到这几处')
     add('color', texts.length + images.length > 1 ? '改成同一颜色' : '改这一处颜色')
@@ -693,13 +1149,18 @@ function proposeOptions(spans, editor) {
     return bits
   }
   if (looksLikeCircledRegion(spans)) {
-    if (looksLikeShadow(spans, editor)) {
+    const decor = classifyDecorStroke(ui.lastPaint, spans)
+    if (decor === 'reflect') add('reflect', '加上倒影')
+    if (decor === 'shadow' || looksLikeShadow(spans, editor)) {
       const packed = cupScreenBox(editor)
       add('shadow', shadowOptionLabel(ui.lastPaint, packed?.cup))
     }
-    add('frame', '加上一个框')
-    add('circle', '加上一个圈')
+    if (!decor) {
+      add('frame', '加上一个框')
+      add('circle', '加上一个圈')
+    }
     add('shadow', '加上阴影')
+    add('reflect', '加上倒影')
     return bits
   }
   if (looksLikeShadow(spans, editor)) {
@@ -781,7 +1242,7 @@ function applyCommandText() {
     if (needsColor(ui.intent) && ui.color) parts.push(ui.color)
     if (ui.printFit === 'short') parts.push('杯面用简称')
     if (ui.printFit === 'shrink') parts.push('缩小写进像素')
-    replaceCommandText(parts.join('，'))
+    if (parts.length) replaceCommandText(parts.join('，'))
   }
 }
 
@@ -800,7 +1261,7 @@ function goBack() {
 }
 
 function heading(step, intent) {
-  if (step === 'propose') return '在旁边写出要做什么'
+  if (step === 'propose') return '画完后开始判断'
   if (step === 'review') return '已改这些地方'
   if (intent === 'name' || intent === 'print-short') return '改成什么名字'
   if (intent === 'color') return '改成什么颜色'
@@ -813,17 +1274,19 @@ function heading(step, intent) {
   return '再补一点'
 }
 
-function btn(label, { primary, on, title } = {}, onClick) {
+function btn(label, { primary, on, title, pointer } = {}, onClick) {
   const el = document.createElement('button')
   el.type = 'button'
   if (primary) el.className = 'primary'
   if (on) el.classList.add('is-on')
   el.textContent = label
   if (title) el.title = title
-  el.addEventListener('click', (e) => {
+  const go = (e) => {
     e.stopPropagation()
+    if (pointer) e.preventDefault()
     onClick()
-  })
+  }
+  el.addEventListener(pointer ? 'pointerdown' : 'click', go)
   return el
 }
 
@@ -887,7 +1350,7 @@ export function addCoachMarks(layer, editor) {
   }
   const caption = document.createElement('p')
   caption.className = 'coach-caption'
-  caption.textContent = '用画笔涂过要改的字或图，再在旁边写出一两个字，比如删、改、色。系统按你写的给出选项。'
+  caption.textContent = '先画、再写。画完点「开始判断」，系统给出几条可能操作。不满意再要几条，选中后才改网页。'
   const ok = btn('知道了', { primary: true }, dismissCoach)
   caption.append(ok)
   wrap.append(caption)
@@ -965,6 +1428,22 @@ function pickOption(id, deps, editor) {
     else deps.toast('已改回物体')
     return
   }
+  if (id === 'scale-down' || id === 'scale-up') {
+    const down = id === 'scale-down'
+    const label = down ? '缩小' : '放大'
+    if (!withLocalUndo(editor, label, () => {
+      if (!isWebDocActive()) return false
+      return applyWebScale(down ? 0.82 : 1.22, label)
+    })) {
+      deps.toast('先圈要缩放的 Logo 或图片')
+      return
+    }
+    clearPaintMarks()
+    deps.toast(down ? '已缩小 Logo。可点「还原这一处」' : '已放大 Logo。可点「还原这一处」')
+    startReview()
+    emit()
+    return
+  }
   if (id === 'shadow') {
     if (!withLocalUndo(editor, '阴影', () => {
       if (isWebDocActive()) {
@@ -979,6 +1458,23 @@ function pickOption(id, deps, editor) {
     }
     clearPaintMarks()
     deps.toast('已按你画的形状加上投影。可点「撤回刚才」')
+    startReview()
+    emit()
+    return
+  }
+  if (id === 'reflect') {
+    if (!withLocalUndo(editor, '倒影', () => {
+      if (isWebDocActive()) return applyWebReflect()
+      const img = editor?.view?.dom?.querySelector('img[data-block-id]')
+      if (!img) return false
+      img.style.webkitBoxReflect = 'below 6px linear-gradient(transparent 35%, rgba(0,0,0,.4))'
+      return true
+    })) {
+      deps.toast('先圈要加倒影的图')
+      return
+    }
+    clearPaintMarks()
+    deps.toast('已加上倒影。可点「撤回刚才」')
     startReview()
     emit()
     return
@@ -1587,8 +2083,33 @@ export function setSchemeModuleColor(editor, moduleId, colorId, toast, { restore
   })
 }
 
+function runPickedColor(editor, deps, name) {
+  ui.color = name
+  applyCommandText()
+  if (isWebDocActive()) {
+    const result = executeCircledOp('color', {
+      color: name,
+      label: `改成${name}`,
+      onBefore: (lab) => rememberLocal(editor, lab),
+    })
+    if (!result.ok) {
+      deps.toast(result.reason || '没有改到圈中的内容')
+      return
+    }
+    startReview()
+    emit()
+    deps.toast(result.message)
+    return
+  }
+  runIntent(editor, deps, 'inside')
+}
+
 function runIntent(editor, deps, scope) {
   ui.elsewhere = scope
+  if (ui.intent === 'scale-down' || ui.intent === 'scale-up') {
+    pickOption(ui.intent, deps, editor)
+    return
+  }
   if (ui.intent === 'indent') {
     if (scope === 'follow') withLocalUndo(editor, '空两格（全页）', () => {
       applyIndentAll(editor)
@@ -1656,73 +2177,55 @@ function fillPropose(bar, spans, editor, deps) {
   bar.append(title)
   const hint = document.createElement('p')
   hint.className = 'card-note'
-  if (looksLikeLayout(spans) || layoutSourceWaiting(spans)) {
-    hint.textContent = looksLikeLayout(spans)
-      ? '同一颜色圈了模块和它要去的位置。点「移到画出的位置」，会按落点大小放进去。'
-      : `已用${layoutSourceWaiting(spans)}笔圈中要挪的模块。再用同一颜色圈它要去的位置。`
-  } else if (ui.noteText) {
-    hint.textContent = ui.noteConfident
-      ? `看成「${ui.noteText}」，按这个猜下面几项。点一项继续。写错可擦掉。`
-      : ui.note
-        ? `写成「${ui.noteText}」不太确定，先按这个猜。不对就擦掉再写。`
-        : '字没认清，先给通用项。可擦掉再写，或在旁边再写一两个字。'
-  } else if (spans.filter((s) => s.indentMark).length === 1) {
-    hint.textContent = '再在段前画一个小方格，就会空两格。不用按 Shift。'
-  } else if (looksLikeIndent(spans)) {
-    hint.textContent = '两个格子表示这段空两格。点下面确认。'
-  } else if (looksLikePageLine(spans)) {
-    hint.textContent = '看成一条线。可选直线、波浪线、删除线，或水平 / 垂直。'
-  } else if (looksLikeCircledRegion(spans)) {
-    hint.textContent = '圈了一块。没写字的话，可加上一个框、一个圈，或加阴影。'
-  } else if (spans.some((s) => s.paintMark) && !spans.some((s) => s.kind === 'text' || s.kind === 'image')) {
-    hint.textContent = '没涂到字或杯子。可加阴影、空两格，或加框、圈、插入文字。'
-  } else {
-    hint.textContent = '用鼠标或笔在旁边写一两个字（删、改、色、加…）。写错点擦掉。没写则按你涂到的内容猜。'
-  }
+  if (ui.guessing) hint.textContent = '正在根据你画的和写下的判断意图…'
+  else if (layoutSourceWaiting(spans) && !looksLikeLayout(spans)) hint.textContent = '再用同一颜色圈它要去的位置'
+  else if (ui.judged) hint.textContent = '点一项就执行。不满意可再要几条。'
+  else hint.textContent = '圈、涂、写都会一起看。有字会先认出来，再和画的位置合着判断。画完点「开始判断」。'
   bar.append(hint)
-  if (hasInk() || ui.noteText) {
-    const tools = document.createElement('div')
-    tools.className = 'card-row'
-    if (hasInk()) {
-      tools.append(
-        btn('擦掉上一笔', {}, () => {
-          undoLastInkStroke()
-          deps.toast(hasInk() ? '已擦掉上一笔，可继续写' : '字已擦掉，可再写')
-        }),
-      )
-    }
+
+  const tools = document.createElement('div')
+  tools.className = 'card-row'
+  if (!ui.guessing && !ui.judged) {
     tools.append(
-      btn('擦掉字重写', {}, () => {
-        eraseWrittenNote()
-        deps.toast('字已擦掉，可再写')
+      btn('开始判断', { primary: true, pointer: true }, () => {
+        requestIntentGuesses(editor, { more: false })
       }),
     )
-    bar.append(tools)
   }
-  const lead = document.createElement('div')
-  lead.className = 'card-title'
-  lead.textContent = ui.note ? '可能想做什么' : '没写字时，按你画的猜'
-  bar.append(lead)
-  const row = document.createElement('div')
-  row.className = 'card-row'
-  const options = proposeOptions(spans, editor)
-  if (!options.length) {
-    const empty = document.createElement('p')
-    empty.className = 'card-note'
-    empty.textContent = spans.some((s) => s.indentMark)
-      ? '再在段前画一个小方格，就会空两格'
-      : spans.some((s) => s.paintMark)
-        ? '没涂到字或杯子。可加阴影、空两格，或加框 / 线 / 插入'
-        : '再圈一点，或在旁边写出要做什么'
-    bar.append(empty)
-    return
+  if (!ui.guessing && ui.judged) {
+    tools.append(
+      btn('再给几条', { primary: true, pointer: true }, () => {
+        requestIntentGuesses(editor, { more: true })
+      }),
+    )
   }
-  for (const [id, label] of options) {
-    const primary =
-      (id === 'indent' || id === 'shadow' || id === 'move-layout' || id === 'line') && options[0][0] === id
-    row.append(btn(label, { primary, on: ui.intent === id }, () => pickOption(id, deps, editor)))
-  }
-  bar.append(row)
+  tools.append(
+    btn('重新圈选', { pointer: true }, () => {
+      cancelGuesses()
+      clearInk()
+      replaceSpans([])
+      idleCard()
+      deps.toast('已清掉这次笔迹，再画一次')
+    }),
+  )
+  bar.append(tools)
+
+  if (ui.guessing && !ui.guesses.length) return
+  if (!ui.judged && !ui.guesses.length) return
+
+  const guesses = ui.guesses
+  if (!guesses.length) return
+  const list = document.createElement('div')
+  list.className = 'card-guesses'
+  guesses.forEach((guess, i) => {
+    const el = btn(guess.label, { primary: i === 0 && !guess.wait }, () => clickGuessAt(i, editor))
+    el.dataset.guessIndex = String(i)
+    el.dataset.guessId = guess.id
+    el.dataset.guessLabel = guess.label
+    if (guess.wait) el.disabled = true
+    list.append(el)
+  })
+  bar.append(list)
 }
 
 function followActions(bar, editor, deps, canRun) {
@@ -1757,7 +2260,7 @@ function fillValues(bar, editor, deps) {
   if (String(ui.intent).startsWith('delete')) {
     const note = document.createElement('p')
     note.className = 'card-note'
-    note.textContent = '会删掉圈里对应的字或图上那一块。'
+    note.textContent = '会从网页去掉圈中的图标、链接或文字。'
     bar.append(note)
     bar.append(
       btn('确认删除', { primary: true }, () => runIntent(editor, deps, 'inside')),
@@ -1989,7 +2492,7 @@ function fillValues(bar, editor, deps) {
       b.addEventListener('click', (e) => {
         e.stopPropagation()
         ui.color = swatch.id
-        emit()
+        runPickedColor(editor, deps, swatch.id)
       })
       pal.append(b)
     }
@@ -2003,7 +2506,7 @@ function fillValues(bar, editor, deps) {
     picker.addEventListener('pointerdown', (e) => e.stopPropagation())
     picker.addEventListener('input', () => {
       ui.color = picker.value
-      emit()
+      runPickedColor(editor, deps, picker.value)
     })
     const customName = document.createElement('span')
     customName.textContent = '自选颜色'
@@ -2039,6 +2542,21 @@ function fillReview(bar, editor, deps) {
   const snap = getSnapshot()
   const list = document.createElement('ul')
   list.className = 'card-changes'
+  const edits = listWebEdits()
+  for (const item of edits) {
+    const li = document.createElement('li')
+    const restored = item.keep === false
+    const line = document.createElement('button')
+    line.type = 'button'
+    line.className = 'change-line'
+    line.textContent = item.label || '网页改动'
+    const toggle = btn(restored ? '改回这一处' : '还原这一处', {}, () => {
+      const ok = restored ? redoWebEdit(item.id) : restoreWebEdit(item.id)
+      deps.toast(ok ? (restored ? '已改回这一处' : '已还原这一处') : '这一处没能撤回')
+    })
+    li.append(line, toggle)
+    list.append(li)
+  }
   for (const item of snap.changes || []) {
     const li = document.createElement('li')
     if (snap.changeActive === item.id) li.classList.add('is-on')
@@ -2063,7 +2581,7 @@ function fillReview(bar, editor, deps) {
     li.append(line, toggle)
     list.append(li)
   }
-  if (!snap.changes.length) {
+  if (!edits.length && !snap.changes.length) {
     const empty = document.createElement('p')
     empty.className = 'card-note'
     empty.textContent = '没有留下改动点。'
@@ -2073,10 +2591,13 @@ function fillReview(bar, editor, deps) {
 }
 
 export function fillNoviceCard(bar, editor, deps) {
+  guessRuntime.editor = editor
+  guessRuntime.deps = deps
   const snap = getSnapshot()
   const spans = snap.spans
-  if (ui.hideCard && !spans.length && !(snap.changes || []).length) return
-  const showReview = ui.step === 'review' || (!spans.length && snap.changes.length)
+  const webCount = listWebEdits().length
+  if (ui.hideCard && !spans.length && !(snap.changes || []).length && !webCount) return
+  const showReview = ui.step === 'review' || (!spans.length && (snap.changes.length || webCount))
   if (showReview && ui.step !== 'review') ui.step = 'review'
 
   if (!spans.length && !showReview) {
@@ -2089,7 +2610,7 @@ export function fillNoviceCard(bar, editor, deps) {
     } else if (ui.coachOn) {
       const title = document.createElement('div')
       title.className = 'card-title'
-      title.textContent = '先涂一涂，再在旁边写出要做什么'
+      title.textContent = '先画完，再点开始判断'
       bar.append(title)
     }
     return
@@ -2100,8 +2621,9 @@ export function fillNoviceCard(bar, editor, deps) {
     return
   }
 
-  fillHints(bar, editor, spans)
-  if (ui.step === 'values' && ui.intent) fillValues(bar, editor, deps)
-  else fillPropose(bar, spans, editor, deps)
+  if (ui.step === 'values' && ui.intent) {
+    fillHints(bar, editor, spans)
+    fillValues(bar, editor, deps)
+  } else fillPropose(bar, spans, editor, deps)
   appendUndoRow(bar, editor, deps)
 }

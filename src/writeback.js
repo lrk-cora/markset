@@ -144,8 +144,7 @@ export async function runWriteback(kind, editor, notify) {
   }
 
   if (kind === 'delete' && scoped.some((s) => s.kind === 'image')) {
-    const ok = window.confirm('删除会抹掉勾选范围内的字，并抹掉图上那一块。确定？')
-    if (!ok) return
+    /* user already picked a delete guess */
   }
 
   const printSpan =
@@ -194,7 +193,7 @@ async function commitInside(editor, ops, kind, commandText, notify, fact = null,
   const gateOn = isClientModelGateOn()
   const health = gateOn && (wantTextModel || wantImage) ? await fetchHealth().catch(() => ({})) : {}
   const useTextModel = wantTextModel && gateOn && Boolean(health.dashscope)
-  const useImageModel = wantImage && gateOn && Boolean(health.fal)
+  const useImageModel = wantImage && gateOn && Boolean(health.wanx || health.dashscope)
   const localText = planned.length > 0 && (kind === 'replace' || kind === 'delete' || !useTextModel)
   const localImage = wantImage && !useImageModel
   const canDoSomething =
@@ -242,7 +241,7 @@ async function commitInside(editor, ops, kind, commandText, notify, fact = null,
       scope === 'follow' ? '已写入圈内外相同的名字' : scope === 'anchor' ? '已按圈中改正文（圈里没动）' : '已写入圈里的'
     const bits = [head, `已标出 ${result.count} 处`]
     if (skippedModel) bits.push('字按你填的新值改')
-    if (usedLocalImage) bits.push('图为选区内调色（未调用 fal）')
+    if (usedLocalImage) bits.push('图为选区内调色（未调用万相）')
     bits.push('每处可点「还原这一处」。点页面空白看成品，「撤回全部」撤销整次')
     notify(bits.join('。'))
   } catch (err) {

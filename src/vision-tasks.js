@@ -1,5 +1,5 @@
-import { isClientModelGateOn, planOps } from './api.js'
-import { captureMarkedPage } from './capture.js'
+import { isClientModelGateOn, planIntent, planOps } from './api.js'
+import { captureAnnotationScene, captureMarkedPage } from './capture.js'
 import { intersectBoxes } from './geometry.js'
 import { imageSpanFromNaturalBox, normalizeVisionBox } from './hit-test.js'
 import { appendSpans, getSnapshot, replaceCommandText } from './store.js'
@@ -108,6 +108,112 @@ export async function findSame(editor, notify) {
   } finally {
     running = false
   }
+}
+
+function normalizeGuesses(json, data) {
+  const raw = Array.isArray(json?.guesses)
+    ? json.guesses
+    : Array.isArray(data?.guesses)
+      ? data.guesses
+      : []
+  const out = []
+  for (const item of raw) {
+    if (typeof item === 'string' && item.trim()) {
+      out.push({ id: '', label: item.trim(), note: '', command: '' })
+      continue
+    }
+    if (!item || typeof item !== 'object') continue
+    const label = String(item.label || item.guess || item.text || '').trim()
+    const id = String(item.id || item.intent || '').trim()
+    if (!label && !id) continue
+    out.push({
+      id,
+      label: label || id,
+      note: String(item.note || '').trim(),
+      command: String(item.command || '').trim(),
+    })
+  }
+  if (!out.length) {
+    const label = String(json?.guess || data?.guess || json?.text || '').trim()
+    const note = String(json?.note || data?.note || '').trim()
+    const intent = String(json?.intent || data?.intent || '').trim()
+    if (label || note || intent) {
+      out.push({
+        id: intent || note,
+        label: label || note || intent,
+        note: note || intent,
+        command: String(json?.command || data?.command || '').trim(),
+      })
+    }
+  }
+  return out.slice(0, 4)
+}
+
+export async function guessAnnotationIntent(editor, notify, { silent = false, more = false, exclude = [], handwriting = '' } = {}) {
+  if (!silent && running) return null
+  if (!silent) running = true
+  if (!silent) notify?.('正在理解批注…')
+  try {
+    const scene = await captureAnnotationScene(editor)
+    if (!scene.imageDataUrls?.length && !scene.imageDataUrl) {
+      if (!silent) notify?.('没有可看的批注画面')
+      return null
+    }
+    const skip = (exclude || []).filter(Boolean).join('；')
+    const written = String(handwriting || '').trim()
+    const instruction = [
+      '必须同时看「画的部分」和「写的部分」。',
+      '第一张图是网页加上用户全部笔迹。圈落在哪一块，就只针对那一块，不要因为页面上有大Logo就猜成改Logo。',
+      '若圈里是字，就改这些字；若圈里是图，就改这张图；若字和图都圈到了，就两类一起改。',
+      '若圈在空白处或只是自画图形，不要猜成主Logo操作。',
+      written ? `本地已经认出的字：${written}。以它为线索，再结合画落在哪一块来理解。` : '如果有手写，先识别成中文，再和圈/涂的位置合在一起判断。',
+      '例如：圈了图标并写「删」=删掉该图标；只圈了「搜狗搜索」四字并写改红色=只改这几个字的颜色；圈了字和图=两类一起改。',
+      more
+        ? '再给出 3 到 4 条不同的可能操作，不要重复已经给过的。'
+        : '给出 3 到 4 条最可能的操作，按可能性从高到低。',
+      skip ? `不要再给出这些：${skip}` : '',
+      'label 用一句短中文，像在跟用户确认。JSON 里 text 填识别出的手写。command 有具体颜色就填颜色名（如红色）。',
+    ]
+      .filter(Boolean)
+      .join('')
+    const data = await planIntent({
+      task: 'intent',
+      instruction,
+      handwriting: written,
+      marks: scene.marks,
+      pageText: scene.pageText,
+      imageDataUrl: scene.combinedDataUrl || scene.imageDataUrls[0] || scene.imageDataUrl,
+      imageDataUrls: scene.imageDataUrls,
+    })
+    const json = parseVisionJson(data?.text) || data
+    const guesses = normalizeGuesses(json, data)
+    const text = String(json?.text || json?.guess || data?.guess || written || guesses[0]?.label || '').trim()
+    const note = String(json?.note || data?.note || guesses[0]?.note || '').trim()
+    const command = String(json?.command || data?.command || guesses[0]?.command || '').trim()
+    const intent = String(json?.intent || data?.intent || guesses[0]?.id || '').trim()
+    if (!guesses.length && !text && !note && !intent) {
+      if (!silent) notify?.('没看懂这批注')
+      return null
+    }
+    return {
+      guesses,
+      text: text || note || intent,
+      note: note || intent,
+      command,
+      intent,
+      confident: true,
+    }
+  } catch (err) {
+    if (err.code === 'client-gate' || err.code === 'calls_disabled' || err.code === 'no_client_gate') return null
+    if (!silent) notify?.(err.message || '理解批注失败')
+    return null
+  } finally {
+    if (!silent) running = false
+  }
+}
+
+export async function guessInkIntent(notify) {
+  return guessAnnotationIntent(null, notify)
 }
 
 export async function guessStrokePrompt(editor, notify) {

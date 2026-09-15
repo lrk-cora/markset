@@ -52,6 +52,21 @@ export function planOps(payload) {
   return post('/api/plan', payload)
 }
 
+export async function planIntent(payload) {
+  const res = await fetch('/api/plan', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload || {}),
+  })
+  const data = await res.json().catch(() => ({}))
+  if (!res.ok) {
+    const err = new Error(data.error || `http ${res.status}`)
+    err.code = data.code || String(res.status)
+    throw err
+  }
+  return data
+}
+
 export async function importPage(payload) {
   const headers = { 'Content-Type': 'application/json' }
   if (clientGate) headers['X-MarkSet-Call'] = '1'

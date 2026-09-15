@@ -5,12 +5,12 @@ import { tintedMaskCanvas } from './mask.js'
 import { isLassoMode } from './overlay.js'
 import { applyScopeAfterSelect, visibleSuggests } from './scope.js'
 import { snapExistingMark } from './contour.js'
-import { runWriteback } from './writeback.js'
 import { redoChange, restoreChange } from './changes.js'
 import { colorFill, paperFill, parseHexColor, pickerSwatches } from './colors.js'
 import {
   addCoachMarks,
   canUndoLocal,
+  clickGuessAt,
   eraseWrittenNote,
   fillNoviceCard,
   getCard,
@@ -34,6 +34,7 @@ import {
   finishInsert,
   getSnapshot,
   refreshImageLayout,
+  replaceCommandText,
   removeMark,
   setAnchors,
   setChangeActive,
@@ -139,7 +140,7 @@ function bindToolbarMove(bar) {
   return grip
 }
 
-export function toast(message, ms = 2200) {
+export function toast(message, ms = 3200) {
   const el = document.getElementById('toast')
   el.hidden = false
   el.textContent = message
@@ -463,7 +464,7 @@ function addSnapButton(parent, markId, className = 'snap-one') {
   btn.type = 'button'
   btn.className = className
   btn.textContent = '贴物体'
-  btn.title = '用这块的大致范围调用 SAM，把选区贴到物体。不点则保持鼠标圈的范围。'
+  btn.title = '云端贴物体已关掉。选区保持鼠标圈的范围。'
   btn.addEventListener('click', (e) => {
     e.stopPropagation()
     snapExistingMark(markId, toast)
@@ -904,6 +905,33 @@ function performUndo(editor) {
 }
 
 export function bindChromeKeys(editor) {
+  const layer = document.getElementById('chrome-layer')
+  if (layer && !layer.dataset.guessBound) {
+    layer.dataset.guessBound = '1'
+    layer.addEventListener(
+      'pointerdown',
+      (e) => {
+        const hit = e.target instanceof Element ? e.target.closest('[data-guess-index]') : null
+        if (!hit || hit.disabled) return
+        e.preventDefault()
+        e.stopPropagation()
+        clickGuessAt(Number(hit.dataset.guessIndex), editor, hit)
+      },
+      true,
+    )
+    layer.addEventListener(
+      'click',
+      (e) => {
+        const hit = e.target instanceof Element ? e.target.closest('[data-guess-index]') : null
+        if (!hit || hit.disabled) return
+        e.preventDefault()
+        e.stopPropagation()
+        clickGuessAt(Number(hit.dataset.guessIndex), editor, hit)
+      },
+      true,
+    )
+  }
+
   document.getElementById('btn-undo')?.addEventListener('click', () => {
     performUndo(editor)
   })

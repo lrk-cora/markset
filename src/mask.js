@@ -186,7 +186,7 @@ export function screenBoxToNatural(box, imageRect, naturalSize) {
 }
 
 /** White = inpaint, black = keep. Opaque RGB PNG, same size as the photo. */
-export function maskToFalDataUrl(maskCanvas) {
+export function maskToInpaintDataUrl(maskCanvas) {
   const out = document.createElement('canvas')
   out.width = maskCanvas.width
   out.height = maskCanvas.height
@@ -196,7 +196,8 @@ export function maskToFalDataUrl(maskCanvas) {
   const src = maskCanvas.getContext('2d').getImageData(0, 0, maskCanvas.width, maskCanvas.height)
   const dst = ctx.getImageData(0, 0, out.width, out.height)
   for (let i = 0; i < src.data.length; i += 4) {
-    const on = src.data[i + 3] > 12
+    const lum = (src.data[i] + src.data[i + 1] + src.data[i + 2]) / 3
+    const on = src.data[i + 3] > 12 && lum > 12
     dst.data[i] = on ? 255 : 0
     dst.data[i + 1] = on ? 255 : 0
     dst.data[i + 2] = on ? 255 : 0
@@ -204,6 +205,54 @@ export function maskToFalDataUrl(maskCanvas) {
   }
   ctx.putImageData(dst, 0, 0)
   return out.toDataURL('image/png')
+}
+
+export const maskToFalDataUrl = maskToInpaintDataUrl
+
+const WANX_MIN = 512
+const WANX_MAX = 4096
+
+/** Scale/pad photo + mask into Wanx's 512–4096 window, keep them the same size. */
+export async function prepareWanxImages(imageSrc, maskCanvas) {
+  const img = await loadImageEl(imageSrc)
+  const w0 = img.naturalWidth || img.width || 1
+  const h0 = img.naturalHeight || img.height || 1
+  let dw = w0
+  let dh = h0
+  const maxSide = Math.max(dw, dh)
+  if (maxSide > WANX_MAX) {
+    const s = WANX_MAX / maxSide
+    dw = Math.max(1, Math.round(dw * s))
+    dh = Math.max(1, Math.round(dh * s))
+  }
+  const canvasW = Math.max(WANX_MIN, dw)
+  const canvasH = Math.max(WANX_MIN, dh)
+  const ox = Math.floor((canvasW - dw) / 2)
+  const oy = Math.floor((canvasH - dh) / 2)
+
+  const photo = document.createElement('canvas')
+  photo.width = canvasW
+  photo.height = canvasH
+  const pctx = photo.getContext('2d')
+  pctx.fillStyle = '#000000'
+  pctx.fillRect(0, 0, canvasW, canvasH)
+  pctx.drawImage(img, ox, oy, dw, dh)
+
+  const maskRgb = document.createElement('canvas')
+  maskRgb.width = canvasW
+  maskRgb.height = canvasH
+  const mctx = maskRgb.getContext('2d')
+  mctx.fillStyle = '#000000'
+  mctx.fillRect(0, 0, canvasW, canvasH)
+  mctx.imageSmoothingEnabled = false
+  mctx.drawImage(maskCanvas, ox, oy, dw, dh)
+
+  return {
+    imageDataUrl: photo.toDataURL('image/jpeg', 0.92),
+    maskDataUrl: maskToInpaintDataUrl(maskRgb),
+    srcRect: { x: ox, y: oy, w: dw, h: dh },
+    sendSize: { w: canvasW, h: canvasH },
+  }
 }
 
 export function loadImageEl(src) {

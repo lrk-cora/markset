@@ -1,7 +1,7 @@
 import './styles.css'
 import { applyDemoPage, applyImportedPage, createEditor, refreshDecorations } from './editor.js'
 import { bindChromeKeys, renderChrome, toast } from './chrome.js'
-import { fetchHealth, importPage, isClientModelGateOn, setClientModelGate } from './api.js'
+import { fetchHealth, importPage, setClientModelGate } from './api.js'
 import { canSnap, consumePackagingHint, consumeSkipObjectSnap, peekPackagingHint, peekSkipObjectSnap, setSnapOn, snapImageHits } from './contour.js'
 import { aabb, looksLikeBoxStroke, looksLikeDrawnLine } from './geometry.js'
 import {
@@ -20,7 +20,7 @@ import { applyScopeAfterSelect } from './scope.js'
 import { guessStrokePrompt } from './vision-tasks.js'
 import { ingestLayoutStroke } from './layout.js'
 import { exportWebDoc, hitWebDoc, isWebDocActive, unmountWebDoc } from './web-doc.js'
-import { clearLocalUndos, dismissCoach, getCard, idleCard, keepCardForAppend, markCrossOut, openPageRecolor, applyWrittenNote, paintLooksLikeCupShadow, resetCardForNewSelection, resetPagePaper, setPaintGesture, canUndoLocal } from './card-flow.js'
+import { clearLocalUndos, dismissCoach, getCard, idleCard, keepCardForAppend, openPageRecolor, applyWrittenNote, resetCardForNewSelection, resetPagePaper, setPaintGesture, shouldTreatStrokeAsInk, canUndoLocal } from './card-flow.js'
 import { addInkStroke, clearInk, hasInk, isLikelyInk, onInkRecognized } from './ink.js'
 import { exitToView } from './view-mode.js'
 import {
@@ -33,6 +33,7 @@ import {
   getSnapshot,
   hasChanges,
   refreshImageLayout,
+  replaceCommandText,
   replaceSpans,
   subscribe,
   undoLastInsert,
@@ -52,8 +53,7 @@ bindChromeKeys(editor)
 setLassoMode(true)
 forceModelsOff()
 onInkRecognized(({ text, confident }) => {
-  applyWrittenNote(text, { confident })
-  if (!text) toast('字没认清，先给通用项。可在旁边再写')
+  applyWrittenNote(text, { confident, silent: true })
 })
 renderChrome(editor)
 
@@ -165,18 +165,10 @@ document.getElementById('allow-models')?.addEventListener('change', (e) => {
 })
 
 document.getElementById('snap-contour')?.addEventListener('change', (e) => {
-  if (e.target.checked && !isClientModelGateOn()) {
-    e.target.checked = false
-    toast('先勾「允许调用云端模型」，并把 .env 里 MARKSET_ALLOW_MODEL_CALLS 改为 1 后重启')
-    return
-  }
-  setSnapOn(e.target.checked)
-  e.target.closest('label')?.classList.toggle('is-on', e.target.checked)
-  toast(
-    e.target.checked
-      ? '之后圈图松手会自动贴到物体（每次消耗 fal 额度）。不勾则保持鼠标圈的范围'
-      : '已关闭自动贴物体，选区保持鼠标圈的范围',
-  )
+  e.target.checked = false
+  setSnapOn(false)
+  e.target.closest('label')?.classList.remove('is-on')
+  toast('云端贴物体已关掉。选区就是鼠标圈的范围')
 })
 
 document.getElementById('btn-api')?.addEventListener('click', async () => {
@@ -185,12 +177,13 @@ document.getElementById('btn-api')?.addEventListener('click', async () => {
     const dash = data.dashscope
       ? `百炼已接入（改字 ${data.rewriteModel}）`
       : '百炼未填 DASHSCOPE_API_KEY'
-    const fal = data.fal ? `fal 已接入（重画 ${data.inpaintModel}）` : 'fal 未填 FAL_KEY'
+    const wanx = data.wanx || data.dashscope
+      ? `万相已接入（重画 ${data.inpaintModel || 'wanx2.1-imageedit'}）`
+      : '万相未接入：先填 DASHSCOPE_API_KEY 并开通 wanx2.1-imageedit'
     const fmt = []
     if (data.dashscope && data.hints && !data.hints.dashscopePrefixOk) fmt.push('百炼密钥格式请再核对')
-    if (data.fal && data.hints && !data.hints.falPairOk) fmt.push('fal 密钥应为 id:secret')
     const gate = data.allowCalls ? '服务器允许调用' : '服务器禁止调用（MARKSET_ALLOW_MODEL_CALLS≠1）'
-    toast([dash, fal, gate, ...fmt].join('；'))
+    toast([dash, wanx, gate, ...fmt].join('；'))
   } catch {
     toast('检查接口失败：请先 npm run dev，并在 markset/.env 填密钥')
   }
@@ -355,12 +348,15 @@ function applyHits(textHits, imageHits, polygon, { append, subtract, add, color,
         finishSelect(suggests)
         hintAfterSelect(extra)
       }
-    } else if (suggests.length) finishSelect(suggests)
-    else toast('按住 Shift 再圈可加上；Alt 圈不要的可挖掉')
+    } else if (suggests.length) {
+      finishSelect(suggests)
+    } else toast('按住 Shift 再圈可加上；Alt 圈不要的可挖掉')
     return
   }
 
-  const objectHits = contentImageHits(imageHits)
+  const objectHits = isWebDocActive()
+    ? { found: imageHits.found, suggest: imageHits.suggest }
+    : contentImageHits(imageHits)
   const next = [...textHits.found, ...objectHits.found]
   if (!next.length) {
     const slot = emptyPaintSpan(rawPoints, polygon) || hitPageSlot(polygon, editor.view)
@@ -407,8 +403,11 @@ function indentSpanFromStroke(rawPoints, polygon) {
   if (!looksLikeBoxStroke(rawPoints) && !compact) return null
   if (isWebDocActive()) {
     const hits = hitWebDoc(polygon)
-    const text = hits.texts.found[0] || getSnapshot().spans.find((s) => s.kind === 'text' && s.webId)
-    if (!text?.webId) return null
+    if (hits.images.found.length) return null
+    const text = hits.texts.found[0]
+    if (!text?.webId || !text.screenRect) return null
+    const coversText = box.x + box.w > text.screenRect.x + 10
+    if (coversText) return null
     return {
       kind: 'slot',
       indentMark: true,
@@ -445,60 +444,38 @@ bindLasso({
   },
   onFinish(polygon, { shift, subtract, add, color, crossOut, rawPoints }) {
     ignoreClickUntil = performance.now() + 400
-    if (crossOut && getSnapshot().spans.length && !shift && !subtract && !add && !color) {
-      markCrossOut()
-      toast('圈上打了 ×，当作删除。点一项确认')
-      return false
-    }
     if (
       !shift &&
       !subtract &&
       !add &&
       !color &&
       !isLayoutPen() &&
-      hasInk() &&
-      isLikelyInk(rawPoints, { hasSelection: true, hasNewContent: false })
+      (shouldTreatStrokeAsInk(rawPoints) ||
+        (hasInk() && isLikelyInk(rawPoints, { hasSelection: true, hasNewContent: false })))
     ) {
       addInkStroke(rawPoints)
       return false
-    }
-    const indentSpan = !subtract && !add && !color && !isLayoutPen() ? indentSpanFromStroke(rawPoints, polygon) : null
-    if (indentSpan) {
-      const existing = getSnapshot().spans.filter((s) => s.indentMark)
-      clearInk()
-      setPaintGesture(rawPoints, { silent: true })
-      if (existing.length === 0) {
-        replaceSpans([indentSpan])
-        resetCardForNewSelection()
-        dismissCoach()
-        toast('再在段前画一个小方格，就会空两格')
-      } else {
-        appendSpans([indentSpan], editor.state.doc)
-        keepCardForAppend()
-        dismissCoach()
-        toast('已记下两个格子。点「这段空两格」')
-      }
-      return
     }
     if (rawPoints?.length) setPaintGesture(rawPoints, { silent: true })
     const webHits = isWebDocActive() ? hitWebDoc(polygon) : null
     const textHits = webHits ? webHits.texts : hitText(editor.view, polygon, { skipCovered: shift && !subtract })
     const rawImageHits = webHits ? webHits.images : hitImages(editor.view, polygon)
-    const imageHits = subtract || add || color ? rawImageHits : contentImageHits(rawImageHits)
+    const imageHits =
+      subtract || add || color || isWebDocActive() ? rawImageHits : contentImageHits(rawImageHits)
     const hasImage = imageHits.found.length + imageHits.suggest.length > 0
     const selected = getSnapshot().spans
     const newText = textHits.found.filter((s) => !selected.some((c) => sameTextHit(c, s)))
     const newImg = imageHits.found.filter(
-      (s) => !isTinyImageSpan(s) && !selected.some((c) => c.kind === 'image' && ((c.webId && s.webId && c.webId === s.webId) || c.block_id === s.block_id)),
+      (s) =>
+        (s.webId || !isTinyImageSpan(s)) &&
+        !selected.some((c) => c.kind === 'image' && ((c.webId && s.webId && c.webId === s.webId) || c.block_id === s.block_id)),
     )
-    const asShadow = paintLooksLikeCupShadow(rawPoints, editor)
     if (
       !shift &&
       !subtract &&
       !add &&
       !color &&
       !isLayoutPen() &&
-      !asShadow &&
       isLikelyInk(rawPoints, {
         hasSelection: selected.length > 0,
         hasNewContent: newText.length + newImg.length > 0,
@@ -557,12 +534,12 @@ function isDrawing() {
 window.addEventListener(
   'click',
   (e) => {
+    const target = e.target instanceof Element ? e.target : e.target.parentElement
+    if (target?.closest('.chrome-layer, .inspector, .topbar, .suggest, .toolbar, .novice-card, .coach, .change-badge, .scheme-tag')) return
     if (performance.now() < ignoreClickUntil) {
       e.preventDefault()
       return
     }
-    const target = e.target instanceof Element ? e.target : e.target.parentElement
-    if (target?.closest('.chrome-layer, .inspector, .topbar, .suggest, .toolbar, .novice-card, .coach, .change-badge, .scheme-tag')) return
 
     const hasSpans = getSnapshot().spans.length > 0
     const changing = hasChanges()

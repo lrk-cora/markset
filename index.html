@@ -25,11 +25,11 @@
           <button type="button" id="btn-recolor" class="mode-btn">换配色</button>
           <button type="button" id="btn-undo" class="mode-btn" hidden>撤回全部</button>
           <button type="button" id="btn-api" class="mode-btn">检查接口</button>
-          <label class="allow-models" title="默认关闭。套索、改选区、检查接口从不消耗额度。只有勾上后，改写/改图才会打百炼或 fal。">
+          <label class="allow-models" title="默认关闭。套索、改选区、检查接口从不消耗额度。只有勾上后，改写才会打通义千问，改图才会打万相。">
             <input type="checkbox" id="allow-models" />
             允许调用云端模型
           </label>
-          <label class="allow-models" title="默认关闭：选区就是鼠标圈出来的像素。打开后，每次圈图松手都会调用 SAM 贴到物体，消耗 fal 额度。减选仍用本地像素。">
+          <label class="allow-models" title="已停用：不再调用云端 SAM。选区就是鼠标圈出来的像素。">
             <input type="checkbox" id="snap-contour" />
             松手自动贴物体
           </label>

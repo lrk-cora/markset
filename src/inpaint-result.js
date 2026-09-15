@@ -37,10 +37,10 @@ function sampleLooksLikeMask(image) {
 }
 
 /**
- * fal fill may return a finished RGB image or an RGBA patch.
+ * Wanx may return a finished RGB image or an RGBA patch.
  * Composite onto the original using our selection mask (or the result alpha).
  */
-export async function resolveInpaintResult(originalUrl, resultUrl, maskCanvas) {
+export async function resolveInpaintResult(originalUrl, resultUrl, maskCanvas, srcRect, sendSize) {
   const orig = await loadImageEl(originalUrl)
   const result = await loadImageEl(resultUrl)
   const out = document.createElement('canvas')
@@ -49,11 +49,20 @@ export async function resolveInpaintResult(originalUrl, resultUrl, maskCanvas) {
   const ctx = out.getContext('2d')
   ctx.drawImage(orig, 0, 0, out.width, out.height)
 
+  const rw = result.naturalWidth || result.width
+  const rh = result.naturalHeight || result.height
+  const sx = sendSize?.w ? rw / sendSize.w : 1
+  const sy = sendSize?.h ? rh / sendSize.h : 1
+  const cropX = (srcRect?.x || 0) * sx
+  const cropY = (srcRect?.y || 0) * sy
+  const cropW = (srcRect?.w || rw) * sx
+  const cropH = (srcRect?.h || rh) * sy
+
   const tmp = document.createElement('canvas')
   tmp.width = out.width
   tmp.height = out.height
   const tctx = tmp.getContext('2d')
-  tctx.drawImage(result, 0, 0, out.width, out.height)
+  tctx.drawImage(result, cropX, cropY, cropW, cropH, 0, 0, out.width, out.height)
 
   if (sampleHasAlpha(result) && !sampleLooksLikeMask(result)) {
     ctx.drawImage(tmp, 0, 0)

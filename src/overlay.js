@@ -140,10 +140,19 @@ export function setColorMode(on) {
 
 function uiTarget(e) {
   const el = e.target instanceof Element ? e.target : e.target.parentElement
-  return el?.closest?.('.hl-handle, .img-handle, .badge, .scheme-tag, .toolbar, .topbar, .inspector, .suggest, .confirm, .change-badge')
+  return el?.closest?.(
+    '.hl-handle, .img-handle, .badge, .scheme-tag, .toolbar, .novice-card, .card-guesses, .topbar, .inspector, .suggest, .confirm, .change-badge, .coach, [data-guess-index]',
+  )
 }
 
 let paintMarks = []
+
+export function getPaintMarks() {
+  return paintMarks.map((m) => ({
+    color: m.color,
+    points: m.points.map((p) => ({ x: p.x, y: p.y })),
+  }))
+}
 
 export function keepPaintMark(points, { append = false, color = '#3c6fd4' } = {}) {
   if (!points?.length) return

@@ -1,9 +1,9 @@
-import { aabb, looksLikeXStroke, pathLength, segmentsIntersect } from './geometry.js'
+import { aabb, dist, looksLikeXStroke, pathLength, segmentsIntersect } from './geometry.js'
 
 const MAIN = ['改', '删', '色', '减', '添', '加']
 const EXTRA = ['换', '短', '插', '叉', '润']
 const GRID = 48
-const SETTLE_MS = 1000
+const SETTLE_MS = 2000
 
 const HAND_TEMPLATES = {
   改: [
@@ -149,18 +149,56 @@ function inkBox() {
   return aabb(pts)
 }
 
+export function inkToDataUrl() {
+  const box = inkBox()
+  if (!box) return ''
+  const pad = 18
+  const w = Math.max(80, Math.ceil(box.w + pad * 2))
+  const h = Math.max(80, Math.ceil(box.h + pad * 2))
+  const canvas = document.createElement('canvas')
+  canvas.width = w
+  canvas.height = h
+  const ctx = canvas.getContext('2d')
+  ctx.fillStyle = '#ffffff'
+  ctx.fillRect(0, 0, w, h)
+  ctx.strokeStyle = '#111111'
+  ctx.lineWidth = 3.2
+  ctx.lineCap = 'round'
+  ctx.lineJoin = 'round'
+  for (const stroke of strokes) {
+    if (stroke.length < 2) continue
+    ctx.beginPath()
+    ctx.moveTo(stroke[0].x - box.x + pad, stroke[0].y - box.y + pad)
+    for (let i = 1; i < stroke.length; i += 1) {
+      ctx.lineTo(stroke[i].x - box.x + pad, stroke[i].y - box.y + pad)
+    }
+    ctx.stroke()
+  }
+  return canvas.toDataURL('image/png')
+}
+
 function nearBoxes(a, b, pad) {
   return a.x < b.x + b.w + pad && a.x + a.w > b.x - pad && a.y < b.y + b.h + pad && a.y + a.h > b.y - pad
 }
 
-function isWritingNow() {
+export function isWritingNow() {
   return strokes.length > 0 && timer !== 0
+}
+
+export function finishInkNow() {
+  window.clearTimeout(timer)
+  timer = 0
+  finishWriting()
 }
 
 export function isLikelyInk(rawPoints, { hasSelection, hasNewContent }) {
   if (!rawPoints?.length) return false
   const box = aabb(rawPoints)
   if (!(box.w > 4 && box.h > 4)) return false
+  const peri = 2 * (box.w + box.h)
+  const len = pathLength(rawPoints)
+  const closed = dist(rawPoints[0], rawPoints[rawPoints.length - 1]) < Math.max(box.w, box.h) * 0.32
+  if (closed && box.w > 36 && box.h > 28 && len < peri * 2.5) return false
   const prev = inkBox()
   if (prev && nearBoxes(box, prev, 240)) return true
   if (isWritingNow() && box.w < 280 && box.h < 280) return true
@@ -169,8 +207,6 @@ export function isLikelyInk(rawPoints, { hasSelection, hasNewContent }) {
   const longSwipe = box.w > box.h * 3.2 || box.h > box.w * 3.2
   if (longSwipe && hasNewContent) return false
   if (box.w < 280 && box.h < 280) return true
-  const peri = 2 * (box.w + box.h)
-  const len = pathLength(rawPoints)
   const scribbly = len > peri * 1.15 || looksLikeXStroke(rawPoints)
   if (hasNewContent && !scribbly) return false
   return scribbly || !hasNewContent
@@ -529,7 +565,23 @@ function looksLikeDeleteMark(list) {
   return strokesCross(a, b)
 }
 
-export function recognizeStrokes(list) {
+function clusterStrokesByX(list) {
+  if (list.length < 2) return [list]
+  const items = list.map((st) => ({ st, box: aabb(st) })).sort((a, b) => a.box.x - b.box.x)
+  const widths = items.map((i) => i.box.w).sort((a, b) => a - b)
+  const med = widths[Math.floor(widths.length / 2)] || 40
+  const gap = Math.max(16, med * 0.42)
+  const groups = [[items[0].st]]
+  for (let i = 1; i < items.length; i += 1) {
+    const prev = items[i - 1].box
+    const cur = items[i].box
+    if (cur.x > prev.x + prev.w + gap) groups.push([items[i].st])
+    else groups[groups.length - 1].push(items[i].st)
+  }
+  return groups
+}
+
+function recognizeOne(list) {
   const pts = list.flat()
   if (!list.length || pts.length < 6) return { text: '', confident: false, scores: {}, debug: null }
   if (looksLikeDeleteMark(list)) return { text: '×', confident: true, scores: { '×': 1 }, debug: { x: true } }
@@ -552,8 +604,27 @@ export function recognizeStrokes(list) {
   return { text, confident, scores: combined, debug: { feat, struct, vis } }
 }
 
+export function recognizeStrokes(list) {
+  const pts = list.flat()
+  if (!list.length || pts.length < 6) return { text: '', confident: false, scores: {}, debug: null }
+  if (looksLikeDeleteMark(list)) return { text: '×', confident: true, scores: { '×': 1 }, debug: { x: true } }
+  const groups = clusterStrokesByX(list)
+  if (groups.length >= 2) {
+    const parts = groups.map((g) => recognizeOne(g))
+    const text = parts.map((p) => p.text).join('')
+    const confident = parts.filter((p) => p.text).length >= 2 && parts.some((p) => p.confident)
+    return { text, confident, scores: parts[0]?.scores || {}, debug: { groups: parts.length } }
+  }
+  return recognizeOne(list)
+}
+
 function recognizeInk() {
   return recognizeStrokes(strokes)
+}
+
+export function readInkText() {
+  if (!strokes.length) return { text: '', confident: false }
+  return recognizeInk()
 }
 
 function finishWriting() {

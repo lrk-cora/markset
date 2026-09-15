@@ -2,7 +2,7 @@ import { inpaintImage, rewriteText } from './api.js'
 import { replaceRangeText, setImageSrcByBlockId } from './editor.js'
 import { isForbiddenSpan } from './forbidden.js'
 import { resolveInpaintResult } from './inpaint-result.js'
-import { makeMask, maskToFalDataUrl, paintMask, rectToPoly } from './mask.js'
+import { makeMask, paintMask, prepareWanxImages, rectToPoly } from './mask.js'
 import { textAfterFromOp } from './ops.js'
 import { localPaintMasked } from './pending.js'
 import { parseCommand } from './plan-local.js'
@@ -200,12 +200,13 @@ export async function presentChanges({
       if (src) {
         try {
           if (modelsImage && op.tool === 'image_inpaint' && !isPrint) {
+            const pair = await prepareWanxImages(src, mask)
             const data = await inpaintImage({
               prompt: op.args?.prompt || commandText,
-              imageDataUrl: src,
-              maskDataUrl: maskToFalDataUrl(mask),
+              imageDataUrl: pair.imageDataUrl,
+              maskDataUrl: pair.maskDataUrl,
             })
-            afterSrc = await resolveInpaintResult(src, data.imageUrl, mask)
+            afterSrc = await resolveInpaintResult(src, data.imageUrl, mask, pair.srcRect, pair.sendSize)
           } else {
             afterSrc = await localPaintMasked(src, mask, commandText, kind, stampText, fact)
           }
