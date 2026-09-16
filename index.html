@@ -10,39 +10,25 @@
       <header class="topbar">
         <div class="brand">
           <span class="mark">MarkSet</span>
-          <span class="week">画完后出选项</span>
+          <span class="week">圈画批注后导出网页</span>
         </div>
         <div class="top-actions">
-          <button type="button" class="mode-btn is-on" data-demo-page="a">页 A</button>
-          <button type="button" class="mode-btn" data-demo-page="b">页 B</button>
           <div class="import-box">
             <button type="button" id="btn-import-html" class="mode-btn">导入 HTML</button>
             <button type="button" id="btn-export-html" class="mode-btn">导出网页</button>
           </div>
           <button type="button" id="btn-lasso" class="mode-btn" aria-pressed="false">画笔</button>
-          <div class="pen-colors" id="pen-colors" role="group" aria-label="笔的颜色"></div>
-          <button type="button" id="btn-subtract" class="mode-btn" aria-pressed="false">减选</button>
-          <button type="button" id="btn-recolor" class="mode-btn">换配色</button>
-          <button type="button" id="btn-undo" class="mode-btn" hidden>撤回全部</button>
-          <button type="button" id="btn-api" class="mode-btn">检查接口</button>
-          <label class="allow-models" title="默认关闭。套索、改选区、检查接口从不消耗额度。只有勾上后，改写才会打通义千问，改图才会打万相。">
+          <label class="allow-models" title="默认关闭。只有勾上后，改写才会打通义千问，改图才会打万相。">
             <input type="checkbox" id="allow-models" />
             允许调用云端模型
           </label>
-          <label class="allow-models" title="已停用：不再调用云端 SAM。选区就是鼠标圈出来的像素。">
-            <input type="checkbox" id="snap-contour" />
-            松手自动贴物体
-          </label>
-          <p class="hint">
-            蓝笔圈选批注；红/绿/橙/青笔调整布局（先圈模块再圈落点）。写错 <kbd>Backspace</kbd>　选区上打 <kbd>×</kbd>　<kbd>Shift</kbd> 加上　<kbd>Alt</kbd> 减选　<kbd>Esc</kbd> 清掉　<kbd>Ctrl+Z</kbd> 撤回
-          </p>
         </div>
       </header>
 
       <div class="workspace">
         <main class="stage">
           <article class="page" aria-label="混排实验页">
-            <p class="kicker" id="page-kicker">演示页 A · 文案三处「原木杯」，杯面釉上印字</p>
+            <p class="kicker" id="page-kicker" hidden></p>
             <div id="editor"></div>
             <div id="web-doc-host" class="web-doc-host" hidden>
               <iframe id="web-doc-frame" class="web-doc-frame" title="导入的网页" sandbox="allow-same-origin"></iframe>

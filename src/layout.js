@@ -228,12 +228,21 @@ export function ingestLayoutStroke(editor, { color, polygon, rawPoints, textHits
   const images = [...(imageHits?.found || []), ...(imageHits?.suggest || [])]
   const content = pickLayoutSource(box, texts, images)
   const spans = getSnapshot().spans
-  const existingSrc = spans.find((s) => s.layoutColor === color && s.layoutRole === 'source')
+  const existingSrc =
+    spans.find((s) => s.layoutColor === color && s.layoutRole === 'source') ||
+    spans.find((s) => (s.kind === 'text' || s.kind === 'image') && s.layoutRole !== 'dest' && s.willEdit !== false)
   const pen = layoutPenOf(color)
   const label = pen?.label || '这支笔'
   const wantDest = Boolean(existingSrc && (!content || farFrom(existingSrc, box)))
 
   if (wantDest) {
+    upsertSpan(
+      (s) => s.markId === existingSrc.markId || (existingSrc.webId && s.webId === existingSrc.webId),
+      {
+        layoutColor: color,
+        layoutRole: 'source',
+      },
+    )
     upsertSpan(
       (s) => s.layoutColor === color && s.layoutRole === 'dest',
       {

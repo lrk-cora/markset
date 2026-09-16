@@ -371,7 +371,10 @@ export function applyDemoPage(editor, pageId = 'a') {
   if (host) host.hidden = true
   editor.commands.setContent(demoDoc(currentDemoPage))
   const kicker = document.getElementById('page-kicker')
-  if (kicker) kicker.textContent = DEMO_KICKER[currentDemoPage] || DEMO_KICKER.a
+  if (kicker) {
+    kicker.hidden = true
+    kicker.textContent = ''
+  }
 }
 
 function textNode(text) {
@@ -456,7 +459,10 @@ export async function applyImportedPage(editor, page) {
     }
   })()
   const kicker = document.getElementById('page-kicker')
-  if (kicker) kicker.textContent = `导入 · ${page?.title || '未命名'}${host ? ` · ${host}` : ''}`
+  if (kicker) {
+    kicker.hidden = true
+    kicker.textContent = ''
+  }
 
   const html =
     String(page?.snapshotHtml || '').trim() ||

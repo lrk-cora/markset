@@ -69,6 +69,77 @@ export function looksLikeXStroke(pts) {
   return len > diag * 1.55
 }
 
+/** Several straight strokes fanning out from a hub, e.g. sunburst around a logo. */
+export function looksLikeRadialBurst(strokes) {
+  const list = (strokes || []).filter((s) => s?.length >= 2)
+  if (list.length < 5) return false
+  const pts = list.flat()
+  const box = aabb(pts)
+  if (box.w < 60 || box.h < 60) return false
+  const cx = box.x + box.w / 2
+  const cy = box.y + box.h / 2
+  const rays = []
+  for (const s of list) {
+    const a = s[0]
+    const b = s[s.length - 1]
+    const chord = dist(a, b)
+    const len = pathLength(s)
+    if (chord < 22 || len < 22) continue
+    if (chord / len < 0.62) continue
+    const da = Math.hypot(a.x - cx, a.y - cy)
+    const db = Math.hypot(b.x - cx, b.y - cy)
+    const inner = da < db ? a : b
+    const outer = da < db ? b : a
+    const dx = outer.x - inner.x
+    const dy = outer.y - inner.y
+    rays.push({ inner, angle: Math.atan2(dy, dx) })
+  }
+  if (rays.length < 5) return false
+  const bins = new Set(rays.map((r) => Math.round((((r.angle + Math.PI) / (Math.PI * 2)) * 10) % 10)))
+  if (bins.size < 4) return false
+  const innerBox = aabb(rays.map((r) => r.inner))
+  const innerSpan = Math.hypot(innerBox.w, innerBox.h)
+  const outerSpan = Math.hypot(box.w, box.h)
+  return innerSpan < outerSpan * 0.58
+}
+
+/** Shaft plus optional arrowhead, or a single long pointing stroke. */
+export function looksLikeArrowGesture(strokes) {
+  const list = (strokes || []).filter((s) => s?.length >= 2)
+  if (!list.length || list.length > 6) return false
+  if (looksLikeRadialBurst(list)) return false
+  let best = null
+  for (const s of list) {
+    const len = pathLength(s)
+    const box = aabb(s)
+    const chord = dist(s[0], s[s.length - 1])
+    if (len < 70 || chord < 56) continue
+    if (len > chord * 2.4) continue
+    const aspect = Math.max(box.w, box.h) / Math.max(1, Math.min(box.w, box.h))
+    if (aspect < 1.8) continue
+    if (!best || len > best.len) best = { s, len, chord }
+  }
+  if (!best) return false
+  const end = best.s[best.s.length - 1]
+  const heads = list.filter((s) => {
+    if (s === best.s) return false
+    const nearEnd = dist(s[0], end) < 42 || dist(s[s.length - 1], end) < 42
+    return nearEnd && pathLength(s) < best.len * 0.55
+  })
+  return heads.length >= 1 || (list.length <= 2 && best.chord > 90)
+}
+
+export function looksLikeUnderlineGesture(strokes) {
+  const list = (strokes || []).filter((s) => s?.length >= 2)
+  if (!list.length || list.length > 3) return false
+  if (looksLikeRadialBurst(list) || looksLikeArrowGesture(list)) return false
+  return list.every((s) => {
+    const box = aabb(s)
+    const len = pathLength(s)
+    return box.w > 36 && box.w > box.h * 3.2 && len < box.w * 2.2
+  })
+}
+
 /** Long stroke that is a line (not a closed lasso, X, or small box). */
 export function looksLikeDrawnLine(pts) {
   if (!pts || pts.length < 6) return false

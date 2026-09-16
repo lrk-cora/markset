@@ -141,7 +141,7 @@ export function setColorMode(on) {
 function uiTarget(e) {
   const el = e.target instanceof Element ? e.target : e.target.parentElement
   return el?.closest?.(
-    '.hl-handle, .img-handle, .badge, .scheme-tag, .toolbar, .novice-card, .card-guesses, .topbar, .inspector, .suggest, .confirm, .change-badge, .coach, [data-guess-index]',
+    '.hl-handle, .img-handle, .badge, .scheme-tag, .toolbar, .novice-card, .card-guesses, .topbar, .inspector, .suggest, .confirm, .change-badge, .change-toggle, .coach, [data-guess-index]',
   )
 }
 
@@ -270,7 +270,8 @@ export function bindLasso({ onBegin, onMove, onFinish, onCancel }) {
     })
     const color = drawColor({ erase: subtractHeld || subtractMode, shiftHeld })
     if (persist !== false) {
-      keepPaintMark(points, { append: (shiftHeld && !subtractHeld) || isLayoutPen(), color })
+      const append = Boolean(persist?.append) || (shiftHeld && !subtractHeld) || isLayoutPen()
+      keepPaintMark(points, { append, color })
     }
     clearSvg()
   }

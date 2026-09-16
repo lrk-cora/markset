@@ -1,5 +1,5 @@
 import { isClientModelGateOn, planIntent, planOps } from './api.js'
-import { captureAnnotationScene, captureMarkedPage } from './capture.js'
+import { captureAnnotationScene, captureMarkedPage, classifyDrawnGesture } from './capture.js'
 import { intersectBoxes } from './geometry.js'
 import { imageSpanFromNaturalBox, normalizeVisionBox } from './hit-test.js'
 import { appendSpans, getSnapshot, replaceCommandText } from './store.js'
@@ -149,48 +149,82 @@ function normalizeGuesses(json, data) {
   return out.slice(0, 4)
 }
 
-export async function guessAnnotationIntent(editor, notify, { silent = false, more = false, exclude = [], handwriting = '' } = {}) {
+function shortHandwriting(value) {
+  let t = String(value || '').trim()
+  if (!t) return ''
+  if (t.startsWith('{') || t.startsWith('[')) {
+    const json = parseVisionJson(t)
+    t = String(json?.text || json?.handwriting || '').trim()
+  }
+  t = t.replace(/\s+/g, '').replace(/^["'`「」『』]+|["'`「」『』]+$/g, '')
+  if (!t || t.length > 24) return ''
+  return t
+}
+
+async function readHandwritingVl(scene) {
+  const images = scene.ocrImageDataUrls?.length
+    ? scene.ocrImageDataUrls.slice(0, 1)
+    : [scene.inkDataUrl].filter(Boolean).slice(0, 1)
+  if (!images.length) return ''
+  try {
+    const data = await planIntent({
+      task: 'ink',
+      instruction: '只识别图中的手写汉字，按书写顺序原样输出。不要解释，不要把圈线认成字。没有手写就输出空。',
+      imageDataUrl: images[0],
+      imageDataUrls: images,
+    })
+    return shortHandwriting(data?.handwriting || data?.text)
+  } catch {
+    return ''
+  }
+}
+
+export async function guessAnnotationIntent(editor, notify, { silent = false, more = false, exclude = [], handwriting = '', sceneText = '' } = {}) {
   if (!silent && running) return null
   if (!silent) running = true
-  if (!silent) notify?.('正在理解批注…')
+  if (!silent) notify?.('正在认出批注…')
   try {
     const scene = await captureAnnotationScene(editor)
     if (!scene.imageDataUrls?.length && !scene.imageDataUrl) {
       if (!silent) notify?.('没有可看的批注画面')
       return null
     }
+    const ocr = await readHandwritingVl(scene)
+    const written = ocr || shortHandwriting(handwriting)
+    const gesture = classifyDrawnGesture()
     const skip = (exclude || []).filter(Boolean).join('；')
-    const written = String(handwriting || '').trim()
     const instruction = [
-      '必须同时看「画的部分」和「写的部分」。',
-      '第一张图是网页加上用户全部笔迹。圈落在哪一块，就只针对那一块，不要因为页面上有大Logo就猜成改Logo。',
-      '若圈里是字，就改这些字；若圈里是图，就改这张图；若字和图都圈到了，就两类一起改。',
-      '若圈在空白处或只是自画图形，不要猜成主Logo操作。',
-      written ? `本地已经认出的字：${written}。以它为线索，再结合画落在哪一块来理解。` : '如果有手写，先识别成中文，再和圈/涂的位置合在一起判断。',
-      '例如：圈了图标并写「删」=删掉该图标；只圈了「搜狗搜索」四字并写改红色=只改这几个字的颜色；圈了字和图=两类一起改。',
-      more
-        ? '再给出 3 到 4 条不同的可能操作，不要重复已经给过的。'
-        : '给出 3 到 4 条最可能的操作，按可能性从高到低。',
+      '你是批注理解器。先确认手写字，再看蓝色圈/黑色画落在网页哪一块，两者合在一起才给出操作。',
+      '图1白底笔迹（蓝=圈，黑=手写或自画图案）。图2笔迹特写。图3圈选区域。图4整页。认字以图1、图2为准。',
+      written
+        ? `手写已读出：「${written}」。第一条猜测必须对应该字的含义，不要改认成别的字。`
+        : gesture.kind
+          ? `没有手写汉字。画法已判定为 ${gesture.kind}：${gesture.hint} 第一条猜测必须是 id=${gesture.kind}，label 用「${gesture.label}」。不要猜成插入文字，不要猜成清除涂鸦/删除笔画。`
+          : '没有手写时根据画法判断：叉/涂掉→delete；下划线→underline；箭头或一圈物体+一圈空白→move-layout；画出的图案/放射线/星星/涂鸦图形→stamp，把图案贴到所画位置。不要因为旁边有空白圈就默认插入文字。',
+      '圈落在哪一块就改哪一块：圈字改字，圈图改图。若黑色线围着 Logo 散开，目标是该 Logo 周围的装饰，不是空白插入。',
+      '按手写语义映射，例如：删/叉/×/不要→delete；红/蓝/绿/改色→color；缩小/变小→scale-down；放大→scale-up；阴影→shadow；倒影→reflect；加框→frame；加/插入且圈在空白且没有自画图案→insert-text；往右→nudge-right。手写是别的词就按该词理解，不要默认成删除或插入。',
+      sceneText ? `几何场景：${sceneText}` : '',
+      more ? '再给出 3 到 4 条不同操作，不要重复已给过的。' : '给出 3 到 4 条最可能的操作，按可能性从高到低。有手写时第一条必须对应手写；无手写时第一条必须对应画法。',
       skip ? `不要再给出这些：${skip}` : '',
-      'label 用一句短中文，像在跟用户确认。JSON 里 text 填识别出的手写。command 有具体颜色就填颜色名（如红色）。',
+      'label 用一句短中文确认。command 有具体值就填（红色、缩小一点）。',
     ]
       .filter(Boolean)
-      .join('')
+      .join('\n')
     const data = await planIntent({
       task: 'intent',
       instruction,
       handwriting: written,
       marks: scene.marks,
       pageText: scene.pageText,
-      imageDataUrl: scene.combinedDataUrl || scene.imageDataUrls[0] || scene.imageDataUrl,
+      imageDataUrl: scene.imageDataUrls[0] || scene.imageDataUrl,
       imageDataUrls: scene.imageDataUrls,
     })
-    const json = parseVisionJson(data?.text) || data
+    const json = parseVisionJson(data?.text) || {}
     const guesses = normalizeGuesses(json, data)
-    const text = String(json?.text || json?.guess || data?.guess || written || guesses[0]?.label || '').trim()
-    const note = String(json?.note || data?.note || guesses[0]?.note || '').trim()
-    const command = String(json?.command || data?.command || guesses[0]?.command || '').trim()
-    const intent = String(json?.intent || data?.intent || guesses[0]?.id || '').trim()
+    const text = written || shortHandwriting(json.text || json.handwriting || data.handwriting)
+    const note = String(json.note || data.note || guesses[0]?.note || parseNoteSafe(text) || '').trim()
+    const command = String(json.command || data.command || guesses[0]?.command || '').trim()
+    const intent = String(json.intent || data.intent || guesses[0]?.id || '').trim()
     if (!guesses.length && !text && !note && !intent) {
       if (!silent) notify?.('没看懂这批注')
       return null
@@ -198,10 +232,11 @@ export async function guessAnnotationIntent(editor, notify, { silent = false, mo
     return {
       guesses,
       text: text || note || intent,
-      note: note || intent,
+      note: note || parseNoteSafe(text) || intent,
       command,
       intent,
       confident: true,
+      fromModel: true,
     }
   } catch (err) {
     if (err.code === 'client-gate' || err.code === 'calls_disabled' || err.code === 'no_client_gate') return null
@@ -210,6 +245,22 @@ export async function guessAnnotationIntent(editor, notify, { silent = false, mo
   } finally {
     if (!silent) running = false
   }
+}
+
+function parseNoteSafe(text) {
+  const t = String(text || '').replace(/\s+/g, '')
+  if (!t) return ''
+  if (/删|叉|×|不要|去掉这块/.test(t)) return 'delete'
+  if (/缩小|变小/.test(t)) return 'scale-down'
+  if (/放大|变大/.test(t)) return 'scale-up'
+  if (/倒影/.test(t)) return 'reflect'
+  if (/阴影|投影/.test(t)) return 'shadow'
+  if (/加框|边框/.test(t)) return 'frame'
+  if (/插入|加字|加点|加东西/.test(t)) return 'insert-text'
+  if (/加图/.test(t)) return 'insert-image'
+  if (/红|蓝|绿|色/.test(t)) return 'color'
+  if (/加|插|添/.test(t)) return 'add'
+  return ''
 }
 
 export async function guessInkIntent(notify) {

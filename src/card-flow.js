@@ -1,5 +1,6 @@
 import { DEMO_CUP, getDemoPage, pageRelativeRect } from './editor.js'
 import { COLOR_TERMS } from './forbidden.js'
+import { COLORS, COLOR_SCHEMES } from './colors.js'
 import { parseCommand } from './plan-local.js'
 import { guessAnnotationIntent } from './vision-tasks.js'
 import { aabb, convexHull, dist, intersectBoxes, looksLikeDrawnLine, pathLength, strokeToPolygon } from './geometry.js'
@@ -25,19 +26,27 @@ import {
   applyWebReflect,
   applyWebScale,
   applyWebShadow,
+  describePaintScene,
   executeCircledOp,
+  inferWebLayoutPairs,
+  insertWebImage,
+  insertWebStamp,
+  insertWebText,
   isWebDocActive,
+  lassoPolys,
   listWebEdits,
   popLastWebEdit,
+  popWebEditsSince,
   redoWebEdit,
   refreshWebTargetsFromDrawing,
   restoreWebEdit,
   restoreWebHtml,
   snapshotWebHtml,
 } from './web-doc.js'
-import { clearPaintMarks, getPaintMarks, keepPaintMark, setSubtractMode } from './overlay.js'
+import { clearPaintMarks, getPaintMarks, setSubtractMode } from './overlay.js'
 import { redoChange, restoreChange } from './changes.js'
-import { clearInk, getInkStrokes, readInkText } from './ink.js'
+import { clearInk, readInkText } from './ink.js'
+import { classifyDrawnGesture, drawnStampDataUrl, drawnStampScreenBox, looksLikeDrawnPattern } from './capture.js'
 import {
   applyPageScheme,
   assignSchemeToModules,
@@ -94,10 +103,24 @@ const LOCAL_ANNO = new Set([
 const PAGE_LINE = new Set(LINE_KIND_IDS)
 
 const LOCAL_LABELS = {
+  'insert-text': '插入文字',
+  'insert-image': '插入图片',
+  deco: '加装饰',
   indent: '空两格',
   'move-layout': '挪位置',
-  'move-nudge': '对齐间距',
+  'move-nudge': '挪一点',
+  'nudge-left': '往左挪',
+  'nudge-right': '往右挪',
+  'nudge-up': '往上挪',
+  'nudge-down': '往下挪',
   shadow: '阴影',
+  'clear-deco': '去掉装饰',
+  'delete-deco': '去掉装饰',
+  soften: '减弱装饰',
+  'color-bg': '改底色',
+  'color-text': '改字色',
+  'color-image': '改图颜色',
+  stamp: '加上画出的图案',
   'scale-down': '缩小',
   'scale-up': '放大',
   underline: '下划线',
@@ -195,7 +218,7 @@ export function undoLastLocalAction(editor) {
   if ('pagePaper' in snap) setPagePaper(snap.pagePaper)
   if (snap.webHtml != null) {
     restoreWebHtml(snap.webHtml)
-    popLastWebEdit()
+    popWebEditsSince(snap.at)
   }
   clearSchemeUi()
   if (ui.step === 'values' || ui.step === 'review') {
@@ -245,6 +268,7 @@ let ui = {
   guessing: false,
   judged: false,
   seenGuessLabels: [],
+  fromModel: false,
 }
 
 let guessToken = 0
@@ -313,6 +337,7 @@ function cancelGuesses() {
   ui.guesses = []
   ui.judged = false
   ui.seenGuessLabels = []
+  ui.fromModel = false
 }
 
 export function resetCardForNewSelection() {
@@ -346,9 +371,18 @@ export function keepCardForAppend() {
 }
 
 export function startReview() {
-  ui.step = 'review'
+  cancelGuesses()
+  ui.step = 'idle'
   ui.intent = null
-  ui.schemeSlot = null
+  ui.hideCard = true
+  ui.note = ''
+  ui.noteText = ''
+  ui.noteConfident = false
+  ui.lastPaint = null
+  clearInk()
+  clearPaintMarks()
+  replaceSpans([])
+  emit()
 }
 
 export function idleCard({ accept = false } = {}) {
@@ -454,18 +488,65 @@ export function markCrossOut() {
   emit()
 }
 
+function colorFromWriting(text) {
+  const t = String(text || '').replace(/\s+/g, '')
+  if (!t) return ''
+  const named = COLORS.find((c) => t.includes(c.id))
+  if (named) return named.id
+  const alias = [
+    ['红色', '红色'],
+    ['红色', '红'],
+    ['雾蓝', '蓝色'],
+    ['雾蓝', '蓝'],
+    ['墨绿', '绿色'],
+    ['墨绿', '绿'],
+    ['黑色', '黑'],
+    ['白色', '白'],
+    ['姜黄', '黄'],
+    ['粉色', '粉'],
+    ['落日', '橙'],
+    ['暮紫', '紫'],
+    ['岩灰', '灰'],
+  ]
+  for (const [id, key] of alias) {
+    if (t.includes(key)) return id
+  }
+  return ''
+}
+
 function parseNote(text) {
   const t = String(text || '')
     .replace(/\s+/g, '')
     .trim()
   if (!t) return ''
   if (t === '×' || t === 'x' || t === 'X') return 'delete'
-  if (/倒影|镜像|反射/.test(t)) return 'reflect'
-  if (/阴影|投影|影子/.test(t)) return 'shadow'
+  if (/去掉(阴影|倒影|投影|框|边框|装饰|标注|高亮|下划线|批注)|取消(阴影|倒影|框|装饰)|不要(阴影|倒影|框)/.test(t)) return 'clear-deco'
+  if (/减弱.*(阴影|装饰|投影)|淡化阴影/.test(t)) return 'soften'
+  if (/倒影|镜像|反射/.test(t) && !/去|删|消/.test(t)) return 'reflect'
+  if (/阴影|投影|影子/.test(t) && !/去|删|消/.test(t)) return 'shadow'
+  if (/风格|配色|整套色|统一色/.test(t)) return 'scheme'
+  if (/图案|贴上这个|加上这个画|画上去|加上画出/.test(t)) return 'stamp'
   if (/缩小|变小|小一点|缩小一点|更小/.test(t)) return 'scale-down'
   if (/放大|变大|大一点|放大一点|更大/.test(t)) return 'scale-up'
+  if (/底色|背景色|改背景|背景改/.test(t)) return 'color-bg'
+  if (/字色|文字颜色|字体颜色|只改字/.test(t)) return 'color-text'
+  if (/只改(图|logo|图标).*色|图.*改成/.test(t) && /色/.test(t)) return 'color-image'
+  if (/往左|向左|左移|向左挪/.test(t)) return 'nudge-left'
+  if (/往右|向右|右移|向右挪/.test(t)) return 'nudge-right'
+  if (/往上|向上|上移|往上挪/.test(t)) return 'nudge-up'
+  if (/往下|向下|下移|往下挪/.test(t)) return 'nudge-down'
+  if (/挪位置|移到|放到|换位置/.test(t)) return 'move-layout'
+  if (/加粗/.test(t)) return 'bold'
+  if (/高亮/.test(t)) return 'highlight'
+  if (/下划线/.test(t)) return 'underline'
+  if (/加框|套个框|加边框|加个框/.test(t)) return 'frame'
+  if (/加图|插图|贴图|插入图片/.test(t)) return 'insert-image'
+  if (/加字|加点|加上|加个|插入|写一句|放一张|空白.*加|这里加|加东西/.test(t)) return 'insert'
   if (/改颜色|改色|换色|变色|颜色|配色|上色|着色|染色/.test(t)) return 'color'
+  if (/^[红蓝绿黄黑白灰橙紫粉]$/.test(t) || /改成.{0,2}[红蓝绿黄黑白灰橙紫粉]|[红蓝绿黄]色/.test(t)) return 'color'
   if (/色|彩/.test(t) && !/删|去|减/.test(t)) return 'color'
+  if (/只删(字|文字)|删掉这些字/.test(t)) return 'delete-text'
+  if (/只删(图|图片)|删掉这块图/.test(t)) return 'delete-image'
   if (/删|叉|去|消|隐藏|去掉|删掉|不要了|抹掉|擦掉这个/.test(t)) return 'delete'
   if (/减|短|少|精简/.test(t)) return 'cut'
   if (/添|加|插|扩/.test(t)) return 'add'
@@ -486,8 +567,21 @@ export function applyWrittenNote(text, { confident = false, note, silent = false
 export function shouldTreatStrokeAsInk(pts) {
   if (ui.step !== 'propose') return false
   const spans = getSnapshot().spans
-  if (!spans.some((s) => s.kind === 'text' || s.kind === 'image' || s.kind === 'slot')) return false
   if (layoutSourceWaiting(spans) || looksLikeLayout(spans) || hasLayoutWork(spans)) return false
+  if (pts?.length >= 8) {
+    const box = aabb(pts)
+    const peri = 2 * (box.w + box.h)
+    const len = pathLength(pts)
+    const closed = dist(pts[0], pts[pts.length - 1]) < Math.max(box.w, box.h) * 0.35
+    if (closed && box.w > 36 && box.h > 28 && len < peri * 2.5) return false
+    const insidePaint = getPaintMarks().some((mark) => {
+      if (!mark.points?.length) return false
+      const pb = aabb(mark.points)
+      return box.w < 280 && box.h < 280 && box.x >= pb.x - 24 && box.y >= pb.y - 24 && box.x + box.w <= pb.x + pb.w + 24 && box.y + box.h <= pb.y + pb.h + 24
+    })
+    if (insidePaint) return true
+  }
+  if (!spans.some((s) => s.kind === 'text' || s.kind === 'image' || s.kind === 'slot')) return false
   if (pts?.length >= 8) {
     const box = aabb(pts)
     const peri = 2 * (box.w + box.h)
@@ -550,16 +644,45 @@ export function eraseWrittenNote() {
   emit()
 }
 
+function sceneIsBlank() {
+  try {
+    if (isWebDocActive()) return Boolean(describePaintScene().blank)
+  } catch {
+    /* ignore */
+  }
+  const spans = getSnapshot().spans
+  const { texts, images, slots } = selectionKinds(spans)
+  return Boolean((slots.length || looksLikeCircledRegion(spans)) && !texts.length && !images.length)
+}
+
+function verbFamily(note) {
+  const n = String(note || '')
+  if (n === 'add' || n === 'insert' || n === 'insert-text' || n === 'insert-image' || n === 'deco' || n === 'frame' || n === 'circle' || n === 'shadow' || n === 'reflect') {
+    return 'add'
+  }
+  if (n.startsWith('delete') || n === 'clear-deco' || n === 'clear-anno') return 'delete'
+  if (n === 'scheme' || n.startsWith('color')) return 'color'
+  if (n.startsWith('scale')) return 'scale'
+  if (n.startsWith('nudge') || n === 'move-layout') return 'move'
+  return ''
+}
+
 function mapNoteToIntent(note, label) {
   const n = String(note || parseNote(label) || '').trim()
-  if (n === 'delete') return 'delete'
-  if (n === 'color') return 'color'
-  if (n === 'shadow') return 'shadow'
-  if (n === 'reflect') return 'reflect'
+  if (n === 'delete' || n === 'delete-text' || n === 'delete-image') return n
+  if (n === 'clear-deco' || n === 'delete-deco' || n === 'soften') return n === 'delete-deco' ? 'clear-deco' : n
+  if (n === 'insert' || n === 'insert-text') return 'insert-text'
+  if (n === 'insert-image') return 'insert-image'
+  if (n === 'add') return sceneIsBlank() ? 'insert-text' : 'frame'
+  if (n === 'color' || n === 'color-bg' || n === 'color-text' || n === 'color-image') return n
+  if (n === 'scheme') return 'scheme'
+  if (n === 'stamp') return 'stamp'
+  if (n === 'shadow' || n === 'reflect') return n
   if (n === 'scale-down' || n === 'scale-up') return n
+  if (n.startsWith('nudge-') || n === 'move-nudge' || n === 'move-layout') return n
+  if (n === 'frame' || n === 'bold' || n === 'highlight' || n === 'underline') return n
   if (n === 'indent' || n === 'move') return n === 'move' ? 'move-layout' : 'indent'
   if (n === 'cut') return 'shorter'
-  if (n === 'add') return 'frame'
   if (n === 'change') return 'polish'
   return 'custom'
 }
@@ -568,7 +691,20 @@ const GUESS_IDS = new Set([
   'delete',
   'delete-image',
   'delete-text',
+  'delete-deco',
+  'clear-deco',
+  'clear-anno',
+  'soften',
   'color',
+  'color-bg',
+  'color-text',
+  'color-image',
+  'scheme',
+  'stamp',
+  'insert-text',
+  'insert-image',
+  'insert',
+  'deco',
   'name',
   'name-color',
   'polish',
@@ -581,6 +717,11 @@ const GUESS_IDS = new Set([
   'scale-up',
   'indent',
   'move-layout',
+  'move-nudge',
+  'nudge-left',
+  'nudge-right',
+  'nudge-up',
+  'nudge-down',
   'strike',
   'longer',
   'shorter',
@@ -607,6 +748,10 @@ const ID_ALIASES = {
   改色: 'color',
   改颜色: 'color',
   颜色: 'color',
+  配色: 'scheme',
+  风格: 'scheme',
+  图案: 'stamp',
+  stamp: 'stamp',
   阴影: 'shadow',
   倒影: 'reflect',
   shrink: 'scale-down',
@@ -616,6 +761,16 @@ const ID_ALIASES = {
   放大: 'scale-up',
   rewrite: 'polish',
   改字: 'polish',
+  'delete-deco': 'clear-deco',
+  去掉装饰: 'clear-deco',
+  'clear-deco': 'clear-deco',
+  往左: 'nudge-left',
+  往右: 'nudge-right',
+  往上: 'nudge-up',
+  往下: 'nudge-down',
+  插入: 'insert-text',
+  加字: 'insert-text',
+  加图: 'insert-image',
 }
 
 function canonicalizeGuessId(id, label, note) {
@@ -635,14 +790,40 @@ function normalizeGuessItem(item) {
     return { id: mapNoteToIntent(note, label), label, note, command: '' }
   }
   const label = String(item.label || item.guess || item.text || '').trim()
-  const note = String(item.note || parseNote(label) || '').trim()
+  const parsedLabel = parseNote(label)
+  const note = String(
+    parsedLabel && parsedLabel !== 'custom' && parsedLabel !== 'change'
+      ? parsedLabel
+      : item.note || parsedLabel || '',
+  ).trim()
   const command = String(item.command || '').trim()
   const fromText = mapNoteToIntent(note, label)
   let id = canonicalizeGuessId(item.id || item.intent, label, note)
   if ((id === 'custom' || id === 'polish' || id === 'shorter') && fromText !== 'custom') id = fromText
-  if (fromText === 'scale-down' || fromText === 'scale-up' || fromText === 'delete' || fromText === 'shadow' || fromText === 'reflect') {
+  if (
+    fromText === 'scale-down' ||
+    fromText === 'scale-up' ||
+    fromText === 'delete' ||
+    fromText === 'delete-text' ||
+    fromText === 'delete-image' ||
+    fromText === 'shadow' ||
+    fromText === 'reflect' ||
+    fromText === 'clear-deco' ||
+    fromText === 'soften' ||
+    fromText === 'insert' ||
+    fromText === 'insert-text' ||
+    fromText === 'insert-image' ||
+    fromText === 'add' ||
+    fromText === 'color-bg' ||
+    fromText === 'color-text' ||
+    fromText === 'scheme' ||
+    fromText === 'stamp' ||
+    String(fromText).startsWith('nudge-')
+  ) {
     id = fromText
   }
+  if (id === 'add') id = sceneIsBlank() ? 'insert-text' : 'frame'
+  if (id === 'insert') id = 'insert-text'
   if (!label && !id) return null
   return { id, label: label || localLabel(id) || '按这个改', note, command }
 }
@@ -653,6 +834,8 @@ function ptsToPoly(pts) {
 }
 
 function collectDrawingPolys() {
+  const fromLasso = lassoPolys()
+  if (fromLasso.length) return fromLasso
   const polys = []
   const add = (pts) => {
     const poly = ptsToPoly(pts)
@@ -660,10 +843,6 @@ function collectDrawingPolys() {
   }
   add(ui.lastPaint)
   for (const mark of getPaintMarks()) add(mark.points)
-  for (const stroke of getInkStrokes()) add(stroke)
-  for (const span of getSnapshot().spans) {
-    if (span.poly?.length) polys.push(span.poly)
-  }
   return polys
 }
 
@@ -685,6 +864,124 @@ function ensureTargetsForGuess() {
   return merged
 }
 
+function uniqueGuesses(list) {
+  const out = []
+  const seen = new Set()
+  for (const g of list || []) {
+    if (!g?.id && !g?.label) continue
+    const key = `${g.id}::${g.label}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    out.push(g)
+  }
+  return out
+}
+
+function sceneLabel(scene) {
+  if (scene?.kind === 'image') return '圈中这块图'
+  if (scene?.kind === 'text') return '圈中这些字'
+  if (scene?.kind === 'mixed') return '圈中这块'
+  return '圈中这块'
+}
+
+function relabelGuesses(list, scene, verb) {
+  const target = sceneLabel(scene)
+  const mapped = (list || []).map((g) => {
+    let label = String(g.label || '')
+    if (!scene?.blank) {
+      label = label
+        .replace(/圈中空白区域内容/g, target)
+        .replace(/空白区域内容/g, target)
+        .replace(/空白区域/g, target)
+        .replace(/圈里的空白处/g, target)
+        .replace(/空白处/g, target)
+    }
+    return { ...g, label }
+  })
+  const fam = verbFamily(verb) || verbFamily(mapped[0]?.id) || verbFamily(mapped[0]?.note)
+  const prefer = []
+  if (looksLikeStampGuess(verb, ui.noteText, mapped)) {
+    const gesture = classifyDrawnGesture()
+    prefer.push({ id: 'stamp', label: gesture.label || '加上画出的图案', note: 'stamp', command: '' })
+  }
+  if (inferWebLayoutPairs().length || verb === 'move-layout' || fam === 'move') {
+    prefer.push({ id: 'move-layout', label: '把圈中模块移到另一圈的位置', note: 'move-layout', command: '' })
+  }
+  if (fam === 'scale' || verb === 'scale-down' || verb === 'scale-up') {
+    const id = verb === 'scale-up' ? 'scale-up' : 'scale-down'
+    prefer.push({
+      id,
+      label: id === 'scale-down' ? `缩小${target}` : `放大${target}`,
+      note: id,
+      command: '',
+    })
+  }
+  if (fam === 'color' || String(verb).startsWith('color') || verb === 'scheme') {
+    const mods = collectSchemeModules(guessRuntime.editor, { pageWide: false }).filter((m) => m.kind !== 'paper')
+    if (verb === 'scheme' || mods.length >= 2) {
+      prefer.push({ id: 'scheme', label: '给圈中几处套一套颜色风格', note: 'scheme', command: '' })
+    }
+    prefer.push({ id: verb.startsWith('color-') ? verb : 'color', label: `改${target}的颜色`, note: verb.startsWith('color-') ? verb : 'color', command: '' })
+  }
+  if (!prefer.length) return uniqueGuesses(mapped).slice(0, 4)
+  const rest = mapped.filter((g) => !prefer.some((p) => p.id === g.id))
+  return uniqueGuesses([...prefer, ...rest]).slice(0, 4)
+}
+
+function looksLikeStampGuess(verb, written, list = []) {
+  const t = String(written || '')
+  if (/图案|贴上这个|加上这个画|画上去|加上画出|光芒|放射/.test(t) || verb === 'stamp') return true
+  if (list.some((g) => String(g.id) === 'stamp' || /画出的图案|加上这个图案|光芒/.test(g.label || ''))) return true
+  if (!isWebDocActive()) return false
+  const gesture = classifyDrawnGesture()
+  if (gesture.kind === 'stamp') return true
+  if (!looksLikeDrawnPattern()) return false
+  const note = parseNote(t)
+  if (t && note && note !== 'custom' && note !== 'insert' && note !== 'add' && note !== 'stamp') return false
+  return true
+}
+
+function reconcileGuesses(vl, local, verb, scene) {
+  const gesture = classifyDrawnGesture()
+  const vlNorm = uniqueGuesses(vl || [])
+  if (gesture.kind === 'stamp') {
+    const stamp = { id: 'stamp', label: gesture.label || '加上画出的图案', note: 'stamp', command: '' }
+    const rest = vlNorm.filter(
+      (g) =>
+        g.id !== 'stamp' &&
+        g.id !== 'insert-text' &&
+        g.id !== 'insert-image' &&
+        !/插入文字|涂鸦装饰|多余笔画|清除此处/.test(g.label || ''),
+    )
+    const later = vlNorm.filter((g) => g.id === 'insert-text' || g.id === 'insert-image')
+    return uniqueGuesses([stamp, ...rest, ...later]).slice(0, 4)
+  }
+  if (gesture.kind === 'move-layout') {
+    const move = { id: 'move-layout', label: gesture.label, note: 'move-layout', command: '' }
+    return relabelGuesses(uniqueGuesses([move, ...vlNorm, ...(local || [])]), scene, 'move-layout')
+  }
+  if (gesture.kind === 'underline') {
+    const line = { id: 'underline', label: gesture.label, note: 'underline', command: '' }
+    return uniqueGuesses([line, ...vlNorm]).slice(0, 4)
+  }
+  if (vlNorm.length) {
+    const vlFam = verbFamily(vlNorm[0].id) || verbFamily(vlNorm[0].note) || verbFamily(parseNote(vlNorm[0].label)) || verbFamily(verb)
+    if (scene?.blank && vlFam === 'add' && !scene?.drawn) {
+      const inserts = [
+        { id: 'insert-text', label: '在圈里的空白处插入文字', note: 'insert-text', command: '' },
+        { id: 'insert-image', label: '在圈里的空白处插入图片', note: 'insert-image', command: '' },
+      ]
+      return relabelGuesses(uniqueGuesses([...vlNorm, ...inserts]), scene, verb)
+    }
+    return relabelGuesses(vlNorm, scene, verb)
+  }
+  if (scene?.blank && verbFamily(verb) === 'add' && !scene?.drawn) {
+    return uniqueGuesses(local).slice(0, 4)
+  }
+  if (verb && local.length) return relabelGuesses(uniqueGuesses(local), scene, verb)
+  return relabelGuesses(local, scene, verb)
+}
+
 function localGuesses(spans, editor) {
   if (layoutSourceWaiting(spans) && !looksLikeLayout(spans) && !hasLayoutWork(spans)) {
     return [{ id: '', label: '再用同一颜色圈要放到的位置', note: '', command: '', wait: true }]
@@ -692,6 +989,8 @@ function localGuesses(spans, editor) {
   const opts = proposeOptions(spans, editor)
   const out = opts.slice(0, 4).map(([id, label]) => ({ id, label, note: ui.note, command: '' }))
   if (looksLikeLayout(spans) || hasLayoutWork(spans)) return out
+  const addLike = verbFamily(ui.note) === 'add'
+  if (addLike) return out
   const extra = [
     { id: 'delete', label: '删掉圈中这块', note: 'delete', command: '' },
     { id: 'color', label: '改圈中内容的颜色', note: 'color', command: '' },
@@ -713,6 +1012,10 @@ export function requestIntentGuesses(editor, { more = false } = {}) {
     ui.guesses = []
     ui.judged = false
     ui.seenGuessLabels = []
+    ui.fromModel = false
+    ui.note = ''
+    ui.noteText = ''
+    ui.noteConfident = false
   }
   emit()
   runIntentGuesses(editor, token, { more })
@@ -724,29 +1027,47 @@ export function scheduleIntentGuesses(editor) {
 
 async function runIntentGuesses(editor, token, { more = false } = {}) {
   const seen = new Set((ui.seenGuessLabels || []).map((s) => String(s).trim()))
-  const local = localGuesses(getSnapshot().spans, editor).filter((g) => !seen.has(g.label))
   if (token !== guessToken) return
+  let local = []
   try {
-    const localInk = readInkText()
-    if (localInk.text) applyWrittenNote(localInk.text, { confident: localInk.confident, silent: true })
-    const handwriting = [ui.noteText, localInk.text].filter(Boolean).join('')
+    const scene = isWebDocActive() ? describePaintScene() : { blank: sceneIsBlank(), text: '' }
+    const gesture = classifyDrawnGesture()
     const hit = await guessAnnotationIntent(editor, null, {
       silent: true,
       more,
       exclude: [...seen],
-      handwriting,
+      handwriting: '',
+      sceneText: [scene.text, gesture.hint].filter(Boolean).join('\n'),
     })
     if (token !== guessToken) return
+    const localInk = hit?.fromModel ? { text: '', confident: false } : readInkText()
+    let written = String(hit?.text || (localInk.confident ? localInk.text : '') || '').trim()
+    if (
+      gesture.kind &&
+      (!written ||
+        written.length <= 2 ||
+        /涂鸦|笔画/.test(written) ||
+        ['custom', 'add', 'insert', 'change'].includes(parseNote(written)))
+    ) {
+      written = ''
+    }
+    const parsed = parseNote(written)
+    const verb = (parsed && parsed !== 'custom' ? parsed : '') || gesture.kind || hit?.note || ui.note
+    if (written) applyWrittenNote(written, { confident: Boolean(hit?.fromModel || localInk.confident), note: verb, silent: true })
+    local = localGuesses(getSnapshot().spans, editor).filter((g) => !seen.has(g.label))
     let next = (hit?.guesses || []).map(normalizeGuessItem).filter(Boolean)
     next = next.filter((g) => g.label && !seen.has(g.label))
+    next = reconcileGuesses(next, local, verb, scene)
     if (!next.length) next = local.slice(0, 4)
     ui.guesses = next.slice(0, 4)
     ui.judged = true
     ui.seenGuessLabels = [...seen, ...ui.guesses.map((g) => g.label)]
     if (hit?.command) replaceCommandText(hit.command)
-    if (hit?.note) ui.note = hit.note
-    if (hit?.text) ui.noteText = hit.text
-    ui.noteConfident = Boolean(hit?.text || next.length)
+    if (hit?.fromModel) ui.note = verb || hit.note || ui.note
+    else if (verb) ui.note = verb
+    if (written) ui.noteText = written
+    ui.noteConfident = Boolean(hit?.fromModel || written)
+    ui.fromModel = Boolean(hit?.fromModel)
   } catch {
     if (token !== guessToken) return
     ui.guesses = local.slice(0, 4)
@@ -763,17 +1084,23 @@ async function runIntentGuesses(editor, token, { more = false } = {}) {
         : ui.guesses.length
           ? '判断好了。点一项执行；不满意可再要几条'
           : '没看懂这次笔迹，可再画一点后重新判断'
-      guessRuntime.deps?.toast?.(msg)
+      if (!more && ui.guesses.length && ui.fromModel) {
+        const heard = ui.noteText ? `已认出「${ui.noteText}」` : '已按圈和笔迹判断'
+        guessRuntime.deps?.toast?.(`${heard}，并给出操作。点一项执行`)
+      } else {
+        guessRuntime.deps?.toast?.(msg)
+      }
     }
   }
 }
 
 function guessNeedsValue(id, command) {
   if (String(id).startsWith('delete')) return false
-  if (LOCAL_ANNO.has(id) || id === 'clear-anno' || id === 'indent' || id === 'move-layout' || id === 'shadow' || id === 'reflect' || id === 'scale-down' || id === 'scale-up' || id === 'trim' || id === 'background') {
+  if (LOCAL_ANNO.has(id) || id === 'clear-anno' || id === 'clear-deco' || id === 'delete-deco' || id === 'soften' || id === 'indent' || id === 'move-layout' || String(id).startsWith('nudge-') || id === 'move-nudge' || id === 'shadow' || id === 'reflect' || id === 'scale-down' || id === 'scale-up' || id === 'trim' || id === 'background' || id === 'color-bg' || id === 'color-text' || id === 'color-image') {
     return false
   }
   if (id === 'scheme' || id === 'insert-text' || id === 'insert-image') return true
+  if (id === 'stamp') return false
   if (needsColor(id) && !ui.color && !command) return true
   if (needsName(id) && !ui.productName.trim() && !command) return true
   if (id === 'custom' && !command && !ui.moreText.trim() && !ui.noteText.trim()) return true
@@ -792,41 +1119,66 @@ function applyGuess(guess, editor, deps) {
   guessToken += 1
   window.clearTimeout(scheduleIntentGuesses.timer)
   ui.guessing = false
-  for (const stroke of getInkStrokes()) {
-    if (stroke?.length >= 2) keepPaintMark(stroke, { append: true, color: '#1d1916' })
-  }
   const targetsNow = ensureTargetsForGuess()
-  clearInk()
-  const id = canonicalizeGuessId(guess.id, guess.label, guess.note)
+  const written = String(ui.noteText || guess.command || '').trim()
+  let id = canonicalizeGuessId(guess.id, guess.label, guess.note)
   const label = String(guess.label || '').trim()
   const command = String(guess.command || '').trim()
-  ui.note = guess.note || parseNote(label) || ui.note
-  ui.noteText = label || command || ui.noteText
+  ui.note = guess.note || parseNote(written) || parseNote(label) || ui.note
+  ui.noteText = written || label || command || ui.noteText
   ui.noteConfident = true
-  const parsed = parseCommand([command, label, ui.noteText].filter(Boolean).join(' '))
+  const parsed = parseCommand([written, command, label].filter(Boolean).join(' '))
   if (parsed.color) ui.color = parsed.color
+  else if (colorFromWriting(written) || colorFromWriting(label) || colorFromWriting(command)) {
+    ui.color = colorFromWriting(written) || colorFromWriting(label) || colorFromWriting(command)
+  }
   if (parsed.product && needsName(id)) ui.productName = parsed.product
   if (id === 'custom') ui.moreText = command || label
   if (command) replaceCommandText(command)
   else if (label) replaceCommandText(label)
 
   if (isWebDocActive()) {
-    const webOp = String(id).startsWith('delete')
-      ? id
-      : LOCAL_ANNO.has(id) || id === 'clear-anno' || id === 'shadow' || id === 'reflect' || id === 'scale-down' || id === 'scale-up' || id === 'color'
+    if (id === 'stamp') {
+      const src = drawnStampDataUrl()
+      const box = drawnStampScreenBox()
+      deps.toast(`正在执行：${label || '加上画出的图案'}`)
+      let result = { ok: false, reason: '没有可放下的图案' }
+      const ok = withLocalUndo(editor, '加上画出的图案', () => {
+        result = insertWebStamp(src, box)
+        return result.ok
+      })
+      if (!ok) {
+        deps.toast(result.reason || '没能放下画出的图案')
+        emit()
+        return
+      }
+      clearInk()
+      startReview()
+      emit()
+      deps.toast(result.message)
+      return
+    }
+    id = remapWebGuessId(id, written, label)
+    if (id === 'scheme' || id === 'deco' || id === 'unify' || id === 'pattern') {
+      applyDefaultScheme(editor, deps, { pageWide: /整页|整套|全部/.test(`${written}${label}`) })
+      return
+    }
+    const webOp = String(id).startsWith('delete') || String(id).startsWith('nudge-')
+      ? (id === 'delete-deco' ? 'clear-deco' : id)
+      : LOCAL_ANNO.has(id) || id === 'clear-anno' || id === 'clear-deco' || id === 'soften' || id === 'shadow' || id === 'reflect' || id === 'scale-down' || id === 'scale-up' || id === 'color' || id === 'color-bg' || id === 'color-text' || id === 'color-image' || id === 'move-nudge'
         ? id
         : ''
     if (webOp) {
-      if (webOp === 'color' && !parsed.color && !ui.color) {
-        ui.intent = 'color'
-        ui.step = 'values'
-        emit()
-        deps.toast('点色板里的颜色，页面会马上改')
+      const namedColor = parsed.color || ui.color || colorFromWriting(written) || colorFromWriting(label) || colorFromWriting(command)
+      if (String(webOp).startsWith('color') && !namedColor) {
+        openColorPalette(deps, webOp)
         return
       }
+      const paintColor = namedColor
+      if (String(webOp).startsWith('color')) ui.color = paintColor
       deps.toast(`正在执行：${label || localLabel(id)}`)
       const result = executeCircledOp(webOp, {
-        color: parsed.color || ui.color,
+        color: paintColor,
         label: label || localLabel(id),
         onBefore: (lab) => rememberLocal(editor, lab),
       })
@@ -835,6 +1187,7 @@ function applyGuess(guess, editor, deps) {
         emit()
         return
       }
+      clearInk()
       startReview()
       emit()
       deps.toast(result.message)
@@ -870,6 +1223,10 @@ function applyGuess(guess, editor, deps) {
   if (isWebDocActive() && !targetsNow.length && String(id).startsWith('delete')) {
     deps.toast('圈的位置没对上网页元素。请贴着图标或文字再画一圈')
     emit()
+    return
+  }
+  if (isWebDocActive() && (id === 'deco' || /风格|配色/.test(`${written}${label}`))) {
+    applyDefaultScheme(editor, deps, { pageWide: /整页|整套|全部/.test(`${written}${label}`) })
     return
   }
   applyCommandText()
@@ -1041,17 +1398,66 @@ function addChangeChoices(add, { texts, images }) {
 }
 
 function proposeOptions(spans, editor) {
-  const { texts, images, slots } = selectionKinds(spans)
-  const empty = Boolean(slots.length && !texts.length && !images.length)
+  let { texts, images, slots } = selectionKinds(spans)
+  const scene = isWebDocActive() ? describePaintScene() : { blank: false, kind: '' }
+  const empty = Boolean((slots.length && !texts.length && !images.length) || scene.blank)
+  if (scene.blank) {
+    texts = []
+    images = []
+  }
   const note = ui.note
   const bits = []
   const add = (id, label) => {
     if (!bits.some((b) => b[0] === id)) bits.push([id, label])
   }
 
-  if (hasLayoutWork(spans) || looksLikeLayout(spans) || layoutSourceWaiting(spans)) {
-    if (looksLikeLayout(spans)) add('move-layout', '移到画出的位置')
+  const layoutReady = looksLikeLayout(spans) || inferWebLayoutPairs().length
+  if (layoutReady) add('move-layout', '把圈中模块移到另一圈的位置')
+  if (layoutSourceWaiting(spans) && !layoutReady && (!note || note === 'move-layout')) return bits
+  if (layoutReady && (note === 'move-layout' || String(note).startsWith('nudge-') || note === 'move-nudge')) {
+    add(note.startsWith('nudge-') ? note : 'nudge-right', localLabel(note.startsWith('nudge-') ? note : 'nudge-right'))
+    add('nudge-left', '往左挪一点')
+    add('nudge-right', '往右挪一点')
+    add('nudge-up', '往上挪一点')
+    add('nudge-down', '往下挪一点')
     return bits
+  }
+
+  const gesture = classifyDrawnGesture()
+  if (gesture.kind === 'stamp') {
+    add('stamp', gesture.label || '加上画出的图案')
+    add('frame', '给这块加上边框')
+    add('color', '改圈中内容的颜色')
+    add('insert-text', '还是在空白处插入文字')
+    return bits
+  }
+  if (gesture.kind === 'move-layout') {
+    add('move-layout', gesture.label)
+    add('nudge-right', '往右挪一点')
+    add('nudge-left', '往左挪一点')
+    return bits
+  }
+  if (gesture.kind === 'underline') {
+    add('underline', gesture.label)
+    add('highlight', '改成高亮')
+    add('bold', '改成加粗')
+    return bits
+  }
+
+  const wantAdd =
+    note === 'insert' ||
+    note === 'insert-text' ||
+    note === 'insert-image' ||
+    note === 'add'
+  if (wantAdd && note !== 'delete' && !String(note).startsWith('delete')) {
+    if (note === 'insert-image') add('insert-image', '在圈里的空白处插入图片')
+    add('insert-text', empty || note === 'add' || note === 'insert' || note === 'insert-text' ? '在圈里的空白处插入文字' : '插入一段文字')
+    add('insert-image', '在圈里的空白处插入图片')
+    add('frame', '在这块空白加上一个框')
+    add('deco', '在空白处加装饰或图案')
+    if (note === 'add' && texts.length) add('longer', '扩写圈中文字')
+    if (note === 'add' && images.length) add('shadow', '给这张图加阴影')
+    if (empty || note === 'insert' || note === 'insert-text' || note === 'insert-image' || note === 'add') return bits
   }
 
   if (note === 'delete') {
@@ -1065,6 +1471,37 @@ function proposeOptions(spans, editor) {
     if (texts.length) add('strike', '划掉这些字')
     add('delete-deco', '去掉圈里的装饰/标注')
     add('clear-anno', '去掉下划线/框/高亮')
+    return bits
+  }
+
+  if (note === 'clear-deco' || note === 'delete-deco' || note === 'soften') {
+    add('clear-deco', '去掉圈里的阴影/框/标注')
+    add('soften', '减弱阴影/装饰')
+    add('clear-anno', '只去掉下划线/框/高亮')
+    add('delete', '还是删掉这块内容')
+    return bits
+  }
+
+  if (note === 'scale-down' || note === 'scale-up') {
+    add(note, note === 'scale-down' ? '缩小圈中这块' : '放大圈中这块')
+    if (images.length) add(note === 'scale-down' ? 'scale-down' : 'scale-up', note === 'scale-down' ? '只缩小图' : '只放大图')
+    if (texts.length) add(note, note === 'scale-down' ? '缩小这些字' : '放大这些字')
+    return bits
+  }
+
+  if (String(note).startsWith('nudge-') || note === 'move-layout' || note === 'move-nudge') {
+    if (note === 'move-layout' || looksLikeLayout(spans)) add('move-layout', '移到画出的位置')
+    add(note.startsWith('nudge-') ? note : 'nudge-right', localLabel(note.startsWith('nudge-') ? note : 'nudge-right'))
+    add('nudge-left', '往左挪一点')
+    add('nudge-right', '往右挪一点')
+    add('nudge-up', '往上挪一点')
+    add('nudge-down', '往下挪一点')
+    return bits
+  }
+
+  if (note === 'color-bg' || note === 'color-text' || note === 'color-image') {
+    add(note, localLabel(note))
+    add('color', '字和图一起改色')
     return bits
   }
 
@@ -1177,12 +1614,21 @@ function proposeOptions(spans, editor) {
   if (texts.length) {
     add('name', '改名字')
     add('color', '改颜色')
+    add('color-text', '只改这些字的颜色')
     add('polish', '润色这段')
+    add('scale-down', '缩小这些字')
   }
   if (images.length && !texts.length) add('color', '改颜色')
+  if (images.length) {
+    add('color-image', '只改图的颜色')
+    add('scale-down', '缩小圈中这块')
+    add('scale-up', '放大圈中这块')
+    add('nudge-right', '往右挪一点')
+  }
   if (texts.length && images.length) add('delete', '删掉圈里的')
   else if (images.length) add('delete-image', '删掉这块图')
   else if (texts.length) add('delete-text', '删掉这些字')
+  add('clear-deco', '去掉圈里的装饰/标注')
   if (images.length) add('anchor', '照着这里改别处')
   return bits
 }
@@ -1192,7 +1638,68 @@ function needsName(intent) {
 }
 
 function needsColor(intent) {
-  return intent === 'color' || intent === 'name-color'
+  return intent === 'color' || intent === 'name-color' || intent === 'color-bg' || intent === 'color-text' || intent === 'color-image'
+}
+
+function openColorPalette(deps, intent = 'color') {
+  ui.intent = intent
+  ui.color = ''
+  ui.step = 'values'
+  emit()
+  deps?.toast?.('点色板或打开调色盘选颜色，选完会马上改圈中的内容')
+}
+
+function openSchemeBars(editor, deps, { pageWide = false, silent = false } = {}) {
+  ui.intent = 'scheme'
+  ui.pageRecolor = pageWide
+  ui.scheme = ''
+  ui.schemeAssign = null
+  ui.schemeSlot = null
+  ui.schemeModules = collectSchemeModules(editor, { pageWide })
+  ui.step = 'values'
+  ui.hideCard = false
+  emit()
+  if (!silent) {
+    deps?.toast?.(
+      ui.schemeModules.length
+        ? '点一套颜色风格条。圈中每一块会分到不同颜色，也可再点模块旁的色标微调'
+        : '先圈要改颜色的几块内容',
+    )
+  }
+}
+
+function remapWebGuessId(id, written, label) {
+  const blob = `${written || ''}${label || ''}`
+  if (id === 'color' || String(id).startsWith('color-')) return id
+  if (/边框|加框|套个框/.test(label || '') || id === 'frame' || id === 'box' || id === 'border') return 'frame'
+  if (id === 'scheme' || id === 'deco' || id === 'unify' || id === 'pattern' || /风格|配色/.test(blob)) return 'scheme'
+  return id
+}
+
+function applyDefaultScheme(editor, deps, { pageWide = false } = {}) {
+  openSchemeBars(editor, deps, { pageWide, silent: true })
+  const sch = COLOR_SCHEMES[0]
+  ui.scheme = sch.id
+  const modules = ui.schemeModules || []
+  if (modules.length) {
+    ui.schemeAssign = assignSchemeToModules(sch, modules)
+    const imgMod = modules.find((m) => m.kind === 'image')
+    ui.color = imgMod ? ui.schemeAssign[imgMod.id] : sch.colors[0]
+  } else {
+    ui.schemeAssign = { _: sch.colors[0] }
+    ui.color = sch.colors[0]
+  }
+  ui.hideCard = false
+  ui.step = 'values'
+  emit()
+  commitScheme(editor, { label: `套上「${sch.label}」` }).then((ok) => {
+    deps?.toast?.(
+      ok
+        ? `已套上「${sch.label}」。可再点其他风格条，或点模块旁的色标微调`
+        : '圈中的内容没改到，请贴着搜索框或标题再画一圈',
+    )
+    emit()
+  })
 }
 
 function needsFollow(intent) {
@@ -1264,7 +1771,7 @@ function heading(step, intent) {
   if (step === 'propose') return '画完后开始判断'
   if (step === 'review') return '已改这些地方'
   if (intent === 'name' || intent === 'print-short') return '改成什么名字'
-  if (intent === 'color') return '改成什么颜色'
+  if (intent === 'color' || intent === 'color-bg' || intent === 'color-text' || intent === 'color-image') return '改成什么颜色'
   if (intent === 'name-color') return '新品名和颜色'
   if (intent === 'scheme') return ui.schemeAssign ? '已按模块上色，点旁边的标签可单独改' : '选一套配色'
   if (intent === 'insert-text') return '要插入的文字'
@@ -1515,7 +2022,7 @@ function pickOption(id, deps, editor) {
       return count
     })
     if (!ok) {
-      deps.toast('先用一支颜色圈模块，再用同一颜色圈它要去的位置')
+      deps.toast('先圈要挪的模块，再圈它要去的空白位置。后一圈不会当成新选区')
       return
     }
     clearPaintMarks()
@@ -2004,7 +2511,6 @@ export function openPageRecolor(editor) {
 let schemeGen = 0
 
 async function commitScheme(editor, { follow = false, slot = null, label } = {}) {
-  if (!ui.schemeAssign) return false
   let modules = ui.schemeModules || []
   if (follow) {
     modules = collectSchemeModules(editor, { pageWide: true })
@@ -2012,6 +2518,22 @@ async function commitScheme(editor, { follow = false, slot = null, label } = {})
     if (sch) ui.schemeAssign = assignSchemeToModules(sch, modules)
     ui.schemeModules = modules
   }
+  const sch = schemeById(ui.scheme) || COLOR_SCHEMES[0]
+  if (isWebDocActive() && !slot) {
+    snapshotLocal(editor, label || `套上「${sch.label}」`)
+    const result = executeCircledOp('scheme', {
+      color: sch.colors?.[0] || '粉色',
+      label: label || `套上「${sch.label}」`,
+      scheme: sch,
+    })
+    if (!result.ok) {
+      localUndos.pop()
+      return false
+    }
+    emit()
+    return true
+  }
+  if (!ui.schemeAssign) return false
   if (!modules.length) return false
   const slotMod = slot ? modules.find((m) => m.id === slot) : null
   snapshotLocal(editor, label || (slotMod ? `配色·${slotMod.label}` : '配色'))
@@ -2087,9 +2609,10 @@ function runPickedColor(editor, deps, name) {
   ui.color = name
   applyCommandText()
   if (isWebDocActive()) {
-    const result = executeCircledOp('color', {
+    const op = ui.intent === 'color-bg' || ui.intent === 'color-text' || ui.intent === 'color-image' ? ui.intent : 'color'
+    const result = executeCircledOp(op, {
       color: name,
-      label: `改成${name}`,
+      label: op === 'color-bg' ? `底色改成${name}` : op === 'color-text' ? `字改成${name}` : `改成${name}`,
       onBefore: (lab) => rememberLocal(editor, lab),
     })
     if (!result.ok) {
@@ -2178,7 +2701,8 @@ function fillPropose(bar, spans, editor, deps) {
   const hint = document.createElement('p')
   hint.className = 'card-note'
   if (ui.guessing) hint.textContent = '正在根据你画的和写下的判断意图…'
-  else if (layoutSourceWaiting(spans) && !looksLikeLayout(spans)) hint.textContent = '再用同一颜色圈它要去的位置'
+  else if (layoutSourceWaiting(spans) && !looksLikeLayout(spans) && !inferWebLayoutPairs().length) hint.textContent = '再圈它要放到的空白位置。后一圈会当成落点，不会当成新选区'
+  else if (looksLikeLayout(spans) || inferWebLayoutPairs().length) hint.textContent = '已认出模块和落点。点「移到画出的位置」'
   else if (ui.judged) hint.textContent = '点一项就执行。不满意可再要几条。'
   else hint.textContent = '圈、涂、写都会一起看。有字会先认出来，再和画的位置合着判断。画完点「开始判断」。'
   bar.append(hint)
@@ -2398,14 +2922,15 @@ function fillValues(bar, editor, deps) {
         e.stopPropagation()
         ui.scheme = sch.id
         ui.schemeModules = collectSchemeModules(editor, { pageWide: ui.pageRecolor })
-        if (!ui.schemeModules.length) {
+        if (ui.schemeModules.length) {
+          ui.schemeAssign = assignSchemeToModules(sch, ui.schemeModules)
+          const imgMod = ui.schemeModules.find((m) => m.kind === 'image')
+          ui.color = imgMod ? ui.schemeAssign[imgMod.id] : sch.colors[0]
+        } else if (!isWebDocActive()) {
           deps.toast('先圈要改的字或图')
           return
         }
-        ui.schemeAssign = assignSchemeToModules(sch, ui.schemeModules)
         ui.schemeSlot = null
-        const imgMod = ui.schemeModules.find((m) => m.kind === 'image')
-        ui.color = imgMod ? ui.schemeAssign[imgMod.id] : sch.colors[0]
         commitScheme(editor, { label: sch.label }).then((ok) => {
           deps.toast(ok ? `已套上「${sch.label}」。点模块旁的颜色标签可单独改` : '这套配色没套上')
         })
@@ -2595,19 +3120,18 @@ export function fillNoviceCard(bar, editor, deps) {
   guessRuntime.deps = deps
   const snap = getSnapshot()
   const spans = snap.spans
-  const webCount = listWebEdits().length
-  if (ui.hideCard && !spans.length && !(snap.changes || []).length && !webCount) return
-  const showReview = ui.step === 'review' || (!spans.length && (snap.changes.length || webCount))
-  if (showReview && ui.step !== 'review') ui.step = 'review'
+  if (spans.length && (ui.step === 'idle' || ui.step === 'review' || ui.hideCard)) {
+    ui.hideCard = false
+    ui.step = 'propose'
+  }
+  if (ui.hideCard || ui.step === 'review') return
 
-  if (!spans.length && !showReview) {
-    if (canUndoLocal() && !ui.hideCard) {
-      const title = document.createElement('div')
-      title.className = 'card-title'
-      title.textContent = '刚才的操作可以撤回'
-      bar.append(title)
-      appendUndoRow(bar, editor, deps)
-    } else if (ui.coachOn) {
+  if (!spans.length) {
+    if (ui.step === 'propose' || ui.guessing) {
+      fillPropose(bar, spans, editor, deps)
+      return
+    }
+    if (ui.coachOn && ui.step !== 'idle') {
       const title = document.createElement('div')
       title.className = 'card-title'
       title.textContent = '先画完，再点开始判断'
@@ -2616,14 +3140,8 @@ export function fillNoviceCard(bar, editor, deps) {
     return
   }
 
-  if (showReview) {
-    fillReview(bar, editor, deps)
-    return
-  }
-
   if (ui.step === 'values' && ui.intent) {
     fillHints(bar, editor, spans)
     fillValues(bar, editor, deps)
   } else fillPropose(bar, spans, editor, deps)
-  appendUndoRow(bar, editor, deps)
 }

@@ -5,6 +5,7 @@ import { imageSpanFromNaturalBox } from './hit-test.js'
 import { localPaintMasked } from './pending.js'
 import { collectCupBody } from './print-region.js'
 import { getSnapshot } from './store.js'
+import { isWebDocActive, tintWebEl } from './web-doc.js'
 
 const DEFAULT_PAPER = '#fffaf2'
 
@@ -67,6 +68,16 @@ function textModuleSelected(block, spans) {
 }
 
 export function collectSchemeModules(editor, { pageWide = false } = {}) {
+  if (isWebDocActive()) {
+    const spans = getSnapshot().spans.filter((s) => s.webId && s.kind !== 'slot' && s.willEdit !== false)
+    const modules = spans.map((s) => ({
+      id: `web:${s.webId}`,
+      kind: s.kind === 'image' ? 'image' : 'text',
+      webId: s.webId,
+      label: s.kind === 'image' ? '图' : previewOf(s.text, '文字'),
+    }))
+    return modules
+  }
   const spans = getSnapshot().spans || []
   const modules = []
   for (const block of listColorBlocks(editor)) {
@@ -234,7 +245,7 @@ export async function applyPageScheme(editor, { assign, modules = [], slot = nul
     setPagePaper(assign.paper?.startsWith('#') ? assign.paper : paperFill(assign.paper || assign[paperMod.id] || DEFAULT_PAPER))
   }
 
-  const imageMod = targets.find((m) => m.kind === 'image')
+  const imageMod = targets.find((m) => m.kind === 'image' && !m.webId)
   if (imageMod) await paintProduct(editor, assign[imageMod.id])
 
   const glazeMod = modules.find((m) => m.kind === 'image')
@@ -251,6 +262,10 @@ export async function applyPageScheme(editor, { assign, modules = [], slot = nul
   }
 
   for (const module of targets) {
+    if (module.webId) {
+      tintWebEl(module.webId, assign[module.id], module.kind)
+      continue
+    }
     if (module.kind === 'text') setBlockInk(editor, module.blockId, assign[module.id])
   }
   return true

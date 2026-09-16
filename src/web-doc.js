@@ -1,11 +1,11 @@
 import { isClientModelGateOn, rewriteText } from './api.js'
-import { colorFill, colorRgb } from './colors.js'
-import { aabb, intersectBoxes, pointInPolygon, strokeToPolygon } from './geometry.js'
-import { getInkStrokes } from './ink.js'
+import { colorFill, colorRgb, COLOR_SCHEMES } from './colors.js'
+import { aabb, dist, intersectBoxes, looksLikeRadialBurst, pathLength, pointInPolygon, strokeToPolygon } from './geometry.js'
 import { collectLayoutPairs } from './layout.js'
-import { getPaintMarks } from './overlay.js'
+import { getInkStrokes } from './ink.js'
+import { getPaintMarks, SELECT_COLOR } from './overlay.js'
 import { inferCommandText, localNextText, parseCommand } from './plan-local.js'
-import { getSnapshot, ping, targets } from './store.js'
+import { getSnapshot, ping, targets, upsertSpan } from './store.js'
 
 const SKIP = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'META', 'LINK', 'BR', 'HR', 'HEAD', 'HTML'])
 const SKIN_ID = 'markset-skin'
@@ -13,6 +13,8 @@ const MAX_HITS = 4
 
 let meta = { title: '', sourceUrl: '' }
 let viewportBound = false
+const iframeScrollBound = new WeakSet()
+const BADGE_HOST = 'markset-badge-host'
 
 const SKIN = `
 html, body { margin: 0; width: 100%; min-width: 100%; max-width: none; }
@@ -101,6 +103,9 @@ function prepareDoc(doc) {
   if (!doc) return
   injectSkin(doc)
   stampIds(doc)
+  doc.querySelector(`#${BADGE_HOST}`)?.remove()
+  doc.querySelectorAll('[data-markset-badge-host], [data-markset-edit-badge]').forEach((el) => el.remove())
+  bindIframeScroll(doc)
   doc.querySelectorAll('a[href]').forEach((a) => {
     a.setAttribute('target', '_blank')
     a.setAttribute('rel', 'noopener')
@@ -112,6 +117,14 @@ function prepareDoc(doc) {
   })
 }
 
+function bindIframeScroll(doc) {
+  if (!doc || iframeScrollBound.has(doc)) return
+  iframeScrollBound.add(doc)
+  const onMove = () => ping()
+  doc.addEventListener('scroll', onMove, { passive: true, capture: true })
+  doc.defaultView?.addEventListener('scroll', onMove, { passive: true })
+}
+
 function bindViewport() {
   if (viewportBound) return
   viewportBound = true
@@ -120,6 +133,7 @@ function bindViewport() {
     ping()
   }
   document.querySelector('.stage')?.addEventListener('scroll', onMove, { passive: true })
+  document.querySelector('.page')?.addEventListener('scroll', onMove, { passive: true })
   window.addEventListener('resize', () => {
     if (!isWebDocActive()) return
     fitHeight()
@@ -141,7 +155,10 @@ function setHtml(html) {
 export function snapshotWebHtml() {
   const doc = getDoc()
   if (!doc?.documentElement) return ''
-  return `<!DOCTYPE html>\n${doc.documentElement.outerHTML}`
+  const clone = doc.documentElement.cloneNode(true)
+  clone.querySelector(`#${BADGE_HOST}`)?.remove()
+  clone.querySelectorAll('[data-markset-badge-host], [data-markset-edit-badge]').forEach((el) => el.remove())
+  return `<!DOCTYPE html>\n${clone.outerHTML}`
 }
 
 export function restoreWebHtml(html) {
@@ -273,16 +290,57 @@ function recordWebEdit(label, before, after) {
     id: `we-${webEditSeq}`,
     label: label || '改网页',
     keep: true,
+    at: Date.now(),
     before,
     after: after || [],
+    screen: null,
   }
+  item.screen = firstLiveAnchor(item.after) || firstLiveAnchor(item.before)
   webEdits = [item, ...webEdits]
   ping()
   return item
 }
 
+function firstLiveAnchor(shots) {
+  for (const shot of shots || []) {
+    if (!shot?.webId || shot.removed) continue
+    const r = liveScreenRect({ webId: shot.webId })
+    if (r && r.w > 1 && r.h > 1) return { x: r.x + r.w + 6, y: r.y }
+  }
+  return null
+}
+
 export function listWebEdits() {
-  return webEdits.map((item) => ({ id: item.id, label: item.label, keep: item.keep !== false }))
+  return webEdits.map((item) => ({
+    id: item.id,
+    label: item.label,
+    keep: item.keep !== false,
+    webIds: [...new Set([...(item.after || []), ...(item.before || [])].map((s) => s.webId).filter(Boolean))],
+  }))
+}
+
+export function webEditAnchor(item) {
+  const full = webEdits.find((x) => x.id === item?.id) || item
+  const live = firstLiveAnchor(full.keep === false ? full.before : full.after) || firstLiveAnchor(full.before)
+  if (live) {
+    full.screen = live
+    return live
+  }
+  return full.screen || null
+}
+
+export function tintWebEl(webId, name, kind = 'auto') {
+  const el = findByWebId(webId)
+  if (!el) return false
+  const before = snapshotNode(el)
+  const graphic = kind === 'image' || isGraphicEl(el)
+  applyColor(el, name, graphic ? 'image' : 'text')
+  for (const child of collectColorable(el)) {
+    if (child === el) continue
+    applyColor(child, name, isGraphicEl(child) ? 'image' : 'text')
+  }
+  recordWebEdit(`改成${name || '所选颜色'}`, [before], [snapshotNode(el)])
+  return true
 }
 
 export function restoreWebEdit(id) {
@@ -313,6 +371,13 @@ export function popLastWebEdit() {
   return item.label
 }
 
+export function popWebEditsSince(at) {
+  const t = Number(at) || 0
+  if (!t) return popLastWebEdit()
+  webEdits = webEdits.filter((item) => (item.at || 0) < t)
+  ping()
+}
+
 export function clearWebEdits() {
   webEdits = []
   ping()
@@ -339,7 +404,7 @@ function logoCluster(el, box) {
   return cur
 }
 
-function pickVisualEls(els) {
+function pickVisualEls(els, box) {
   const drilled = []
   for (const el of els) {
     if (!el) continue
@@ -347,7 +412,9 @@ function pickVisualEls(els) {
       ? el
       : el.querySelector?.('img, svg, picture, canvas, video, [class*="logo" i], [id*="logo" i]')
     const seed = inner && areaOf(inner) > 40 && areaOf(inner) < areaOf(el) * 0.92 ? inner : el
-    drilled.push(logoCluster(seed))
+    const cluster = logoCluster(seed, box)
+    const use = box && cluster && !staysInPaint(cluster, box) ? seed : cluster
+    drilled.push(use)
   }
   const unique = []
   const seen = new Set()
@@ -357,27 +424,229 @@ function pickVisualEls(els) {
     seen.add(id)
     unique.push(el)
   }
-  return unique.slice(0, 1)
+  return unique.slice(0, 3)
 }
 
 function visualTargets() {
+  const box = iframeUnionBox(drawingPolys())
   const raw = selectedWebEls().map((x) => x.el).filter(Boolean)
   const fallback = selectedWebEls('image').map((x) => x.el).filter(Boolean)
-  return pickVisualEls(raw.length ? raw : fallback)
+  const seeds = pickVisualEls(raw.length ? raw : fallback, box)
+  if (!box) return seeds.slice(0, 1)
+  return seeds.filter((el) => staysInPaint(el, box) || overlapScore(el, box).coverEl >= 0.4).slice(0, 1)
 }
 
-function drawingPolys() {
-  const polys = []
-  const add = (pts) => {
-    if (!pts?.length) return
-    polys.push(pts.length >= 3 ? strokeToPolygon(pts) : pts)
+function looksLikeLassoStroke(pts) {
+  if (!pts || pts.length < 8) return false
+  const box = aabb(pts)
+  if (box.w < 32 || box.h < 22) return false
+  const peri = 2 * (box.w + box.h)
+  const len = pathLength(pts)
+  const closed = dist(pts[0], pts[pts.length - 1]) < Math.max(box.w, box.h) * 0.42
+  return closed && len < peri * 3.2
+}
+
+function isHandwritingPaint(mark) {
+  const pts = mark?.points
+  if (!pts || pts.length < 2) return true
+  const hex = String(mark.color || '').toLowerCase()
+  if (hex === '#1d1916' || hex === '#111111' || hex === '#000000') return true
+  if (looksLikeLassoStroke(pts)) return false
+  const box = aabb(pts)
+  const select = String(SELECT_COLOR || '#3c6fd4').toLowerCase()
+  if (hex && hex === select) return false
+  return box.w < 90 && box.h < 90
+}
+
+function boxOverlap(a, b) {
+  if (!a || !b) return 0
+  const x = Math.max(a.x, b.x)
+  const y = Math.max(a.y, b.y)
+  const r = Math.min(a.x + a.w, b.x + b.w)
+  const bot = Math.min(a.y + a.h, b.y + b.h)
+  return Math.max(0, r - x) * Math.max(0, bot - y)
+}
+
+function boxesFar(a, b) {
+  if (!a || !b) return true
+  const overlap = boxOverlap(a, b)
+  const area = Math.max(1, a.w * a.h, b.w * b.h)
+  if (overlap / area > 0.4) return false
+  const dx = a.x + a.w / 2 - (b.x + b.w / 2)
+  const dy = a.y + a.h / 2 - (b.y + b.h / 2)
+  return Math.hypot(dx, dy) > 36
+}
+
+function sceneFromIframeBox(box) {
+  const empty = {
+    blank: false,
+    kind: 'none',
+    fill: 0,
+    coreTexts: [],
+    coreImages: 0,
+    incidental: [],
+    text: '没有圈。',
   }
-  for (const mark of getPaintMarks()) add(mark.points)
-  for (const stroke of getInkStrokes()) add(stroke)
+  if (!box || box.w < 8 || box.h < 8) return empty
+  const paintArea = Math.max(1, box.w * box.h)
+  const hits = scanOverlapEls(box).filter((h) => isGraphicEl(h.el) || isTextEl(h.el) || isWidgetEl(h.el))
+  const core = hits.filter((h) => {
+    if (h.coverEl >= 0.28 && (centerInPaint(h.el, box) || h.coverBox >= 0.08)) return true
+    return centerInPaint(h.el, box) && h.coverBox >= 0.05 && (isGraphicEl(h.el) || isWidgetEl(h.el))
+  })
+  const incidental = hits.filter((h) => !core.includes(h) && (h.coverBox < 0.08 || (!centerInPaint(h.el, box) && h.coverEl < 0.45)))
+  const coreArea = core.reduce((sum, h) => sum + Math.min(h.area, paintArea) * Math.min(1, h.coverEl), 0)
+  const fill = coreArea / paintArea
+  const coreTexts = core.filter((h) => isPrimarilyText(h.el)).map((h) => textOf(h.el)).filter(Boolean)
+  const coreImages = core.filter((h) => isGraphicEl(h.el) || isWidgetEl(h.el)).length
+  const blank = fill < 0.16 && !coreImages && !coreTexts.length
+  const kind = blank ? 'blank' : coreImages && coreTexts.length ? 'mixed' : coreImages ? 'image' : coreTexts.length ? 'text' : 'blank'
+  const bits = []
+  if (blank) {
+    bits.push('圈内大部分是空白。操作对象是这块空白区域，不要把边上蹭到的搜索框/按钮当主目标。')
+    if (incidental.length) {
+      bits.push(`圈边只是碰到：${incidental.slice(0, 4).map((h) => `「${(textOf(h.el) || h.el.tagName).slice(0, 24)}」`).join('、')}。这些不要当成主目标。`)
+    }
+  } else {
+    if (coreTexts.length) bits.push(`圈中文字：${coreTexts.map((t) => `「${t.slice(0, 48)}」`).join('、')}`)
+    if (coreImages) bits.push(`圈中图片/Logo ${coreImages} 处。手写若是变小/缩小/改色，应改这一块，不是空白插入。`)
+  }
+  return { blank, kind, fill, coreTexts, coreImages, incidental, text: bits.join('\n') }
+}
+
+function paintLassoMarks() {
+  const paints = getPaintMarks().filter((m) => m.points?.length >= 3 && !isHandwritingPaint(m))
+  const lassos = paints.filter((m) => looksLikeLassoStroke(m.points))
+  return lassos.length ? lassos : paints
+}
+
+function classifyPaintRoles(marks = paintLassoMarks()) {
+  const all = marks || []
+  if (all.length < 2) return { sources: all, dests: [], all }
+  const scored = all.map((m) => {
+    const poly = m.points.length >= 3 ? strokeToPolygon(m.points) : m.points
+    const box = aabb(m.points)
+    const iframe = iframeUnionBox([poly])
+    const scene = sceneFromIframeBox(iframe)
+    const hits = hitWebDoc(poly, { loose: true })
+    const n = (hits.images?.found?.length || 0) + (hits.texts?.found?.length || 0)
+    return { mark: m, box, poly, scene, n, blank: scene.blank || scene.fill < 0.2 }
+  })
+  const dests = scored.filter((s) => s.blank)
+  const sources = scored.filter((s) => !s.blank)
+  if (dests.length && sources.length) {
+    return { sources: sources.map((s) => s.mark), dests: dests.map((s) => s.mark), all }
+  }
+  scored.sort((a, b) => b.n - a.n || a.box.w * a.box.h - b.box.w * b.box.h)
+  const primary = scored[0]
+  const extra = scored.slice(1).filter((s) => boxesFar(primary.box, s.box) && s.n <= primary.n)
+  if (extra.length) {
+    return { sources: [primary.mark], dests: extra.map((s) => s.mark), all }
+  }
+  return { sources: all, dests: [], all }
+}
+
+function polysOfMarks(marks) {
+  const polys = []
+  for (const mark of marks || []) {
+    if (!mark?.points?.length) continue
+    polys.push(mark.points.length >= 3 ? strokeToPolygon(mark.points) : mark.points)
+  }
+  return polys
+}
+
+export function lassoPolys() {
+  const roles = classifyPaintRoles()
+  const source = roles.sources.length ? roles.sources : roles.all
+  const polys = polysOfMarks(source)
+  if (polys.length) return polys
+  const destIds = new Set(getSnapshot().spans.filter((s) => s.layoutRole === 'dest').map((s) => s.markId))
   for (const span of getSnapshot().spans) {
+    if (span.layoutRole === 'dest' || destIds.has(span.markId)) continue
     if (span.poly?.length) polys.push(span.poly)
   }
   return polys
+}
+
+function drawingPolys() {
+  return lassoPolys()
+}
+
+export function looksLikeWebLayoutDest(rawPoints, polygon) {
+  const sources = getSnapshot().spans.filter((s) => s.webId && s.kind !== 'slot' && s.layoutRole !== 'dest' && s.willEdit !== false)
+  if (!sources.length) return false
+  const pts = rawPoints?.length ? rawPoints : polygon
+  const box = aabb(pts)
+  const far = sources.every((s) => boxesFar(s.screenRect || liveScreenRect(s), box))
+  if (!far) return false
+  const iframe = iframeUnionBox([polygon?.length ? polygon : pts])
+  const scene = sceneFromIframeBox(iframe)
+  return scene.blank || scene.fill < 0.22
+}
+
+export function pairWebLayoutDest(rawPoints, polygon, color = SELECT_COLOR) {
+  const pts = rawPoints?.length ? rawPoints : polygon
+  const box = aabb(pts)
+  const sources = getSnapshot().spans.filter((s) => s.webId && s.kind !== 'slot' && s.layoutRole !== 'dest' && s.willEdit !== false)
+  const src = sources[0]
+  if (!src || !box) return null
+  const hex = String(color || SELECT_COLOR)
+  upsertSpan(
+    (s) => s.markId === src.markId || (src.webId && s.webId === src.webId),
+    { layoutColor: hex, layoutRole: 'source' },
+  )
+  upsertSpan(
+    (s) => s.layoutColor === hex && s.layoutRole === 'dest',
+    {
+      kind: 'slot',
+      layoutColor: hex,
+      layoutRole: 'dest',
+      screenRect: box,
+      poly: polygon,
+      paintMark: true,
+      why: 'layout-dest',
+    },
+  )
+  return { source: src, dest: box }
+}
+
+export function inferWebLayoutPairs() {
+  const tagged = collectLayoutPairs()
+  if (tagged.length) return tagged
+  const roles = classifyPaintRoles()
+  if (!roles.dests.length || !roles.sources.length) {
+    const dest = getSnapshot().spans.find((s) => s.layoutRole === 'dest' && s.screenRect)
+    const src = getSnapshot().spans.find((s) => s.webId && s.kind !== 'slot' && s.layoutRole !== 'dest')
+    if (src?.webId && dest?.screenRect) {
+      return [{
+        webId: src.webId,
+        dest: dest.screenRect,
+        sourceRect: src.screenRect,
+        kind: src.kind,
+        label: src.kind === 'image' ? '图' : String(src.text || '这块').slice(0, 8),
+      }]
+    }
+    return []
+  }
+  const destBox = aabb(roles.dests[0].points)
+  const pairs = []
+  const seen = new Set()
+  for (const mark of roles.sources) {
+    const poly = mark.points.length >= 3 ? strokeToPolygon(mark.points) : mark.points
+    const hits = hitWebDoc(poly, { loose: true })
+    for (const span of [...(hits.images?.found || []), ...(hits.texts?.found || [])]) {
+      if (!span.webId || seen.has(span.webId)) continue
+      seen.add(span.webId)
+      pairs.push({
+        webId: span.webId,
+        dest: destBox,
+        sourceRect: span.screenRect,
+        kind: span.kind,
+        label: span.kind === 'image' ? '图' : String(span.text || '这块').slice(0, 8),
+      })
+    }
+  }
+  return pairs
 }
 
 export function circledEditSpans() {
@@ -386,12 +655,55 @@ export function circledEditSpans() {
   return getSnapshot().spans.filter((s) => s.webId && s.kind !== 'slot' && s.willEdit !== false)
 }
 
+export function describePaintScene() {
+  const empty = {
+    blank: false,
+    kind: 'none',
+    fill: 0,
+    coreTexts: [],
+    coreImages: 0,
+    incidental: [],
+    text: '没有圈。',
+  }
+  if (!isWebDocActive()) return empty
+  const box = iframeUnionBox(drawingPolys())
+  const scene = sceneFromIframeBox(box)
+  const pairs = inferWebLayoutPairs()
+  if (pairs.length) {
+    scene.text = `${scene.text || '已圈中要挪的模块。'}\n另有一处空白圈，应理解为落点而不是新选区。`
+    scene.layout = true
+  }
+  const inks = getInkStrokes().filter((s) => s?.length >= 2)
+  if (inks.length >= 3) {
+    const inkBox = iframeUnionBox(inks)
+    const around = sceneFromIframeBox(inkBox)
+    const radial = looksLikeRadialBurst(inks)
+    const who = around.coreTexts[0]
+      ? `「${around.coreTexts[0].slice(0, 24)}」`
+      : around.coreImages
+        ? '这块图/Logo'
+        : ''
+    if (who) {
+      scene.blank = false
+      scene.drawn = radial ? 'radial' : 'pattern'
+      scene.text = `${scene.text || ''}\n用户在${who}周围画了${inks.length}条线${radial ? '（放射状光芒/装饰）' : ''}。这是要把画出的图案加到该物体周围，不是空白插入，也不是删除这些线。`.trim()
+    } else if (radial) {
+      scene.blank = false
+      scene.drawn = 'radial'
+      scene.text = `${scene.text || ''}\n用户画了放射状线条，应把该图案贴到所画位置。`.trim()
+    }
+  }
+  return scene.kind === 'none' && !box && !scene.drawn ? empty : scene
+}
+
 export function describeCircledHits() {
+  const scene = describePaintScene()
+  if (scene.text && (scene.kind !== 'none' || scene.drawn || scene.layout)) return scene.text
   const spans = circledEditSpans()
   const texts = spans.filter((s) => s.kind === 'text' && (s.text || '').trim())
   const images = spans.filter((s) => s.kind === 'image')
   if (!texts.length && !images.length) {
-    return '圈内没有命中网页文字或图片（空白或用户自画）。不要猜成页面主Logo，除非圈确实套在Logo上。'
+    return '圈内没有命中网页文字或图片。若用户只画了线或图案，按画法理解为贴上图案或调整布局，不要默认插入文字，也不要无视周围的 Logo。'
   }
   const bits = []
   if (texts.length) bits.push(`圈中文字：${texts.map((s) => `「${String(s.text).slice(0, 48)}」`).join('、')}`)
@@ -485,11 +797,12 @@ function setElScale(el, factor) {
   el.setAttribute('data-markset-scale', String(next))
   el.setAttribute('data-markset-scaled', '1')
   rememberFlow(el)
+  clearAncestorClip(el)
   if (/^(IMG|SVG|CANVAS|VIDEO|PICTURE)$/.test(el.tagName)) {
     el.style.zoom = ''
     el.style.width = `${Math.max(12, origW * next)}px`
     el.style.height = 'auto'
-    el.style.maxWidth = '100%'
+    el.style.maxWidth = 'none'
   } else {
     el.style.zoom = String(next)
   }
@@ -497,13 +810,7 @@ function setElScale(el, factor) {
 }
 
 export function applyWebScale(factor, label = '缩放') {
-  const els = visualTargets()
-  if (!els.length) return false
-  const before = els.map((el) => snapshotNode(el))
-  for (const el of els) setElScale(el, factor)
-  recordWebEdit(label, before, els.map((el) => snapshotNode(el)))
-  fitHeight()
-  return true
+  return executeCircledOp(factor < 1 ? 'scale-down' : 'scale-up', { label }).ok
 }
 
 function iframeBox() {
@@ -558,8 +865,18 @@ function isImageEl(el) {
   return false
 }
 
+function looksLikeLogo(el) {
+  const blob = `${el?.id || ''} ${el?.className || ''} ${el?.getAttribute?.('aria-label') || ''} ${el?.getAttribute?.('alt') || ''}`.toLowerCase()
+  return /logo|brand|icon|sogou|搜狗/.test(blob)
+}
+
 function isGraphicEl(el) {
-  return isImageEl(el) || hasPaintedBg(el) || el?.tagName === 'SVG'
+  if (!el) return false
+  if (isImageEl(el) || hasPaintedBg(el) || el.tagName === 'SVG') return true
+  if (el.getAttribute?.('role') === 'img') return true
+  if (looksLikeLogo(el) && (hasPaintedBg(el) || el.querySelector?.('img, svg, canvas'))) return true
+  if (el.querySelector?.(':scope > img, :scope > svg') && areaOf(el) < 420 * 220) return true
+  return false
 }
 
 function collectColorable(el) {
@@ -842,14 +1159,8 @@ function annoKind(id) {
 }
 
 export function applyWebAnno(id) {
-  if (id === 'clear-anno') return clearWebAnno()
-  const kind = annoKind(id)
-  const els = editTargetEls()
-  if (!els.length) return false
-  const before = els.map((el) => snapshotNode(el))
-  for (const el of els) el.setAttribute('data-markset-anno', kind)
-  recordWebEdit(kind === 'highlight' ? '高亮' : '加框', before, els.map((el) => snapshotNode(el)))
-  return true
+  if (id === 'clear-anno') return executeCircledOp('clear-anno', { label: '去掉批注' }).ok
+  return executeCircledOp(annoKind(id) === id ? id : annoKind(id), { label: id === 'highlight' ? '高亮' : '加框' }).ok
 }
 
 export function applyWebAnnoAll(id) {
@@ -881,39 +1192,11 @@ export function clearWebAnno() {
 }
 
 export function applyWebShadow() {
-  const img = visualTargets()[0]
-  if (!img) return false
-  const before = [snapshotNode(img)]
-  const css = 'drop-shadow(6px 10px 8px rgba(36, 24, 14, 0.45))'
-  if (img.dataset.marksetShadow === '1') {
-    img.style.filter = ''
-    delete img.dataset.marksetShadow
-    if (img.getAttribute('data-markset-flow') === 'shadow') adaptLayout(img, 'clear')
-  } else {
-    img.style.filter = css
-    img.dataset.marksetShadow = '1'
-    adaptLayout(img, 'shadow')
-  }
-  recordWebEdit('加阴影', before, [snapshotNode(img)])
-  return true
+  return executeCircledOp('shadow', { label: '加阴影' }).ok
 }
 
 export function applyWebReflect() {
-  const img = visualTargets()[0]
-  if (!img) return false
-  const before = [snapshotNode(img)]
-  const css = 'below 8px linear-gradient(transparent 20%, rgba(0,0,0,.45))'
-  if (img.dataset.marksetReflect === '1') {
-    img.style.webkitBoxReflect = ''
-    delete img.dataset.marksetReflect
-    if (img.getAttribute('data-markset-flow') === 'reflect') adaptLayout(img, 'clear')
-  } else {
-    img.style.webkitBoxReflect = css
-    img.dataset.marksetReflect = '1'
-    adaptLayout(img, 'reflect')
-  }
-  recordWebEdit('加倒影', before, [snapshotNode(img)])
-  return true
+  return executeCircledOp('reflect', { label: '加倒影' }).ok
 }
 
 export function applyWebIndent({ all = false } = {}) {
@@ -939,25 +1222,153 @@ export function applyWebIndent({ all = false } = {}) {
 }
 
 export function applyWebLayoutMoves() {
-  const pairs = collectLayoutPairs()
-  let n = 0
-  const before = []
-  const afterEls = []
-  for (const pair of pairs) {
-    const el = findByWebId(pair.webId)
-    const dest = toIframeRect(pair.dest)
-    if (!el || !dest) continue
-    before.push(snapshotNode(el))
-    const src = el.getBoundingClientRect()
-    const dx = Math.round(dest.x - src.left)
-    const dy = Math.round(dest.y - src.top)
-    el.style.transform = `translate(${dx}px, ${dy}px)`
-    el.setAttribute('data-markset-shifted', '1')
-    afterEls.push(el)
-    n += 1
+  const html = snapshotWebHtml()
+  const pairs = inferWebLayoutPairs()
+  if (!pairs.length) return 0
+  const modes = ['transform', 'absolute']
+  for (const mode of modes) {
+    if (mode !== 'transform') restoreWebHtml(html)
+    let n = 0
+    const before = []
+    const beforeEv = []
+    const afterEls = []
+    const dests = []
+    for (const pair of pairs) {
+      const el = findByWebId(pair.webId)
+      const dest = toIframeRect(pair.dest)
+      if (!el || !dest) continue
+      before.push(snapshotNode(el))
+      beforeEv.push(evidenceOf(el))
+      dests.push(dest)
+      moveElToDest(el, dest, mode)
+      afterEls.push(el)
+      n += 1
+    }
+    if (!n) continue
+    const afterEv = afterEls.map((el) => (el?.isConnected ? evidenceOf(el) : { connected: false, rect: { x: 0, y: 0, w: 0, h: 0 } }))
+    if (!verifyMove(beforeEv, afterEv, dests)) continue
+    recordWebEdit('挪位置', before, afterEls.map((el) => snapshotNode(el)))
+    fitHeight()
+    return n
   }
-  if (n) recordWebEdit('挪位置', before, afterEls.map((el) => snapshotNode(el)))
-  return n
+  restoreWebHtml(html)
+  return 0
+}
+
+function moveElToDest(el, dest, mode) {
+  const src = el.getBoundingClientRect()
+  const dx = Math.round(dest.x - src.left)
+  const dy = Math.round(dest.y - src.top)
+  if (mode === 'absolute') {
+    const pos = el.ownerDocument?.defaultView?.getComputedStyle(el)?.position
+    if (!pos || pos === 'static') el.style.position = 'absolute'
+    else el.style.position = pos === 'fixed' ? 'absolute' : pos
+    el.style.left = `${Math.round(dest.x)}px`
+    el.style.top = `${Math.round(dest.y)}px`
+    el.style.margin = '0'
+    el.setAttribute('data-markset-shifted', '1')
+    return
+  }
+  nudgeEl(el, dx, dy)
+}
+
+function evidenceOf(el) {
+  if (!el?.isConnected) {
+    return {
+      connected: false,
+      rect: { x: 0, y: 0, w: 0, h: 0 },
+      color: '',
+      bg: '',
+      filter: '',
+      transform: '',
+      fontSize: '',
+      anno: '',
+      reflect: '',
+      html: '',
+      text: '',
+    }
+  }
+  const r = el.getBoundingClientRect()
+  const cs = el.ownerDocument.defaultView.getComputedStyle(el)
+  return {
+    connected: true,
+    rect: { x: r.left, y: r.top, w: r.width, h: r.height },
+    color: cs.color,
+    bg: cs.backgroundColor,
+    filter: cs.filter,
+    transform: cs.transform,
+    fontSize: cs.fontSize,
+    fontWeight: cs.fontWeight,
+    anno: el.getAttribute('data-markset-anno') || '',
+    reflect: el.style.webkitBoxReflect || '',
+    html: el.outerHTML.slice(0, 1800),
+    text: String(el.innerText || '').slice(0, 80),
+  }
+}
+
+function verifyKind(kind, befores, afters) {
+  if (!afters.length) return false
+  if (kind.startsWith('delete') && kind !== 'delete-deco' && kind !== 'clear-deco') {
+    return afters.some((a, i) => !a.connected || a.rect.w * a.rect.h < Math.max(1, (befores[i]?.rect.w || 0) * (befores[i]?.rect.h || 0)) * 0.25)
+  }
+  if (kind === 'scheme' || String(kind).startsWith('color')) {
+    return afters.some((a, i) => a.color !== befores[i]?.color || a.bg !== befores[i]?.bg || a.filter !== befores[i]?.filter || a.html !== befores[i]?.html)
+  }
+  if (kind === 'scale-down') {
+    return afters.some((a, i) => {
+      const ba = Math.max(1, (befores[i]?.rect.w || 0) * (befores[i]?.rect.h || 0))
+      const aa = a.rect.w * a.rect.h
+      const fs0 = parseFloat(befores[i]?.fontSize) || 0
+      const fs1 = parseFloat(a.fontSize) || 0
+      return aa < ba * 0.92 || (fs0 && fs1 && fs1 < fs0 * 0.92)
+    })
+  }
+  if (kind === 'scale-up') {
+    return afters.some((a, i) => {
+      const ba = Math.max(1, (befores[i]?.rect.w || 0) * (befores[i]?.rect.h || 0))
+      return a.rect.w * a.rect.h > ba * 1.08 || parseFloat(a.fontSize) > (parseFloat(befores[i]?.fontSize) || 0) * 1.08
+    })
+  }
+  if (kind === 'shadow') return afters.some((a, i) => a.filter !== befores[i]?.filter && /drop-shadow/i.test(a.filter))
+  if (kind === 'reflect') return afters.some((a) => Boolean(a.reflect))
+  if (kind === 'frame' || kind === 'box' || kind === 'circle' || kind === 'highlight' || kind === 'bold' || kind === 'underline' || kind === 'wavy' || kind === 'strike' || String(kind).startsWith('line')) {
+    return afters.some((a, i) => a.anno !== befores[i]?.anno || a.fontWeight !== befores[i]?.fontWeight || a.html !== befores[i]?.html)
+  }
+  if (String(kind).startsWith('nudge') || kind === 'move-nudge' || kind === 'move-layout') {
+    return afters.some((a, i) => Math.hypot(a.rect.x - (befores[i]?.rect.x || 0), a.rect.y - (befores[i]?.rect.y || 0)) > 6)
+  }
+  if (kind === 'clear-deco' || kind === 'delete-deco' || kind === 'clear-anno' || kind === 'soften') {
+    return afters.some((a, i) => a.filter !== befores[i]?.filter || a.anno !== befores[i]?.anno || a.reflect !== befores[i]?.reflect || a.html !== befores[i]?.html)
+  }
+  return afters.some((a, i) => {
+    const b = befores[i]
+    if (!b) return a.connected
+    return (
+      a.connected !== b.connected ||
+      a.color !== b.color ||
+      a.bg !== b.bg ||
+      a.filter !== b.filter ||
+      a.transform !== b.transform ||
+      a.anno !== b.anno ||
+      a.fontSize !== b.fontSize ||
+      a.fontWeight !== b.fontWeight ||
+      Math.hypot(a.rect.x - b.rect.x, a.rect.y - b.rect.y) > 4 ||
+      Math.abs(a.rect.w * a.rect.h - b.rect.w * b.rect.h) / Math.max(1, b.rect.w * b.rect.h) > 0.06
+    )
+  })
+}
+
+function verifyMove(befores, afters, dests) {
+  return afters.some((a, i) => {
+    const b = befores[i]
+    const dest = dests[i]
+    if (!a?.connected || !b) return false
+    const moved = Math.hypot(a.rect.x - b.rect.x, a.rect.y - b.rect.y) > 6
+    if (!dest) return moved
+    const beforeDist = Math.hypot(b.rect.x - dest.x, b.rect.y - dest.y)
+    const afterDist = Math.hypot(a.rect.x - dest.x, a.rect.y - dest.y)
+    return moved && afterDist < beforeDist - 4
+  })
 }
 
 function replaceText(el, fromText, toText) {
@@ -1073,15 +1484,48 @@ function overlapScore(el, box) {
   }
 }
 
+function centerInPaint(el, box) {
+  const r = el.getBoundingClientRect()
+  const cx = r.x + r.width / 2
+  const cy = r.y + r.height / 2
+  return cx >= box.x && cx <= box.x + box.w && cy >= box.y && cy <= box.y + box.h
+}
+
+function significantChildren(el) {
+  return [...(el?.children || [])].filter((kid) => {
+    if (!kid || SKIP.has(kid.tagName)) return false
+    const r = kid.getBoundingClientRect()
+    return r.width >= 16 && r.height >= 12 && r.width * r.height >= 40 * 20
+  })
+}
+
+function containsOutsiders(el, box) {
+  const kids = significantChildren(el)
+  if (kids.length < 2) return false
+  const insiders = kids.filter((kid) => centerInPaint(kid, box) || overlapScore(kid, box).coverEl >= 0.5)
+  const outsiders = kids.filter((kid) => !centerInPaint(kid, box) && overlapScore(kid, box).coverEl < 0.4)
+  return insiders.length >= 1 && outsiders.length >= 1
+}
+
 function staysInPaint(el, box) {
+  if (!el || !box) return false
   const hit = overlapScore(el, box)
   if (hit.coverEl < 0.6) return false
+  if (!centerInPaint(el, box) && hit.coverEl < 0.82) return false
   if (hit.extraTop > Math.max(16, box.h * 0.1)) return false
   if (hit.extraBottom > Math.max(28, box.h * 0.16)) return false
   if (hit.extraLeft > Math.max(28, box.w * 0.1) && hit.extraRight > Math.max(28, box.w * 0.1) && hit.coverEl < 0.78) {
     return false
   }
+  if (containsOutsiders(el, box)) return false
   return true
+}
+
+function aimedLeaf(el, box) {
+  const hit = overlapScore(el, box)
+  if (containsOutsiders(el, box)) return false
+  if (centerInPaint(el, box)) return hit.coverEl >= 0.18
+  return hit.coverEl >= 0.45 || (isGraphicEl(el) && hit.coverEl >= 0.22)
 }
 
 function scanOverlapEls(box) {
@@ -1148,88 +1592,449 @@ function blockEls(hits, box) {
   return uniqueEls(kept)
 }
 
-function leafEls(hits) {
+function leafEls(hits, box) {
   return uniqueEls(
     hits
-      .filter((h) => (isGraphicEl(h.el) || isTextEl(h.el)) && h.coverEl >= 0.28)
+      .filter((h) => (isGraphicEl(h.el) || isTextEl(h.el)) && h.coverEl >= 0.28 && (!box || aimedLeaf(h.el, box)))
       .sort((a, b) => a.area - b.area)
       .slice(0, 24)
       .map((h) => h.el),
   )
 }
 
-export function executeCircledOp(op, { color = '', label = '', onBefore } = {}) {
-  const doc = getDoc()
-  const iframe = frameEl()
-  if (!doc?.body || !iframe) return { ok: false, reason: '没有导入的网页' }
-  const box = iframeUnionBox(drawingPolys())
-  if (!box || box.w < 6 || box.h < 6) return { ok: false, reason: '没有可用的圈。请再圈一次要改的地方' }
-  const frameArea = Math.max(1, iframe.clientWidth * iframe.clientHeight)
-  const hits = scanOverlapEls(box)
-  const paintArea = box.w * box.h
-  const large = paintArea > frameArea * 0.07 || Math.max(box.w, box.h) > 200
-  const kind = String(op || '')
-  let els = []
+function hasMarksetDeco(el) {
+  if (!el) return false
+  return Boolean(
+    el.hasAttribute?.('data-markset-anno') ||
+      el.dataset?.marksetShadow ||
+      el.dataset?.marksetReflect ||
+      el.dataset?.marksetTint ||
+      el.dataset?.marksetBg ||
+      el.hasAttribute?.('data-markset-shifted') ||
+      el.hasAttribute?.('data-markset-scaled'),
+  )
+}
 
-  if (kind.startsWith('delete')) {
-    if (large) {
-      const mod = pickModuleEl(hits, box, frameArea)
-      if (mod && staysInPaint(mod, box)) els = [mod]
-      if (!els.length) els = blockEls(hits, box)
+function decoEls(hits, box, doc) {
+  const fromHits = (hits || [])
+    .filter((h) => hasMarksetDeco(h.el) && (centerInPaint(h.el, box) || h.coverEl >= 0.35))
+    .map((h) => h.el)
+  const marked = [...(doc?.body?.querySelectorAll('[data-markset-anno], [data-markset-shadow], [data-markset-reflect], [data-markset-tint], [data-markset-bg], [data-markset-shifted], [data-markset-scaled]') || [])]
+    .filter((el) => aimedLeaf(el, box) || overlapScore(el, box).coverEl >= 0.35)
+  return uniqueEls([...fromHits, ...marked])
+}
+
+function stripDeco(el, { soften = false } = {}) {
+  let changed = false
+  if (el.hasAttribute('data-markset-anno')) {
+    if (soften && el.getAttribute('data-markset-anno') === 'highlight') {
+      el.style.background = 'rgba(255, 226, 80, 0.22)'
+    } else {
+      el.removeAttribute('data-markset-anno')
     }
-    if (!els.length) {
-      els = leafEls(hits)
-      if (kind === 'delete-image') els = els.filter((el) => isGraphicEl(el))
-      if (kind === 'delete-text') els = els.filter((el) => isTextEl(el) && !isGraphicEl(el))
-    }
-    if (els.length >= 3) {
-      const parent = commonCoveringParent(els, box, frameArea)
-      if (parent && staysInPaint(parent, box)) els = [parent]
-    }
-    els = els.filter((el) => staysInPaint(el, box) || overlapScore(el, box).coverEl >= 0.5)
-  } else if (kind === 'color') {
-    els = leafEls(hits).filter((el) => overlapScore(el, box).coverEl >= 0.35)
-    if (!els.length) {
-      const mod = pickModuleEl(hits, box, frameArea)
-      if (mod && staysInPaint(mod, box)) els = collectColorable(mod).filter((el) => staysInPaint(el, box) || overlapScore(el, box).coverEl >= 0.4)
-    }
-  } else if (kind === 'shadow' || kind === 'reflect' || kind === 'scale-down' || kind === 'scale-up') {
-    const leaves = leafEls(hits).filter((el) => isGraphicEl(el) && overlapScore(el, box).coverEl >= 0.4)
-    els = pickVisualEls(leaves.length ? leaves : [])
-    if (!els.length) els = leaves.slice(0, 3)
-  } else if (kind === 'clear-anno') {
-    els = leafEls(hits)
-  } else {
-    if (large) {
-      const mod = pickModuleEl(hits, box, frameArea)
-      if (mod && staysInPaint(mod, box)) els = [mod]
-    }
-    if (!els.length) els = leafEls(hits)
+    changed = true
   }
+  if (el.dataset.marksetShadow) {
+    const next = soften
+      ? 'drop-shadow(3px 4px 4px rgba(36, 24, 14, 0.22))'
+      : String(el.style.filter || '').replace(/drop-shadow\([^)]*\)/g, '').replace(/\s+/g, ' ').trim()
+    el.style.filter = next
+    if (!soften) {
+      delete el.dataset.marksetShadow
+      if (el.getAttribute('data-markset-flow') === 'shadow') adaptLayout(el, 'clear')
+    }
+    changed = true
+  }
+  if (el.dataset.marksetReflect && !soften) {
+    el.style.webkitBoxReflect = ''
+    delete el.dataset.marksetReflect
+    if (el.getAttribute('data-markset-flow') === 'reflect') adaptLayout(el, 'clear')
+    changed = true
+  }
+  if (el.dataset.marksetTint && !soften) {
+    el.style.filter = String(el.style.filter || '')
+      .replace(/sepia\([^)]*\)|saturate\([^)]*\)|hue-rotate\([^)]*\)|brightness\([^)]*\)/g, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+    delete el.dataset.marksetTint
+    changed = true
+  }
+  if (el.dataset.marksetBg && !soften) {
+    el.style.backgroundColor = el.dataset.marksetOrigBg || ''
+    delete el.dataset.marksetBg
+    changed = true
+  }
+  return changed
+}
 
-  els = uniqueEls(els).filter((el) => el.isConnected && el !== doc.body)
-  if (!els.length) return { ok: false, reason: '圈里没对上可改的网页内容。请把圈贴着要改的那一块再画一次' }
+function setTextScale(el, factor) {
+  let cur = Number(el.dataset.marksetFont)
+  if (!Number.isFinite(cur) || cur <= 0) {
+    try {
+      cur = parseFloat(el.ownerDocument?.defaultView?.getComputedStyle(el)?.fontSize) || 16
+    } catch {
+      cur = 16
+    }
+    el.dataset.marksetFont = String(cur)
+  }
+  const next = Math.max(10, Math.min(96, cur * factor))
+  el.style.fontSize = `${next.toFixed(1)}px`
+  el.dataset.marksetFont = String(next)
+}
 
-  const title = label || kind
-  onBefore?.(title)
-  const before = els.map((el) => snapshotNode(el))
+function isPrimarilyText(el) {
+  return isTextEl(el) && !isGraphicEl(el) && !hasPaintedBg(el)
+}
+
+function scaleOne(el, factor) {
+  if (isPrimarilyText(el)) setTextScale(el, factor)
+  else setElScale(el, factor)
+}
+
+function replaceFilterPart(el, kind, nextCss) {
+  const raw = String(el.style.filter || '')
+  const cleaned = kind === 'shadow'
+    ? raw.replace(/drop-shadow\([^)]*\)/g, '').replace(/\s+/g, ' ').trim()
+    : raw
+  el.style.filter = `${cleaned} ${nextCss}`.trim()
+}
+
+function nudgeEl(el, dx, dy) {
+  const prev = el.style.transform || ''
+  const m = prev.match(/translate\(\s*(-?[\d.]+)px\s*,\s*(-?[\d.]+)px\s*\)/)
+  const x = (m ? Number(m[1]) : 0) + dx
+  const y = (m ? Number(m[2]) : 0) + dy
+  const rest = prev.replace(/translate\(\s*(-?[\d.]+)px\s*,\s*(-?[\d.]+)px\s*\)/, '').trim()
+  el.style.transform = `translate(${Math.round(x)}px, ${Math.round(y)}px)${rest ? ` ${rest}` : ''}`
+  el.setAttribute('data-markset-shifted', '1')
+  const pos = el.ownerDocument?.defaultView?.getComputedStyle(el)?.position
+  if (!pos || pos === 'static') el.style.position = 'relative'
+}
+
+function nudgeDelta(op, label) {
+  const t = String(label || op || '')
+  const m = t.match(/(\d+)\s*(px|像素)?/)
+  const step = m ? Math.min(160, Math.max(8, Number(m[1]))) : 28
+  if (op === 'nudge-left' || /往左|向左|左移|向左挪/.test(t)) return [-step, 0]
+  if (op === 'nudge-right' || /往右|向右|右移|向右挪/.test(t)) return [step, 0]
+  if (op === 'nudge-up' || /往上|向上|上移|往上挪/.test(t)) return [0, -step]
+  if (op === 'nudge-down' || /往下|向下|下移|往下挪/.test(t)) return [0, step]
+  return [0, 0]
+}
+
+function colorModeOf(kind, label) {
+  const t = String(label || '')
+  if (kind === 'color-bg' || /底色|背景色|背景改成|改背景/.test(t)) return 'bg'
+  if (kind === 'color-text' || /字色|文字颜色|字体颜色|只改字/.test(t)) return 'text'
+  if (kind === 'color-image' || (/只改(图|logo|图标)/.test(t) && /色/.test(t))) return 'image'
+  return 'auto'
+}
+
+function colorTargets(els, box, mode) {
+  const expanded = uniqueEls(els.flatMap((el) => collectColorable(el)))
+  return expanded.filter((el) => {
+    if (!aimedLeaf(el, box)) return false
+    if (mode === 'bg') return true
+    if (mode === 'text') return isPrimarilyText(el)
+    if (mode === 'image') return isGraphicEl(el)
+    return isGraphicEl(el) || isTextEl(el)
+  })
+}
+
+function pickSchemeWrap(els, box) {
+  const live = uniqueEls((els || []).filter((el) => el?.isConnected && el !== el.ownerDocument?.body))
+  if (!live.length) return null
+  const frameArea = Math.max(1, (frameEl()?.clientWidth || 1) * (frameEl()?.clientHeight || 1))
+  if (box) {
+    const parent = commonCoveringParent(live, box, frameArea)
+    if (parent && staysInPaint(parent, box)) return parent
+  }
+  return live.slice().sort((a, b) => areaOf(b) - areaOf(a))[0] || live[0]
+}
+
+function applyBgColor(el, name) {
+  const fill = colorFill(name) || name
+  if (!fill) return
+  if (el.dataset.marksetOrigBg == null) el.dataset.marksetOrigBg = el.style.backgroundColor || ''
+  el.style.backgroundColor = fill
+  el.dataset.marksetBg = fill
+}
+
+function pickContentEls(hits, box, frameArea, { large, kind } = {}) {
+  let els = []
+  if (large) {
+    const mod = pickModuleEl(hits, box, frameArea)
+    if (mod && staysInPaint(mod, box)) els = [mod]
+    if (!els.length) els = blockEls(hits, box)
+  }
+  if (!els.length) {
+    els = leafEls(hits, box)
+    if (kind === 'delete-image' || kind === 'color-image') els = els.filter((el) => isGraphicEl(el))
+    if (kind === 'delete-text' || kind === 'color-text') els = els.filter((el) => isPrimarilyText(el))
+  }
+  if (els.length >= 3) {
+    const parent = commonCoveringParent(els, box, frameArea)
+    if (parent && staysInPaint(parent, box)) els = [parent]
+  }
+  return uniqueEls(els).filter((el) => staysInPaint(el, box) || aimedLeaf(el, box))
+}
+
+function pickScaleEls(hits, box, frameArea, large) {
+  const leaves = leafEls(hits, box)
+  const graphics = leaves.filter((el) => isGraphicEl(el))
+  const texts = leaves.filter((el) => isPrimarilyText(el))
+  if (graphics.length && texts.length) {
+    const vis = pickVisualEls([...graphics, ...texts], box)
+    if (vis.length) return vis
+  }
+  if (large) {
+    const mod = pickModuleEl(hits, box, frameArea)
+    if (mod && staysInPaint(mod, box) && graphics.length + texts.length >= 2) return [mod]
+  }
+  if (graphics.length && !texts.length) {
+    const vis = pickVisualEls(graphics, box).filter((el) => aimedLeaf(el, box) || staysInPaint(el, box) || overlapScore(el, box).coverEl >= 0.18)
+    return vis.length ? vis : graphics.slice(0, 3)
+  }
+  if (texts.length && !graphics.length) return texts.slice(0, 8)
+  return leaves.slice(0, 8)
+}
+
+function pickDecorEls(hits, box, frameArea, large, graphicOnly) {
+  if (graphicOnly) {
+    const graphics = leafEls(hits, box).filter((el) => isGraphicEl(el))
+    const vis = pickVisualEls(graphics, box).filter((el) => aimedLeaf(el, box) || staysInPaint(el, box))
+    if (vis.length) return vis
+    if (graphics.length) return graphics.slice(0, 3)
+  }
+  if (large) {
+    const mod = pickModuleEl(hits, box, frameArea)
+    if (mod && staysInPaint(mod, box)) return [mod]
+  }
+  const leaves = leafEls(hits, box)
+  return leaves.length ? leaves : pickContentEls(hits, box, frameArea, { large, kind: '' })
+}
+
+function viewportPolyFromBox(box) {
+  const frame = iframeBox()
+  if (!frame || !box) return []
+  const x = box.x + frame.left
+  const y = box.y + frame.top
+  return [
+    { x, y },
+    { x: x + box.w, y },
+    { x: x + box.w, y: y + box.h },
+    { x, y: y + box.h },
+  ]
+}
+
+function elsFromKnownSpans(box) {
+  return uniqueEls(
+    getSnapshot()
+      .spans.filter((s) => s.webId && (s.kind === 'image' || s.kind === 'text'))
+      .map((s) => findByWebId(s.webId))
+      .filter((el) => {
+        if (!el?.isConnected) return false
+        if (!box) return true
+        const hit = overlapScore(el, box)
+        return hit.coverEl >= 0.08 || centerInPaint(el, box) || hit.coverBox >= 0.04
+      }),
+  )
+}
+
+function fallbackEls(box, kind) {
+  const preferGraphic = /scale|color-image|shadow|reflect|delete-image/.test(String(kind))
+  const preferText = /color-text|delete-text/.test(String(kind))
+  let els = elsFromKnownSpans(box)
+  if (!els.length) {
+    els = scanOverlapEls(box)
+      .filter((h) => {
+        if (!(isGraphicEl(h.el) || isTextEl(h.el) || isWidgetEl(h.el))) return false
+        return h.coverEl >= 0.1 || (centerInPaint(h.el, box) && h.coverBox >= 0.03)
+      })
+      .sort((a, b) => b.coverEl - a.coverEl || a.area - b.area)
+      .slice(0, 8)
+      .map((h) => h.el)
+  }
+  if (!els.length && box) {
+    const hits = hitWebDoc(viewportPolyFromBox(box), { loose: true })
+    els = [...(hits.images?.found || []), ...(hits.texts?.found || [])]
+      .map((s) => findByWebId(s.webId))
+      .filter(Boolean)
+  }
+  els = uniqueEls([...els, ...editTargetEls()])
+  if (preferGraphic) {
+    const vis = pickVisualEls(
+      els.filter((el) => isGraphicEl(el) || isWidgetEl(el)),
+      box,
+    )
+    if (vis.length) return vis
+  }
+  if (preferText) {
+    const texts = els.filter((el) => isPrimarilyText(el))
+    if (texts.length) return texts
+  }
+  const vis = pickVisualEls(els, box)
+  return vis.length ? vis : els.slice(0, 4)
+}
+
+export function resolveCircledEls(kind = '') {
+  const polys = lassoPolys()
+  const box = iframeUnionBox(polys)
+  const found = []
+  for (const poly of polys) {
+    if (!poly?.length) continue
+    const hits = hitWebDoc(poly, { loose: true })
+    for (const s of [...(hits.images?.found || []), ...(hits.texts?.found || [])]) {
+      const el = findByWebId(s.webId)
+      if (el?.isConnected) found.push(el)
+    }
+  }
+  if (box) found.push(...elsFromKnownSpans(box))
+  found.push(...editTargetEls())
+  let els = uniqueEls(found).filter((el) => el?.isConnected && el !== el.ownerDocument?.body)
+  if (!els.length && box) els = fallbackEls(box, kind)
+  const graphics = els.filter((el) => isGraphicEl(el) || isWidgetEl(el))
+  const texts = els.filter((el) => isPrimarilyText(el))
+  const k = String(kind)
+  if (/delete-image|color-image|shadow|reflect/.test(k)) {
+    const vis = pickVisualEls(graphics, box)
+    return vis.length ? vis : graphics.slice(0, 3)
+  }
+  if (/delete-text|color-text/.test(k)) return texts.slice(0, 8)
+  if (k === 'scale-down' || k === 'scale-up') {
+    if (graphics.length) {
+      const vis = pickVisualEls([...graphics, ...texts], box)
+      return vis.length ? vis : graphics.slice(0, 3)
+    }
+    return texts.slice(0, 8)
+  }
+  if (k === 'color' || k === 'color-bg' || k === 'scheme') {
+    const vis = pickVisualEls(graphics, box)
+    return uniqueEls([...(vis.length ? vis : graphics), ...texts]).slice(0, 8)
+  }
+  return uniqueEls([...graphics, ...texts, ...els]).slice(0, 8)
+}
+
+function gatherEls(kind, title, box, hits, frameArea, large) {
+  let els = resolveCircledEls(kind)
+  const doc = getDoc()
+  if (!els.length) {
+    if (kind === 'delete-deco' || kind === 'clear-deco' || kind === 'clear-anno' || kind === 'soften') {
+      els = decoEls(hits, box, doc)
+      if (kind === 'clear-anno') els = els.filter((el) => el.hasAttribute('data-markset-anno'))
+      if (!els.length) els = pickDecorEls(hits, box, frameArea, large, true)
+    } else if (kind.startsWith('delete')) {
+      if (kind === 'delete-image') {
+        els = leafEls(hits, box).filter((el) => isGraphicEl(el) || hasPaintedBg(el))
+        if (!els.length) els = pickContentEls(hits, box, frameArea, { large, kind }).filter((el) => isGraphicEl(el) || hasPaintedBg(el))
+      } else if (kind === 'delete-text') {
+        els = leafEls(hits, box).filter((el) => isPrimarilyText(el))
+        if (!els.length) els = pickContentEls(hits, box, frameArea, { large, kind }).filter((el) => isPrimarilyText(el))
+      } else {
+        els = pickContentEls(hits, box, frameArea, { large, kind })
+      }
+    } else if (kind === 'color' || kind === 'color-bg' || kind === 'color-text' || kind === 'color-image' || kind === 'scheme') {
+      const mode = colorModeOf(kind, title)
+      els = leafEls(hits, box)
+      if (mode === 'text') els = els.filter((el) => isPrimarilyText(el))
+      else if (mode === 'image') els = els.filter((el) => isGraphicEl(el))
+      else if (mode === 'bg') {
+        const mod = large ? pickModuleEl(hits, box, frameArea) : null
+        els = mod && staysInPaint(mod, box) ? [mod] : leafEls(hits, box)
+      }
+      if (!els.length) els = pickContentEls(hits, box, frameArea, { large, kind })
+    } else if (kind === 'scale-down' || kind === 'scale-up') {
+      els = pickScaleEls(hits, box, frameArea, large)
+    } else if (kind === 'shadow' || kind === 'reflect') {
+      els = pickDecorEls(hits, box, frameArea, false, true)
+      if (!els.length) els = pickDecorEls(hits, box, frameArea, large, false)
+    } else if (kind.startsWith('nudge-') || kind === 'move-nudge') {
+      els = pickContentEls(hits, box, frameArea, { large, kind: '' })
+    } else {
+      els = pickDecorEls(hits, box, frameArea, large, false)
+    }
+  }
+  els = uniqueEls(els).filter((el) => el.isConnected && el !== doc?.body)
+  if (!els.length) els = fallbackEls(box, kind)
+  return uniqueEls(els).filter((el) => el?.isConnected && el !== doc?.body)
+}
+
+function elsByStrategy(kind, title, box, hits, frameArea, large, strategy) {
+  const base = gatherEls(kind, title, box, hits, frameArea, large)
+  if (strategy === 'circled') return base
+  if (strategy === 'tight') {
+    const vis = pickVisualEls(base, box)
+    return vis.length ? vis.slice(0, 2) : base.slice(0, 1)
+  }
+  if (strategy === 'graphics') {
+    const g = base.filter((el) => isGraphicEl(el) || isWidgetEl(el))
+    return g.length ? g : base
+  }
+  if (strategy === 'texts') {
+    const t = base.filter((el) => isPrimarilyText(el))
+    return t.length ? t : base
+  }
+  if (strategy === 'module') {
+    const mod = pickModuleEl(hits, box, frameArea)
+    return mod ? [mod] : base.slice(0, 1)
+  }
+  if (strategy === 'fallback') return fallbackEls(box, kind)
+  return base
+}
+
+function applyOpToEls(els, kind, { color, title, box, dx, dy, scheme }) {
   let count = 0
-
-  if (kind.startsWith('delete')) {
+  const mode = colorModeOf(kind, title)
+  if (kind === 'delete-deco' || kind === 'clear-deco' || kind === 'clear-anno' || kind === 'soften') {
+    for (const el of els) {
+      if (stripDeco(el, { soften: kind === 'soften' })) count += 1
+    }
+  } else if (kind.startsWith('delete')) {
     for (const el of els) {
       el.remove()
       count += 1
     }
-  } else if (kind === 'color') {
+  } else if (kind === 'scheme') {
+    const sch = scheme || COLOR_SCHEMES[0]
+    const colors = (sch?.colors || [color || '粉色']).filter(Boolean)
+    const paper = sch?.paper || colors[0]
+    const wrap = pickSchemeWrap(els, box)
+    if (wrap) {
+      applyBgColor(wrap, paper)
+      if (!wrap.style.borderRadius) wrap.style.borderRadius = '14px'
+      if (!wrap.style.boxShadow) wrap.style.boxShadow = '0 10px 28px rgba(40, 24, 16, 0.12)'
+      wrap.dataset.marksetScheme = sch?.id || '1'
+      count += 1
+    }
+    let ci = 0
+    for (const el of els) {
+      const name = colors[ci % colors.length]
+      applyColor(el, name, isGraphicEl(el) || isWidgetEl(el) ? 'image' : 'text')
+      for (const child of collectColorable(el)) {
+        if (child === el) continue
+        applyColor(child, name, isGraphicEl(child) || isWidgetEl(child) ? 'image' : 'text')
+      }
+      ci += 1
+      count += 1
+    }
+  } else if (kind === 'color' || kind === 'color-bg' || kind === 'color-text' || kind === 'color-image') {
     const name = color || '红色'
-    const painted = uniqueEls(els.flatMap((el) => collectColorable(el)))
+    let painted = mode === 'bg' ? els : colorTargets(els, box, mode)
+    if (!painted.length) painted = els
     for (const el of painted) {
-      applyColor(el, name, isGraphicEl(el) ? 'image' : 'text')
+      if (mode === 'bg') applyBgColor(el, name)
+      else {
+        applyColor(el, name, isGraphicEl(el) ? 'image' : 'text')
+        for (const child of collectColorable(el)) {
+          if (child === el) continue
+          applyColor(child, name, isGraphicEl(child) ? 'image' : 'text')
+        }
+      }
       count += 1
     }
   } else if (kind === 'shadow') {
     for (const el of els) {
-      el.style.filter = `${el.style.filter || ''} drop-shadow(6px 10px 8px rgba(36, 24, 14, 0.45))`.trim()
+      replaceFilterPart(el, 'shadow', 'drop-shadow(6px 10px 8px rgba(36, 24, 14, 0.45))')
       el.dataset.marksetShadow = '1'
       adaptLayout(el, 'shadow')
       count += 1
@@ -1242,16 +2047,17 @@ export function executeCircledOp(op, { color = '', label = '', onBefore } = {}) 
       count += 1
     }
   } else if (kind === 'scale-down' || kind === 'scale-up') {
+    const factor = kind === 'scale-down' ? 0.72 : 1.28
     for (const el of els) {
-      setElScale(el, kind === 'scale-down' ? 0.82 : 1.22)
+      scaleOne(el, factor)
       count += 1
     }
-  } else if (kind === 'clear-anno') {
+  } else if (kind.startsWith('nudge-') || kind === 'move-nudge') {
+    const delta = (dx || dy) ? [dx, dy] : nudgeDelta(kind, title)
+    if (!delta[0] && !delta[1]) return { count: 0, reason: '写明往哪挪：往左 / 往右 / 往上 / 往下' }
     for (const el of els) {
-      if (el.hasAttribute('data-markset-anno')) {
-        el.removeAttribute('data-markset-anno')
-        count += 1
-      }
+      nudgeEl(el, delta[0], delta[1])
+      count += 1
     }
   } else {
     const anno = annoKind(kind)
@@ -1260,22 +2066,79 @@ export function executeCircledOp(op, { color = '', label = '', onBefore } = {}) 
       count += 1
     }
   }
+  return { count }
+}
 
-  if (!count) return { ok: false, reason: '没有改到圈中的内容' }
-  const after = before.map((shot, i) => {
-    const el = els[i]
-    if (!el?.isConnected) return { ...shot, removed: true }
-    return snapshotNode(el)
-  })
-  recordWebEdit(title, before, after)
-  fitHeight()
-  return {
-    ok: true,
-    count,
-    message: kind.startsWith('delete')
-      ? `已删除圈中内容，共 ${count} 处。可还原这一处`
-      : `已改圈中内容，共 ${count} 处。可还原这一处`,
+export function executeCircledOp(op, { color = '', label = '', onBefore, dx = 0, dy = 0, scheme = null } = {}) {
+  const doc = getDoc()
+  const iframe = frameEl()
+  if (!doc?.body || !iframe) return { ok: false, reason: '没有导入的网页' }
+  const box = iframeUnionBox(drawingPolys())
+  if (!box || box.w < 6 || box.h < 6) return { ok: false, reason: '没有可用的圈。请再圈一次要改的地方' }
+  const frameArea = Math.max(1, iframe.clientWidth * iframe.clientHeight)
+  const hits = scanOverlapEls(box)
+  const paintArea = box.w * box.h
+  const large = paintArea > frameArea * 0.07 || Math.max(box.w, box.h) > 200
+  const kind = String(op || '')
+  const title = label || kind
+  const html = snapshotWebHtml()
+  const strategies = ['circled', 'tight', 'graphics', 'texts', 'module', 'fallback']
+  const seen = new Set()
+  for (const strategy of strategies) {
+    if (strategy !== 'circled') restoreWebHtml(html)
+    const els = (() => {
+      const picked = elsByStrategy(kind, title, box, scanOverlapEls(box), frameArea, large, strategy)
+      if (kind !== 'scheme') return picked
+      const wrap = pickSchemeWrap(picked, box)
+      return wrap ? uniqueEls([wrap, ...picked]) : picked
+    })()
+    if (!els.length) continue
+    const key = `${strategy}:${els.map((el) => el.getAttribute('data-markset-id') || el.tagName).join(',')}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    const beforeEv = els.map((el) => evidenceOf(el))
+    const before = els.map((el) => snapshotNode(el))
+    const applied = applyOpToEls(els, kind, { color, title, box, dx, dy, scheme })
+    if (applied.reason && !applied.count) continue
+    if (!applied.count) continue
+    const afterEv = els.map((el) => evidenceOf(el))
+    if (!verifyKind(kind, beforeEv, afterEv)) continue
+    onBefore?.(title)
+    const after = before.map((shot, i) => {
+      const el = els[i]
+      if (!el?.isConnected) return { ...shot, removed: true }
+      return snapshotNode(el)
+    })
+    recordWebEdit(title, before, after)
+    fitHeight()
+    console.log(`[markset exec] ${kind} n=${applied.count} via=${strategy} ${els.map((el) => el.tagName).join(',')}`)
+    const removed = kind.startsWith('delete') && kind !== 'delete-deco'
+    return {
+      ok: true,
+      count: applied.count,
+      message: removed
+        ? `已删除圈中内容，共 ${applied.count} 处。可还原这一处`
+        : `已改圈中内容，共 ${applied.count} 处。可还原这一处`,
+    }
   }
+  restoreWebHtml(html)
+  return { ok: false, reason: '试了几种改法，改完比对仍达不到要求。圈和批注还留着，可换一项或把圈贴紧再试' }
+}
+
+function writebackOp(kind, commandText) {
+  const t = String(commandText || '')
+  if (kind === 'delete' || kind === 'delete-text' || kind === 'delete-image' || kind === 'delete-deco') return kind
+  if (/去掉(阴影|倒影|框|装饰|标注|高亮)|取消(阴影|倒影|框)/.test(t)) return 'clear-deco'
+  if (/倒影|镜像|反射/.test(t) || kind === 'reflect') return 'reflect'
+  if (/阴影|投影|影子/.test(t) || kind === 'shadow') return 'shadow'
+  if (/缩小|变小|小一点/.test(t) || kind === 'scale-down') return 'scale-down'
+  if (/放大|变大|大一点/.test(t) || kind === 'scale-up') return 'scale-up'
+  if (/底色|背景色|改背景/.test(t)) return 'color-bg'
+  if (/往左|向左|左移/.test(t)) return 'nudge-left'
+  if (/往右|向右|右移/.test(t)) return 'nudge-right'
+  if (/往上|向上|上移/.test(t)) return 'nudge-up'
+  if (/往下|向下|下移/.test(t)) return 'nudge-down'
+  return ''
 }
 
 export async function runWebWriteback(kind, notify, { onBefore } = {}) {
@@ -1287,81 +2150,44 @@ export async function runWebWriteback(kind, notify, { onBefore } = {}) {
     ...fromHits.images,
     ...fromHits.texts,
   ]).filter((s, i, arr) => s.webId && s.kind !== 'slot' && arr.findIndex((x) => x.webId === s.webId) === i)
-  if (!web.length) {
-    notify('没圈到可改的网页内容。请把圈画在要改的文字或图片上')
-    return false
-  }
   const snap = getSnapshot()
   const scope = snap.scope || 'inside'
   const commandText = inferCommandText(snap.commandText, web.filter((s) => s.kind === 'text'))
   const parsed = parseCommand(commandText)
-  const deco = /倒影|镜像|反射/.test(commandText)
-    ? 'reflect'
-    : /阴影|投影|影子/.test(commandText)
-      ? 'shadow'
-      : /缩小|变小|小一点/.test(commandText) || kind === 'scale-down'
-        ? 'scale-down'
-        : /放大|变大|大一点/.test(commandText) || kind === 'scale-up'
-          ? 'scale-up'
-          : ''
-  if (deco === 'reflect' || kind === 'reflect') {
-    onBefore?.('加倒影')
-    const ok = applyWebReflect()
-    if (!ok) {
-      notify('先圈要加倒影的图')
+  const routed = writebackOp(kind, commandText)
+  if (routed || (parsed.color && kind !== 'rewrite' && kind !== 'replace')) {
+    const op = routed || 'color'
+    const result = executeCircledOp(op, {
+      color: parsed.color,
+      label: commandText || op,
+      onBefore,
+    })
+    if (!result.ok) {
+      notify(result.reason || '没圈到可改的网页内容。请把圈画在要改的文字或图片上')
       return false
     }
     ping()
     fitHeight()
-    notify('已在网页上加上倒影，仍是 HTML。可撤回这一处')
+    notify(result.message)
     return true
   }
-  if (deco === 'shadow' || kind === 'shadow') {
-    onBefore?.('加阴影')
-    const ok = applyWebShadow()
-    if (!ok) {
-      notify('先圈要加阴影的图')
-      return false
-    }
-    ping()
-    fitHeight()
-    notify('已在网页上加上阴影，仍是 HTML。可撤回这一处')
-    return true
-  }
-  if (deco === 'scale-down' || deco === 'scale-up' || kind === 'scale-down' || kind === 'scale-up') {
-    const down = deco === 'scale-down' || kind === 'scale-down'
-    onBefore?.(down ? '缩小' : '放大')
-    const ok = applyWebScale(down ? 0.82 : 1.22, down ? '缩小' : '放大')
-    if (!ok) {
-      notify('先圈要缩放的 Logo 或图片')
-      return false
-    }
-    ping()
-    fitHeight()
-    notify(down ? '已缩小圈中内容，仍是 HTML。可撤回这一处' : '已放大圈中内容，仍是 HTML。可撤回这一处')
-    return true
-  }
-  if (parsed.color && kind !== 'delete') {
-    onBefore?.('改颜色')
-    const ok = applyWebColor(parsed.color)
-    if (!ok) {
-      notify('没圈到可改颜色的字或图。请贴着要改的文字或图片画圈')
-      return false
-    }
-    ping()
-    fitHeight()
-    notify(`已把圈中的内容改成${parsed.color}（字和图会一起改）。可撤回这一处`)
-    return true
+  if (!web.length) {
+    notify('没圈到可改的网页内容。请把圈画在要改的文字或图片上')
+    return false
   }
   if ((kind === 'rewrite' || kind === 'unify' || kind === 'replace') && !commandText && !parsed.color) {
     notify('先写下新名字或选出颜色')
     return false
   }
-  if (kind === 'delete') {
-    /* user already picked a delete guess */
-  }
 
-  const items = web.map((s) => ({ span: s, el: findByWebId(s.webId) })).filter((x) => x.el)
+  const paintBox = iframeUnionBox(drawingPolys())
+  const items = web
+    .map((s) => ({ span: s, el: findByWebId(s.webId) }))
+    .filter((x) => {
+      if (!x.el) return false
+      if (!paintBox) return true
+      return aimedLeaf(x.el, paintBox) || staysInPaint(x.el, paintBox) || overlapScore(x.el, paintBox).coverEl >= 0.45
+    })
   const useModel = isClientModelGateOn() && (kind === 'rewrite' || kind === 'unify') && items.some((x) => x.span.kind === 'text')
   if (useModel) {
     const ok = window.confirm(`将调用云端改写 ${items.filter((x) => x.span.kind === 'text').length} 处文字，会消耗额度。确定？`)
@@ -1374,15 +2200,6 @@ export async function runWebWriteback(kind, notify, { onBefore } = {}) {
   let count = 0
   const rewritten = new Set()
   for (const { span, el } of items) {
-    if (kind === 'delete') {
-      el.remove()
-      count += 1
-      continue
-    }
-    if (parsed.color && (span.kind === 'text' || span.kind === 'image')) {
-      applyColor(el, parsed.color, span.kind)
-      count += 1
-    }
     if (span.kind !== 'text') continue
     let next = localNextText(span, commandText, kind)
     if (useModel) {
@@ -1432,14 +2249,162 @@ export async function runWebWriteback(kind, notify, { onBefore } = {}) {
   return true
 }
 
+function insertHostBox() {
+  const doc = getDoc()
+  const box = iframeUnionBox(drawingPolys())
+  if (!doc?.body || !box) return null
+  try {
+    const pos = doc.defaultView?.getComputedStyle(doc.body)?.position
+    if (!pos || pos === 'static') doc.body.style.position = 'relative'
+  } catch {
+    doc.body.style.position = 'relative'
+  }
+  return { doc, box }
+}
+
+export function insertWebText(text) {
+  const host = insertHostBox()
+  if (!host) return { ok: false, reason: '请先圈要插入的空白位置' }
+  const t = String(text || '').trim()
+  if (!t) return { ok: false, reason: '先写下要插入的文字' }
+  const { doc, box } = host
+  const el = doc.createElement('p')
+  el.textContent = t
+  el.setAttribute('data-markset-insert', 'text')
+  el.style.cssText = [
+    `position:absolute`,
+    `left:${Math.round(box.x + 16)}px`,
+    `top:${Math.round(box.y + Math.max(20, box.h * 0.28))}px`,
+    `max-width:${Math.round(Math.max(140, box.w - 32))}px`,
+    `margin:0`,
+    `padding:4px 6px`,
+    `font:20px/1.5 system-ui,sans-serif`,
+    `color:#1d1916`,
+    `z-index:8`,
+  ].join(';')
+  doc.body.append(el)
+  stampIds(doc)
+  const after = snapshotNode(el)
+  recordWebEdit('插入文字', [{ ...after, html: '', removed: true }], [after])
+  fitHeight()
+  return { ok: true, message: '已在圈中空白插入文字。可还原这一处' }
+}
+
+export function insertWebStamp(src, screenBox) {
+  const doc = getDoc()
+  const frame = iframeBox()
+  const url = String(src || '').trim()
+  if (!doc?.body || !frame || !url || !screenBox) return { ok: false, reason: '没有可放下的图案' }
+  const el = doc.createElement('img')
+  el.src = url
+  el.alt = '画出的图案'
+  el.setAttribute('data-markset-insert', 'stamp')
+  const x = Math.round(screenBox.x - frame.left)
+  const y = Math.round(screenBox.y - frame.top)
+  const w = Math.round(Math.max(28, screenBox.w))
+  el.style.cssText = [
+    `position:absolute`,
+    `left:${x}px`,
+    `top:${y}px`,
+    `width:${w}px`,
+    `height:${Math.round(Math.max(28, screenBox.h))}px`,
+    `object-fit:contain`,
+    `background:transparent`,
+    `pointer-events:none`,
+    `z-index:6`,
+  ].join(';')
+  const pos = doc.defaultView?.getComputedStyle(doc.body)?.position
+  if (!pos || pos === 'static') doc.body.style.position = 'relative'
+  doc.body.append(el)
+  stampIds(doc)
+  const after = snapshotNode(el)
+  recordWebEdit('加上画出的图案', [{ ...after, html: '', removed: true }], [after])
+  el.addEventListener('load', fitHeight, { once: true })
+  fitHeight()
+  return { ok: true, message: '已把画出的图案放到页面上。可还原这一处' }
+}
+
+export function insertWebImage(src) {
+  const host = insertHostBox()
+  if (!host) return { ok: false, reason: '请先圈要插入的空白位置' }
+  const url = String(src || '').trim()
+  if (!url) return { ok: false, reason: '先选一张要插入的图' }
+  const { doc, box } = host
+  const el = doc.createElement('img')
+  el.src = url
+  el.alt = '插入的图'
+  el.setAttribute('data-markset-insert', 'image')
+  const w = Math.round(Math.max(72, Math.min(360, box.w * 0.56)))
+  el.style.cssText = [
+    `position:absolute`,
+    `left:${Math.round(box.x + Math.max(12, (box.w - w) / 2))}px`,
+    `top:${Math.round(box.y + Math.max(16, box.h * 0.22))}px`,
+    `width:${w}px`,
+    `height:auto`,
+    `max-width:${Math.round(box.w - 24)}px`,
+    `z-index:8`,
+  ].join(';')
+  doc.body.append(el)
+  stampIds(doc)
+  const after = snapshotNode(el)
+  recordWebEdit('插入图片', [{ ...after, html: '', removed: true }], [after])
+  el.addEventListener('load', fitHeight, { once: true })
+  fitHeight()
+  return { ok: true, message: '已在圈中空白插入图片。可还原这一处' }
+}
+
 function fileName() {
   const raw = String(meta.title || 'markset-page').replace(/[\\/:*?"<>|]+/g, ' ').trim() || 'markset-page'
   return `${raw.slice(0, 40)}.html`
 }
 
+function cleanExportDoc(raw) {
+  const parsed = new DOMParser().parseFromString(raw, 'text/html')
+  parsed.getElementById(SKIN_ID)?.remove()
+  parsed.getElementById(BADGE_HOST)?.remove()
+  parsed.querySelectorAll('[data-markset-badge-host],[data-markset-edit-badge]').forEach((el) => el.remove())
+  const keepSkin = parsed.createElement('style')
+  keepSkin.textContent = `
+[data-markset-anno="underline"] { text-decoration: underline 2px; text-underline-offset: 3px; }
+[data-markset-anno="wavy"] { text-decoration: underline wavy 2px #3c6fd4; text-underline-offset: 3px; }
+[data-markset-anno="strike"], [data-markset-anno="line-strike"] { text-decoration: line-through 2px; }
+[data-markset-anno="highlight"] { background: rgba(255, 226, 80, 0.55); }
+[data-markset-anno="bold"] { font-weight: 700; }
+[data-markset-anno="box"], [data-markset-anno="frame"] { outline: 2px solid #3c6fd4; outline-offset: 3px; }
+[data-markset-anno="circle"] { outline: 2px solid #3c6fd4; border-radius: 999px; outline-offset: 4px; }
+[data-markset-scaled] { transform-origin: center center; }
+`
+  parsed.head?.append(keepSkin)
+  const dropAttrs = [
+    'data-markset-id',
+    'data-markset-orig-w',
+    'data-markset-orig-h',
+    'data-markset-orig-bg',
+    'data-markset-mar-b',
+    'data-markset-mar-r',
+    'data-markset-zoom',
+    'data-markset-overflow',
+    'data-markset-font',
+  ]
+  parsed.querySelectorAll('*').forEach((el) => {
+    dropAttrs.forEach((name) => el.removeAttribute(name))
+    if (el.dataset) {
+      delete el.dataset.marksetOrigW
+      delete el.dataset.marksetOrigH
+      delete el.dataset.marksetOrigBg
+      delete el.dataset.marksetMarB
+      delete el.dataset.marksetMarR
+      delete el.dataset.marksetZoom
+      delete el.dataset.marksetOverflow
+      delete el.dataset.marksetFont
+    }
+  })
+  return `<!DOCTYPE html>\n${parsed.documentElement.outerHTML}`
+}
+
 export function exportWebDoc() {
   if (!isWebDocActive()) return false
-  const html = snapshotWebHtml()
+  const html = cleanExportDoc(snapshotWebHtml())
   if (!html.trim()) return false
   const blob = new Blob([html], { type: 'text/html;charset=utf-8' })
   const a = document.createElement('a')

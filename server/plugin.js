@@ -38,6 +38,7 @@ function models(env) {
   return {
     rewriteModel: env.DASHSCOPE_REWRITE_MODEL || 'qwen3.6-flash',
     plannerModel: env.DASHSCOPE_PLANNER_MODEL || 'qwen3-vl-plus',
+    ocrModel: env.DASHSCOPE_OCR_MODEL || 'qwen-vl-ocr-latest',
     inpaintModel: env.DASHSCOPE_INPAINT_MODEL || 'wanx2.1-imageedit',
   }
 }
@@ -77,24 +78,25 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms))
 }
 
-async function dashChat(env, { model, messages, temperature = 0.2 }) {
+async function dashChat(env, { model, messages, temperature = 0.2, thinking = 'off' }) {
+  const body = {
+    model,
+    temperature,
+    messages,
+  }
+  if (thinking === 'off') body.enable_thinking = false
   const res = await fetch(`${dashBase(env)}/chat/completions`, {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${env.DASHSCOPE_API_KEY}`,
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({
-      model,
-      temperature,
-      enable_thinking: false,
-      messages,
-    }),
+    body: JSON.stringify(body),
   })
   const data = await res.json().catch(() => ({}))
   if (!res.ok) {
     const err = new Error(data.error?.message || data.message || `dashscope ${res.status}`)
-    err.status = 502
+    err.status = res.status >= 400 && res.status < 500 ? res.status : 502
     throw err
   }
   const textOut = data.choices?.[0]?.message?.content?.trim()
@@ -104,6 +106,76 @@ async function dashChat(env, { model, messages, temperature = 0.2 }) {
     throw err
   }
   return textOut
+}
+
+function modelUnavailable(err) {
+  const m = String(err?.message || '')
+  return /not found|does not exist|InvalidParameter|model_not_found|AccessDenied|Arrearage|unsupport|未开通|不存在|无权限|不支持/i.test(m)
+}
+
+let ocrModelOk = ''
+
+function cleanOcrText(raw) {
+  let t = String(raw || '').trim()
+  if (!t) return ''
+  const start = t.indexOf('{')
+  const end = t.lastIndexOf('}')
+  if (start >= 0 && end > start) {
+    try {
+      const json = JSON.parse(t.slice(start, end + 1))
+      t = String(json.text || json.handwriting || json.result || t)
+    } catch {
+      /* keep raw */
+    }
+  }
+  t = t
+    .replace(/^手写(汉字|内容|文字)?[：:]\s*/u, '')
+    .replace(/^["'`「」『』]+|["'`「」『』]+$/g, '')
+    .replace(/\s+/g, '')
+    .trim()
+  if (t.length > 24) t = t.slice(0, 24)
+  return t
+}
+
+async function transcribeInk(env, imageUrl, instruction) {
+  const { ocrModel, plannerModel } = models(env)
+  const prompt =
+    instruction ||
+    '只识别图中的手写汉字，按书写顺序原样输出。不要解释，不要把圈线认成字。没有手写就输出空。'
+  const content = [
+    { type: 'text', text: prompt },
+    {
+      type: 'image_url',
+      image_url: { url: imageUrl },
+      min_pixels: 3072,
+      max_pixels: 8388608,
+    },
+  ]
+  const list = [...new Set([ocrModelOk, ocrModel, 'qwen-vl-ocr-latest', 'qwen3.5-ocr', 'qwen-vl-ocr', plannerModel].filter(Boolean))]
+  let lastErr
+  for (const model of list) {
+    try {
+      const isOcr = /ocr/i.test(model)
+      const textOut = await dashChat(env, {
+        model,
+        temperature: 0,
+        thinking: isOcr ? 'omit' : 'off',
+        messages: isOcr
+          ? [{ role: 'user', content }]
+          : [
+              { role: 'system', content: planSystem('ink') },
+              { role: 'user', content },
+            ],
+      })
+      ocrModelOk = model
+      return { textOut, model }
+    } catch (err) {
+      lastErr = err
+      if (ocrModelOk === model) ocrModelOk = ''
+      if (!modelUnavailable(err) && err.status !== 400 && err.status !== 404) throw err
+    }
+  }
+  throw lastErr || new Error('ocr failed')
 }
 
 async function rewrite(env, payload) {
@@ -133,16 +205,26 @@ async function rewrite(env, payload) {
 }
 
 function planSystem(task) {
-  if (task === 'intent' || task === 'ink') {
+  if (task === 'ink') {
     return [
-      'Output JSON only: {"guesses":[{"id":"delete","label":"删掉圈中的这块","note":"delete","command":""}],"text":"识别出的手写","note":"delete","guess":"..."}.',
-      'First read any handwritten Chinese (text field). Then look at the drawing (lasso, scribble, X, underline, shadow, arrow) and WHERE it sits on the page.',
-      'Combine the written words WITH the drawn region. Example: circle an icon and write 删 = delete that icon; scribble beside an image and write 阴影 = add shadow there.',
-      'Do NOT guess the site logo unless the stroke actually covers it. If the circle contains only text, edit that text; only an image, edit that image; both, edit both.',
-      'If the circle is empty or a freehand sketch away from the logo, do not propose logo edits.',
-      'Give 3 or 4 guesses, most likely first. label is a short spoken Chinese sentence.',
-      'id is one of: delete, delete-image, delete-text, color, name, polish, custom, frame, circle, shadow, reflect, scale-down, scale-up, indent, move-layout, strike, longer, shorter, highlight, underline.',
-      'Do NOT assume a closed loop is a selection. command is a concrete value if any (雾蓝, 海盐杯). If asked for more, do not repeat already offered labels.',
+      'Output JSON only: {"text":"..."}.',
+      'Transcribe handwritten Chinese from the stroke images. Blue strokes are the lasso or paint. Black strokes are handwriting.',
+      'Return the exact characters you see, even if messy. Use an empty string if there is no handwriting.',
+      'Do not guess an editing operation. Do not describe the webpage. Do not treat the blue circle as a character.',
+    ].join(' ')
+  }
+  if (task === 'intent') {
+    return [
+      'Output JSON only: {"text":"缩小","note":"scale-down","guesses":[{"id":"scale-down","label":"把圈中内容缩小","note":"scale-down","command":""}]}.',
+      'The JSON above is only a schema. Choose ids that match THIS user writing, not the example.',
+      'You MUST read handwritten Chinese from the images. Image 1 is a white stroke board (blue = circle/paint, black = handwriting). Image 2 is a handwriting close-up. Image 3 is the circled region on the page. Image 4 is the full page.',
+      'Field text = exact handwritten characters. If the user message already gives a transcription, copy it into text and trust it unless the image clearly disagrees.',
+      'Combine writing WITH where the blue stroke sits. Circle text → edit that text. Circle an image → edit that image. Circle mostly empty space → operate on the blank. An edge-grazing search box is not the target.',
+      'Map the written words to ops. 删/叉/× → delete. 红/蓝/绿色/改色 → color. 缩小 → scale-down. 放大 → scale-up. 阴影 → shadow. 倒影 → reflect. 加框 → frame. 加/插入 on blank with no drawing → insert-text. Drawn pattern / sunburst / star around an object → stamp. Arrow or source-circle plus dest-circle → move-layout. Other words: interpret them, do not default to delete or insert.',
+      'If there is NO handwriting, judge the drawing itself. Radiating lines around a logo are stamp (paste the drawn rays), not insert-text and not delete-deco. Do not treat a leftover empty blue box as the main intent when black strokes decorate an object.',
+      'Give 3 or 4 guesses, most likely first. The first guess MUST match the handwritten meaning, or the drawing if there is no writing. label is a short spoken Chinese sentence.',
+      'id is one of: insert-text, insert-image, stamp, deco, delete, delete-image, delete-text, delete-deco, clear-deco, color, color-bg, color-text, color-image, name, polish, custom, frame, circle, shadow, reflect, scale-down, scale-up, indent, move-layout, nudge-left, nudge-right, nudge-up, nudge-down, strike, longer, shorter, highlight, underline, soften.',
+      'command is a concrete value if any (雾蓝, 海盐杯). If asked for more, do not repeat already offered labels.',
     ].join(' ')
   }
   if (task === 'guess') {
@@ -164,8 +246,8 @@ async function plan(env, payload) {
   const task = String(payload.task || 'ops')
   const defaults = {
     guess: '根据选中笔迹猜测用户想把这块改成什么，输出一句简短中文。',
-    ink: '读出手写和圈选，判断用户想删、改颜色、改字、加装饰还是挪位置。',
-    intent: '看网页截图和手写批注，理解用户意图。',
+    ink: '只识别图中的手写汉字，按书写顺序原样输出。不要解释，不要把圈线认成字。没有手写就输出空。',
+    intent: '先确认手写批注；没有手写就根据画法（光芒、箭头、图案、两圈布局）给出操作。不要默认删除或插入。',
     'find-same': '找出图中与当前选中物体同类的其他物体，不要重复已圈的框。',
   }
   const instruction = String(payload.instruction || '').trim() || defaults[task] || ''
@@ -181,6 +263,31 @@ async function plan(env, payload) {
     err.status = 400
     throw err
   }
+
+  if (task === 'ink') {
+    const url = imageUrl || extraImages[0]
+    if (!url) {
+      const err = new Error('missing image')
+      err.status = 400
+      throw err
+    }
+    const { textOut, model } = await transcribeInk(env, url, instruction)
+    const handwritingOut = cleanOcrText(textOut)
+    console.log(`[markset ink] model=${model} text=${handwritingOut.slice(0, 24)}`)
+    return {
+      text: textOut,
+      handwriting: handwritingOut,
+      ops: [],
+      boxes: [],
+      guess: '',
+      note: '',
+      command: '',
+      intent: '',
+      guesses: [],
+      model,
+    }
+  }
+
   const handwriting = String(payload.handwriting || '').trim()
   const userContent = [
     {
@@ -190,7 +297,9 @@ async function plan(env, payload) {
         `指令：${instruction}`,
         `范围：${scope}`,
         `按钮：${kind}`,
-        handwriting ? `本地先认出的手写字：${handwriting}` : '若图中有手写，先读出汉字。',
+        handwriting
+          ? `已读出的手写（以它为准，除非图中明显不是这几个字）：${handwriting}`
+          : '请从笔迹图读出汉字。没有手写就根据画法理解。',
         `当前圈到的内容：\n${marks || '无'}`,
         outsideTexts ? `圈外相同品名（辐射式必须改，不要只改圈内）：\n${outsideTexts}` : '',
         pageText ? `全文（禁改：价格/物流/专利）：\n${pageText}` : '',
@@ -221,6 +330,7 @@ async function plan(env, payload) {
   let command = ''
   let intent = ''
   let guesses = []
+  let handwritingOut = ''
   try {
     const start = textOut.indexOf('{')
     const end = textOut.lastIndexOf('}')
@@ -233,12 +343,18 @@ async function plan(env, payload) {
       if (json.note) note = String(json.note)
       if (json.command) command = String(json.command)
       if (json.intent) intent = String(json.intent)
-      if (json.text && !guess) guess = String(json.text)
+      if (json.handwriting) handwritingOut = String(json.handwriting)
+      else if (json.text) handwritingOut = String(json.text)
+      if (!guess && task !== 'intent' && task !== 'ink' && json.text) guess = String(json.text)
     }
   } catch {
     ops = []
   }
-  return { text: textOut, ops, boxes, guess, note, command, intent, guesses, model: plannerModel }
+  if (task === 'intent') {
+    const first = guesses[0]?.id || note || ''
+    console.log(`[markset intent] model=${plannerModel} text=${(handwritingOut || handwriting).slice(0, 24)} id=${first}`)
+  }
+  return { text: textOut, handwriting: handwritingOut, ops, boxes, guess, note, command, intent, guesses, model: plannerModel }
 }
 
 async function inlineImage(url) {

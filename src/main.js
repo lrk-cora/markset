@@ -19,7 +19,7 @@ import { bindLasso, getStrokeColor, isAddMode, isColorMode, isLassoMode, isLayou
 import { applyScopeAfterSelect } from './scope.js'
 import { guessStrokePrompt } from './vision-tasks.js'
 import { ingestLayoutStroke } from './layout.js'
-import { exportWebDoc, hitWebDoc, isWebDocActive, unmountWebDoc } from './web-doc.js'
+import { exportWebDoc, hitWebDoc, isWebDocActive, looksLikeWebLayoutDest, pairWebLayoutDest, unmountWebDoc } from './web-doc.js'
 import { clearLocalUndos, dismissCoach, getCard, idleCard, keepCardForAppend, openPageRecolor, applyWrittenNote, resetCardForNewSelection, resetPagePaper, setPaintGesture, shouldTreatStrokeAsInk, canUndoLocal } from './card-flow.js'
 import { addInkStroke, clearInk, hasInk, isLikelyInk, onInkRecognized } from './ink.js'
 import { exitToView } from './view-mode.js'
@@ -363,15 +363,15 @@ function applyHits(textHits, imageHits, polygon, { append, subtract, add, color,
     const existing = getSnapshot().spans
     const keepContent = existing.some((s) => s.kind === 'text' || s.kind === 'image')
     if (slot && keepContent) {
-      appendSpans([slot], editor.state.doc)
       keepCardForAppend()
+      appendSpans([slot], editor.state.doc)
       dismissCoach()
       toast(emptyPaintToast(slot))
       return
     }
     if (slot) {
-      replaceSpans([slot])
       resetCardForNewSelection()
+      replaceSpans([slot])
       dismissCoach()
       toast(emptyPaintToast(slot))
       return
@@ -383,8 +383,8 @@ function applyHits(textHits, imageHits, polygon, { append, subtract, add, color,
     toast('涂过字或杯子，或在空白处画一笔')
     return
   }
-  replaceSpans(next)
   resetCardForNewSelection()
+  replaceSpans(next)
   dismissCoach()
   if (consumePackagingHint() && next.some((s) => s.kind === 'image')) {
     toast('已加上包装上的字（不贴物体）', 4200)
@@ -457,7 +457,7 @@ bindLasso({
       return false
     }
     if (rawPoints?.length) setPaintGesture(rawPoints, { silent: true })
-    const webHits = isWebDocActive() ? hitWebDoc(polygon) : null
+    const webHits = isWebDocActive() ? hitWebDoc(polygon, { loose: true }) : null
     const textHits = webHits ? webHits.texts : hitText(editor.view, polygon, { skipCovered: shift && !subtract })
     const rawImageHits = webHits ? webHits.images : hitImages(editor.view, polygon)
     const imageHits =
@@ -483,6 +483,14 @@ bindLasso({
     ) {
       addInkStroke(rawPoints)
       return false
+    }
+    if (isWebDocActive() && !subtract && !add && !color && looksLikeWebLayoutDest(rawPoints, polygon)) {
+      clearInk()
+      keepCardForAppend()
+      pairWebLayoutDest(rawPoints, polygon, getStrokeColor())
+      dismissCoach()
+      toast('已把后一圈当成落点，不会当成新选区。可点「移到画出的位置」')
+      return { append: true }
     }
     if (isLayoutPen() && !subtract && !add && !color) {
       clearInk()

@@ -1,5 +1,5 @@
 import { insertImageAt, insertParagraphAt, newBlockId, pageRelativeRect } from './editor.js'
-import { liveScreenRect } from './web-doc.js'
+import { insertWebImage, insertWebText, isWebDocActive, liveScreenRect, listWebEdits, redoWebEdit, restoreWebEdit, webEditAnchor } from './web-doc.js'
 import { blockRange } from './hit-test.js'
 import { tintedMaskCanvas } from './mask.js'
 import { isLassoMode } from './overlay.js'
@@ -358,14 +358,19 @@ function relayoutAfterInsert(editor) {
 }
 
 function insertText(editor) {
-  const slots = slotTargets()
-  if (!slots.length) {
-    toast('先圈页上还没有字和图的空白（不要圈照片里的桌子）')
-    return
-  }
   const text = getSnapshot().commandText.trim()
   if (!text) {
     toast('在输入框里写要插入的文字')
+    return
+  }
+  if (isWebDocActive()) {
+    const result = insertWebText(text)
+    toast(result.ok ? result.message : result.reason)
+    return
+  }
+  const slots = slotTargets()
+  if (!slots.length) {
+    toast('先圈页上还没有字和图的空白（不要圈照片里的桌子）')
     return
   }
   const slot = [...slots].sort((a, b) => a.screenRect.y - b.screenRect.y)[0]
@@ -412,27 +417,32 @@ function fitInSlot(slot, nat) {
 
 function insertImage(editor) {
   const slots = slotTargets()
-  if (!slots.length) {
+  if (!isWebDocActive() && !slots.length) {
     toast('先圈页上还没有字和图的空白（不要圈照片里的桌子）')
     return
   }
-  const slot = [...slots].sort((a, b) => a.screenRect.y - b.screenRect.y)[0]
+  const slot = slots[0]
   const input = document.createElement('input')
   input.type = 'file'
   input.accept = 'image/*'
   input.addEventListener('change', async () => {
     const file = input.files?.[0]
     if (!file) return
-    const current = slotTargets()
-    const target =
-      current.find((s) => s.markId === slot.markId) ||
-      [...current].sort((a, b) => a.screenRect.y - b.screenRect.y)[0]
-    if (!target) {
-      toast('空白槽已不在，请再圈一次纸面')
-      return
-    }
     try {
       const src = await readDataUrl(file)
+      if (isWebDocActive()) {
+        const result = insertWebImage(src)
+        toast(result.ok ? result.message : result.reason)
+        return
+      }
+      const current = slotTargets()
+      const target =
+        current.find((s) => s.markId === slot?.markId) ||
+        [...current].sort((a, b) => a.screenRect.y - b.screenRect.y)[0]
+      if (!target) {
+        toast('空白槽已不在，请再圈一次纸面')
+        return
+      }
       const nat = await naturalSizeOf(src)
       const size = fitInSlot(target, nat)
       const placed = pageRelativeRect(target.screenRect)
@@ -550,6 +560,10 @@ function changeAnchor(view, item) {
 }
 
 function schemeModuleAnchor(editor, module) {
+  if (module.webId) {
+    const r = liveScreenRect({ webId: module.webId })
+    if (r) return { x: r.x + r.w + 6, y: r.y }
+  }
   if (module.kind === 'paper') {
     const page = document.querySelector('.page')
     if (!page) return null
@@ -688,6 +702,41 @@ function addSchemeTags(layer, editor) {
     }
 
     layer.append(tag)
+  }
+}
+
+function addWebEditBadges(layer) {
+  const used = new Map()
+  for (const item of listWebEdits()) {
+    const anchor = webEditAnchor(item)
+    if (!anchor) continue
+    const key = `${Math.round(anchor.x / 8)}:${Math.round(anchor.y / 8)}`
+    const n = used.get(key) || 0
+    used.set(key, n + 1)
+    const restored = item.keep === false
+    const badge = document.createElement('div')
+    badge.className = `badge change-badge${restored ? ' is-off' : ''}`
+    badge.style.left = `${anchor.x}px`
+    badge.style.top = `${anchor.y - 18 + n * 28}px`
+    badge.addEventListener('pointerdown', (e) => e.stopPropagation())
+    const tag = document.createElement('span')
+    tag.className = 'tag'
+    tag.textContent = restored ? '已还原' : '已改'
+    badge.append(tag)
+    const btn = document.createElement('button')
+    btn.type = 'button'
+    btn.className = 'change-toggle'
+    btn.textContent = restored ? '改回' : '撤回'
+    btn.title = restored ? '再应用这一处' : '只撤回这一处'
+    btn.addEventListener('pointerdown', (e) => e.stopPropagation())
+    btn.addEventListener('click', (e) => {
+      e.preventDefault()
+      e.stopPropagation()
+      const ok = restored ? redoWebEdit(item.id) : restoreWebEdit(item.id)
+      toast(ok ? (restored ? `已改回「${item.label}」` : `已撤回「${item.label}」`) : '这一处没能撤回')
+    })
+    badge.append(btn)
+    layer.append(badge)
   }
 }
 
@@ -840,7 +889,10 @@ export function renderChrome(editor) {
   }
 
   const card = getCard()
-  if (snap.spans.length || (snap.changes || []).length || (canUndoLocal() && !card.hideCard)) {
+  const annotating =
+    snap.spans.length ||
+    (!card.hideCard && (card.step === 'propose' || card.step === 'values' || card.guessing))
+  if (annotating) {
     const bar = document.createElement('div')
     bar.className = 'toolbar novice-card'
     bar.append(bindToolbarMove(bar))
@@ -859,6 +911,7 @@ export function renderChrome(editor) {
 
   addCoachMarks(layer, editor)
   addChangeBadges(layer, editor)
+  addWebEditBadges(layer)
   addSchemeTags(layer, editor)
   renderList(editor)
   inspector.textContent = JSON.stringify(toSpec(), null, 2)
