@@ -1,4 +1,4 @@
-import { isClientModelGateOn, planIntent, planOps } from './api.js'
+import { planIntent, planOps } from './api.js'
 import { captureAnnotationScene, captureMarkedPage, classifyDrawnGesture } from './capture.js'
 import { intersectBoxes } from './geometry.js'
 import { imageSpanFromNaturalBox, normalizeVisionBox } from './hit-test.js'
@@ -55,10 +55,6 @@ function boxesFromPlan(data, naturalSize) {
 
 export async function findSame(editor, notify) {
   if (running) return
-  if (!isClientModelGateOn()) {
-    notify('查找相同需要一次规划 A。未开云端时请按住 Shift 再圈另一件货。')
-    return
-  }
   const images = getSnapshot().spans.filter((s) => s.kind === 'image')
   if (!images.length) {
     notify('先圈一件货，再点查找相同')
@@ -189,22 +185,23 @@ export async function guessAnnotationIntent(editor, notify, { silent = false, mo
       if (!silent) notify?.('没有可看的批注画面')
       return null
     }
-    const ocr = await readHandwritingVl(scene)
-    const written = ocr || shortHandwriting(handwriting)
+    const typed = String(handwriting || '').replace(/\s+/g, ' ').trim().slice(0, 80)
+    const ocr = typed ? '' : await readHandwritingVl(scene)
+    const written = typed || ocr || shortHandwriting(handwriting)
     const gesture = classifyDrawnGesture()
     const skip = (exclude || []).filter(Boolean).join('；')
     const instruction = [
-      '你是批注理解器。先确认手写字，再看蓝色圈/黑色画落在网页哪一块，两者合在一起才给出操作。',
-      '图1白底笔迹（蓝=圈，黑=手写或自画图案）。图2笔迹特写。图3圈选区域。图4整页。认字以图1、图2为准。',
+      '你是批注理解器。先确认要求文字，再看蓝色圈/黑色画落在网页哪一块，两者合在一起才给出操作。',
+      '图1白底笔迹（蓝=圈，黑=手写或自画图案）。图2笔迹特写。图3圈选区域。图4整页。有键盘输入时以输入为准；否则认字以图1、图2为准。',
       written
-        ? `手写已读出：「${written}」。第一条猜测必须对应该字的含义，不要改认成别的字。`
+        ? `${typed ? '用户输入的要求' : '手写已读出'}：「${written}」。第一条猜测必须对应该字的含义，不要改认成别的字。`
         : gesture.kind
           ? `没有手写汉字。画法已判定为 ${gesture.kind}：${gesture.hint} 第一条猜测必须是 id=${gesture.kind}，label 用「${gesture.label}」。不要猜成插入文字，不要猜成清除涂鸦/删除笔画。`
           : '没有手写时根据画法判断：叉/涂掉→delete；下划线→underline；箭头或一圈物体+一圈空白→move-layout；画出的图案/放射线/星星/涂鸦图形→stamp，把图案贴到所画位置。不要因为旁边有空白圈就默认插入文字。',
       '圈落在哪一块就改哪一块：圈字改字，圈图改图。若黑色线围着 Logo 散开，目标是该 Logo 周围的装饰，不是空白插入。',
-      '按手写语义映射，例如：删/叉/×/不要→delete；红/蓝/绿/改色→color；缩小/变小→scale-down；放大→scale-up；阴影→shadow；倒影→reflect；加框→frame；加/插入且圈在空白且没有自画图案→insert-text；往右→nudge-right。手写是别的词就按该词理解，不要默认成删除或插入。',
+      '按文字语义映射，例如：删/叉/×/不要→delete；红/蓝/绿/改色→color；缩小/变小→scale-down；放大→scale-up；润色/改写/通顺→polish；扩写→longer；写短→shorter；阴影→shadow；倒影→reflect；加框→frame；换图/生成图/换成一张…→generate-image，不要只给 insert-image；加/插入且圈在空白且没有自画图案→insert-text；往右→nudge-right。文字是别的词就按该词理解，不要默认成删除或插入。',
       sceneText ? `几何场景：${sceneText}` : '',
-      more ? '再给出 3 到 4 条不同操作，不要重复已给过的。' : '给出 3 到 4 条最可能的操作，按可能性从高到低。有手写时第一条必须对应手写；无手写时第一条必须对应画法。',
+      more ? '再给出 3 到 4 条不同操作，不要重复已给过的。' : '给出 3 到 4 条最可能的操作，按可能性从高到低。有输入或手写时第一条必须对应文字；无文字时第一条必须对应画法。',
       skip ? `不要再给出这些：${skip}` : '',
       'label 用一句短中文确认。command 有具体值就填（红色、缩小一点）。',
     ]
@@ -256,7 +253,9 @@ function parseNoteSafe(text) {
   if (/倒影/.test(t)) return 'reflect'
   if (/阴影|投影/.test(t)) return 'shadow'
   if (/加框|边框/.test(t)) return 'frame'
+  if (/润色|改写|通顺|扩写|写短|口语|正式/.test(t)) return /扩写|写长/.test(t) ? 'longer' : /写短|精简/.test(t) ? 'shorter' : /口语/.test(t) ? 'spoken' : /正式/.test(t) ? 'formal' : 'polish'
   if (/插入|加字|加点|加东西/.test(t)) return 'insert-text'
+  if (/生成.*(图|图片)|换一张图|换掉.*图|文生图/.test(t)) return 'generate-image'
   if (/加图/.test(t)) return 'insert-image'
   if (/红|蓝|绿|色/.test(t)) return 'color'
   if (/加|插|添/.test(t)) return 'add'
@@ -268,7 +267,7 @@ export async function guessInkIntent(notify) {
 }
 
 export async function guessStrokePrompt(editor, notify) {
-  if (running || !isClientModelGateOn()) return
+  if (running) return
   const ok = window.confirm('将调用一次规划 A 猜这一笔想改成什么，可再改。确定？')
   if (!ok) return
 

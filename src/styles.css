@@ -148,20 +148,6 @@ body.is-lassoing {
   box-shadow: inset 0 0 0 2px #fff, 0 0 0 2px var(--blue);
 }
 
-.allow-models {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 12px;
-  color: var(--muted);
-  user-select: none;
-  cursor: pointer;
-}
-
-.allow-models input {
-  margin: 0;
-}
-
 .import-box {
   display: inline-flex;
   align-items: center;
@@ -830,7 +816,7 @@ kbd {
   flex-direction: column;
   align-items: stretch;
   gap: 8px;
-  max-width: min(300px, calc(100vw - 24px));
+  max-width: min(340px, calc(100vw - 24px));
   padding: 10px;
   z-index: 60;
   pointer-events: auto;
@@ -842,6 +828,21 @@ kbd {
 
 .toolbar.novice-card input {
   width: 100%;
+}
+
+.toolbar.novice-card input.card-req {
+  height: 34px;
+  box-sizing: border-box;
+  padding: 0 10px;
+  border: 1px solid #d9d0c3;
+  border-radius: 8px;
+  background: #fff;
+  font: 13px var(--sans);
+}
+
+.toolbar.novice-card input.card-req:focus {
+  outline: 2px solid var(--blue-soft);
+  border-color: var(--blue);
 }
 
 .scheme-list {

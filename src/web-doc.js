@@ -1,4 +1,4 @@
-import { isClientModelGateOn, rewriteText } from './api.js'
+import { rewriteText } from './api.js'
 import { colorFill, colorRgb, COLOR_SCHEMES } from './colors.js'
 import { aabb, dist, intersectBoxes, looksLikeRadialBurst, pathLength, pointInPolygon, strokeToPolygon } from './geometry.js'
 import { collectLayoutPairs } from './layout.js'
@@ -31,6 +31,8 @@ img, video { max-width: 100%; height: auto; }
 [data-markset-shifted] { position: relative; z-index: 3; }
 [data-markset-scaled] { transform-origin: center center; max-width: 100%; }
 [data-markset-flow] { overflow: visible; }
+[data-markset-tombstone] { display: inline-block; width: 0; overflow: hidden; margin: 0; padding: 0; border: 0; vertical-align: top; pointer-events: none; }
+[data-markset-shaped-shadow] { pointer-events: none; }
 `
 
 function esc(text) {
@@ -242,6 +244,49 @@ function findByWebId(id) {
 let webEdits = []
 let webEditSeq = 0
 
+function iframeScroll() {
+  const doc = getDoc()
+  const win = doc?.defaultView
+  return {
+    x: win?.scrollX || doc?.documentElement?.scrollLeft || 0,
+    y: win?.scrollY || doc?.documentElement?.scrollTop || 0,
+  }
+}
+
+function nodeAnchor(el) {
+  if (!el?.getBoundingClientRect) return null
+  const r = el.getBoundingClientRect()
+  const s = iframeScroll()
+  return { ix: r.left + s.x + Math.max(r.width, 0) + 6, iy: r.top + s.y }
+}
+
+function mapAnchor(anchor) {
+  if (!anchor || anchor.ix == null || anchor.iy == null) return null
+  const frame = iframeBox()
+  if (!frame) return null
+  const s = iframeScroll()
+  return { x: frame.left + anchor.ix - s.x, y: frame.top + anchor.iy - s.y }
+}
+
+function isTombstone(el) {
+  return Boolean(el?.hasAttribute?.('data-markset-tombstone'))
+}
+
+function leaveTombstone(el) {
+  if (!el?.isConnected) return null
+  const doc = el.ownerDocument
+  const id = el.getAttribute('data-markset-id') || ''
+  const r = el.getBoundingClientRect()
+  const ph = doc.createElement('span')
+  if (id) ph.setAttribute('data-markset-id', id)
+  ph.setAttribute('data-markset-tombstone', '1')
+  ph.setAttribute('aria-hidden', 'true')
+  const h = Math.max(12, Math.min(40, Math.round(r.height || 0)))
+  ph.style.cssText = `display:inline-block;width:0;height:${h}px;overflow:hidden;margin:0;padding:0;border:0;vertical-align:top;pointer-events:none;`
+  el.replaceWith(ph)
+  return ph
+}
+
 function snapshotNode(el, extra = {}) {
   return {
     webId: el.getAttribute('data-markset-id') || '',
@@ -249,6 +294,8 @@ function snapshotNode(el, extra = {}) {
     parentId: el.parentElement?.getAttribute('data-markset-id') || '',
     nextId: el.nextElementSibling?.getAttribute('data-markset-id') || '',
     removed: false,
+    tombstone: isTombstone(el),
+    anchor: nodeAnchor(el),
     ...extra,
   }
 }
@@ -271,7 +318,8 @@ function applyShot(shot) {
   if (!shot) return
   const cur = shot.webId ? findByWebId(shot.webId) : null
   if (shot.removed) {
-    cur?.remove()
+    if (cur && !isTombstone(cur)) leaveTombstone(cur)
+    else if (!cur) insertShot({ ...shot, html: tombstoneHtml(shot) })
     return
   }
   const wrap = getDoc()?.createElement('div')
@@ -281,6 +329,11 @@ function applyShot(shot) {
   if (!node) return
   if (cur) cur.replaceWith(node)
   else insertShot(shot)
+}
+
+function tombstoneHtml(shot) {
+  const id = shot?.webId ? ` data-markset-id="${esc(shot.webId)}"` : ''
+  return `<span${id} data-markset-tombstone="1" aria-hidden="true" style="display:inline-block;width:0;height:12px;overflow:hidden;margin:0;padding:0;border:0;vertical-align:top;pointer-events:none;"></span>`
 }
 
 function recordWebEdit(label, before, after) {
@@ -296,6 +349,10 @@ function recordWebEdit(label, before, after) {
     screen: null,
   }
   item.screen = firstLiveAnchor(item.after) || firstLiveAnchor(item.before)
+  if (!item.screen) {
+    const shot = (item.after || []).find((s) => s?.anchor) || (item.before || []).find((s) => s?.anchor)
+    item.screen = mapAnchor(shot?.anchor)
+  }
   webEdits = [item, ...webEdits]
   ping()
   return item
@@ -303,9 +360,12 @@ function recordWebEdit(label, before, after) {
 
 function firstLiveAnchor(shots) {
   for (const shot of shots || []) {
-    if (!shot?.webId || shot.removed) continue
+    if (!shot?.webId) continue
+    if (shot.removed && !shot.tombstone) continue
     const r = liveScreenRect({ webId: shot.webId })
-    if (r && r.w > 1 && r.h > 1) return { x: r.x + r.w + 6, y: r.y }
+    if (r) return { x: r.x + Math.max(r.w, 0) + 6, y: r.y }
+    const cached = mapAnchor(shot.anchor)
+    if (cached) return cached
   }
   return null
 }
@@ -980,7 +1040,7 @@ function spanFromEl(el, kind) {
   }
 }
 
-function coverEl(el, poly) {
+function polygonCover(el, poly) {
   const r = el.getBoundingClientRect()
   if (r.width < 3 || r.height < 3) return 0
   let inside = 0
@@ -992,16 +1052,21 @@ function coverEl(el, poly) {
       if (pointInPolygon(x, y, poly)) inside += 1
     }
   }
-  const cover = inside / (n * n)
-  const box = aabb(poly)
-  const hit = intersectBoxes({ x: r.x, y: r.y, w: r.width, h: r.height }, box)
-  const boxCover = hit ? (hit.w * hit.h) / Math.max(1, r.width * r.height) : 0
-  return Math.max(cover, Math.min(1, boxCover))
+  return inside / (n * n)
+}
+
+function coverEl(el, poly) {
+  return polygonCover(el, poly)
+}
+
+function centerInPoly(el, poly) {
+  const r = el.getBoundingClientRect()
+  return pointInPolygon(r.x + r.width / 2, r.y + r.height / 2, poly)
 }
 
 function considerEl(el, frameArea, seen, poly, { minCover = 0.12 } = {}) {
   if (!el || el === el.ownerDocument?.documentElement || el === el.ownerDocument?.body) return
-  if (SKIP.has(el.tagName)) return
+  if (SKIP.has(el.tagName) || isTombstone(el) || el.hasAttribute?.('data-markset-shaped-shadow')) return
   const target = promoteTarget(el)
   const r = target.getBoundingClientRect()
   if (r.width < 3 || r.height < 3) return
@@ -1013,18 +1078,52 @@ function considerEl(el, frameArea, seen, poly, { minCover = 0.12 } = {}) {
   if (!widget && !text) {
     if (r.width * r.height > 240 * 90) return
   }
-  const cover = coverEl(target, poly)
+  const cover = polygonCover(target, poly)
+  const inPoly = centerInPoly(target, poly)
   const box = aabb(poly)
   const hit = intersectBoxes({ x: r.x, y: r.y, w: r.width, h: r.height }, box)
   const overlap = hit ? (hit.w * hit.h) / Math.max(1, Math.min(r.width * r.height, box.w * box.h)) : 0
-  const score = Math.max(cover, overlap)
-  if (score < minCover) return
+  const score = cover + (inPoly ? 0.35 : 0) + overlap * 0.08
+  if (!inPoly && cover < minCover && overlap < minCover) return
   const area = r.width * r.height
-  const kind = widget && !text ? 'image' : text && !widget ? 'text' : widget ? 'image' : 'text'
+  const kind =
+    isImageEl(target) || (widget && !text)
+      ? 'image'
+      : text
+        ? 'text'
+        : widget
+          ? 'image'
+          : 'text'
   const prev = seen.get(id)
   if (!prev || score > prev.score || (score === prev.score && area < prev.area)) {
-    seen.set(id, { el: target, area, kind, cover, overlap, score })
+    seen.set(id, { el: target, area, kind, cover, overlap, score, inPoly })
   }
+}
+
+function dropAncestors(items) {
+  return items.filter((h) => !items.some((o) => o.el !== h.el && h.el.contains(o.el)))
+}
+
+function tightenHits(items, poly, { loose = false } = {}) {
+  if (!items.length) return items
+  const minCover = loose ? 0.22 : 0.32
+  let picked = items.filter((h) => h.inPoly || h.cover >= minCover)
+  if (!picked.length) picked = items.filter((h) => h.inPoly || h.cover >= 0.16 || h.overlap >= 0.28)
+  if (!picked.length) {
+    picked = [...items].sort((a, b) => b.score - a.score || a.area - b.area).slice(0, 1)
+  }
+  picked = dropAncestors(picked)
+  picked.sort((a, b) => b.score - a.score || a.area - b.area)
+  const best = picked[0]
+  if (best && (best.inPoly || best.cover >= 0.28)) {
+    picked = picked.filter((h) => {
+      if (h.el === best.el) return true
+      if (h.inPoly && h.cover >= 0.18) return true
+      if (h.cover >= Math.max(minCover, best.cover * 0.55)) return true
+      return false
+    })
+  }
+  return dropAncestors(picked)
 }
 
 function scanMarked(poly, frameArea, seen, minCover) {
@@ -1053,7 +1152,7 @@ export function hitWebDoc(polygon, { loose = false } = {}) {
   const poly = toIframePoly(polygon)
   const frameArea = Math.max(1, iframe.clientWidth * iframe.clientHeight)
   const seen = new Map()
-  const minCover = loose ? 0.04 : 0.12
+  const minCover = loose ? 0.1 : 0.16
   for (const p of sampleHitPoints(poly)) {
     let stack = []
     try {
@@ -1064,37 +1163,16 @@ export function hitWebDoc(polygon, { loose = false } = {}) {
     }
     for (const el of stack.slice(0, 8)) considerEl(el, frameArea, seen, poly, { minCover })
   }
-  if (loose) scanMarked(inflatePoly(poly, 14), frameArea, seen, 0.08)
-  const box = aabb(poly)
-  const cx = box.x + box.w / 2
-  const cy = box.y + box.h / 2
-  const paintArea = Math.max(1, box.w * box.h)
-  let items = [...seen.values()].filter((h) => h.cover >= (loose ? 0.08 : 0.22) || (loose && h.overlap >= 0.12))
-  if (!items.length) items = [...seen.values()].filter((h) => h.score >= minCover)
+  if (!seen.size) scanMarked(poly, frameArea, seen, minCover)
+  if (loose && !seen.size) scanMarked(inflatePoly(poly, 8), frameArea, seen, 0.12)
+  const paintArea = Math.max(1, aabb(poly).w * aabb(poly).h)
+  let items = tightenHits([...seen.values()], poly, { loose })
   items = items.filter((h) => {
-    if (isGraphicEl(h.el)) return h.cover >= 0.06 || h.overlap >= 0.08
-    return h.area <= paintArea * 8 || h.cover >= 0.45
+    if (isGraphicEl(h.el)) return h.inPoly || h.cover >= 0.08 || h.overlap >= 0.12
+    return h.area <= paintArea * 10 || h.cover >= 0.4 || h.inPoly
   })
-  const atCenter = items
-    .filter((h) => {
-      const r = h.el.getBoundingClientRect()
-      return cx >= r.x && cx <= r.x + r.width && cy >= r.y && cy <= r.y + r.height
-    })
-    .sort((a, b) => a.area - b.area)
-  if (atCenter.length) {
-    const core = atCenter[0]
-    items = items.filter(
-      (h) =>
-        h.el === core.el ||
-        (h.area <= Math.max(core.area * 8, paintArea * 3) && (h.cover >= 0.16 || h.overlap >= 0.18)),
-    )
-    if (!items.some((h) => h.el === core.el)) items.unshift(core)
-  }
-  items.sort((a, b) => a.area - b.area || (b.score || b.cover) - (a.score || a.cover))
-  if (items[0] && items[0].cover >= 0.4 && !loose) {
-    items = items.filter((h) => h.area <= items[0].area * 8)
-  }
-  items = items.slice(0, loose ? 4 : MAX_HITS)
+  items.sort((a, b) => (b.inPoly - a.inPoly) || b.cover - a.cover || a.area - b.area)
+  items = items.slice(0, loose ? 3 : MAX_HITS)
   const images = []
   const texts = []
   for (const hit of items) {
@@ -1301,8 +1379,9 @@ function evidenceOf(el) {
     fontWeight: cs.fontWeight,
     anno: el.getAttribute('data-markset-anno') || '',
     reflect: el.style.webkitBoxReflect || '',
-    html: el.outerHTML.slice(0, 1800),
+    html: el.outerHTML.slice(0, 2800),
     text: String(el.innerText || '').slice(0, 80),
+    shadow: el.getAttribute('data-markset-shadow') || '',
   }
 }
 
@@ -1329,7 +1408,15 @@ function verifyKind(kind, befores, afters) {
       return a.rect.w * a.rect.h > ba * 1.08 || parseFloat(a.fontSize) > (parseFloat(befores[i]?.fontSize) || 0) * 1.08
     })
   }
-  if (kind === 'shadow') return afters.some((a, i) => a.filter !== befores[i]?.filter && /drop-shadow/i.test(a.filter))
+  if (kind === 'shadow') {
+    return afters.some((a, i) => {
+      const b = befores[i]
+      if (a.filter !== b?.filter && /drop-shadow/i.test(a.filter || '')) return true
+      if ((a.shadow || '') !== (b?.shadow || '')) return true
+      if (/data-markset-shaped-shadow/.test(a.html || '') && !/data-markset-shaped-shadow/.test(b?.html || '')) return true
+      return false
+    })
+  }
   if (kind === 'reflect') return afters.some((a) => Boolean(a.reflect))
   if (kind === 'frame' || kind === 'box' || kind === 'circle' || kind === 'highlight' || kind === 'bold' || kind === 'underline' || kind === 'wavy' || kind === 'strike' || String(kind).startsWith('line')) {
     return afters.some((a, i) => a.anno !== befores[i]?.anno || a.fontWeight !== befores[i]?.fontWeight || a.html !== befores[i]?.html)
@@ -1371,13 +1458,24 @@ function verifyMove(befores, afters, dests) {
   })
 }
 
-function replaceText(el, fromText, toText) {
-  if (!el) return
-  const next = String(toText || '')
-  const from = String(fromText || '')
-  const walker = el.ownerDocument.createTreeWalker(el, NodeFilter.SHOW_TEXT)
+function textNodesOf(el) {
   const nodes = []
-  while (walker.nextNode()) nodes.push(walker.currentNode)
+  if (!el) return nodes
+  const walker = el.ownerDocument.createTreeWalker(el, NodeFilter.SHOW_TEXT)
+  while (walker.nextNode()) {
+    if (String(walker.currentNode.nodeValue || '').trim()) nodes.push(walker.currentNode)
+  }
+  return nodes
+}
+
+function replaceText(el, fromText, toText) {
+  if (!el) return false
+  const next = String(toText ?? '')
+  if (!next) return false
+  const from = String(fromText || '').trim()
+  const live = textOf(el)
+  if (live === next.replace(/\s+/g, ' ').trim()) return false
+  const nodes = textNodesOf(el)
   if (from) {
     let did = false
     for (const node of nodes) {
@@ -1386,16 +1484,24 @@ function replaceText(el, fromText, toText) {
         did = true
       }
     }
-    if (did) return
+    if (did) return true
   }
   if (nodes.length === 1) {
     nodes[0].nodeValue = next
-    return
+    return true
+  }
+  const simple = /^(A|P|H1|H2|H3|H4|H5|H6|SPAN|LI|TD|TH|BUTTON|LABEL|FIGCAPTION|STRONG|EM|B|I|DIV|SECTION)$/.test(el.tagName)
+  if (simple || !el.querySelector?.('p, li, h1, h2, h3, h4, ul, ol, table')) {
+    el.textContent = next
+    return true
   }
   if (nodes.length) {
     nodes[0].nodeValue = next
     for (let i = 1; i < nodes.length; i += 1) nodes[i].nodeValue = ''
+    return true
   }
+  el.textContent = next
+  return true
 }
 
 function tintFilter(name) {
@@ -1535,7 +1641,7 @@ function scanOverlapEls(box) {
   const frameArea = Math.max(1, iframe.clientWidth * iframe.clientHeight)
   const out = []
   for (const el of doc.querySelectorAll('[data-markset-id]')) {
-    if (SKIP.has(el.tagName) || el === doc.body || el === doc.documentElement) continue
+    if (SKIP.has(el.tagName) || isTombstone(el) || el === doc.body || el === doc.documentElement) continue
     const hit = overlapScore(el, box)
     if (hit.area > frameArea * 0.82) continue
     if (hit.coverBox < 0.035 && hit.coverEl < 0.1) continue
@@ -1948,6 +2054,10 @@ function gatherEls(kind, title, box, hits, frameArea, large) {
     } else if (kind === 'shadow' || kind === 'reflect') {
       els = pickDecorEls(hits, box, frameArea, false, true)
       if (!els.length) els = pickDecorEls(hits, box, frameArea, large, false)
+      if (!els.length && kind === 'shadow') {
+        const near = nearestToBox(box)
+        if (near) els = [near]
+      }
     } else if (kind.startsWith('nudge-') || kind === 'move-nudge') {
       els = pickContentEls(hits, box, frameArea, { large, kind: '' })
     } else {
@@ -1982,7 +2092,203 @@ function elsByStrategy(kind, title, box, hits, frameArea, large, strategy) {
   return base
 }
 
-function applyOpToEls(els, kind, { color, title, box, dx, dy, scheme }) {
+function nearestToBox(box) {
+  if (!box) return null
+  const doc = getDoc()
+  const iframe = frameEl()
+  if (!doc) return null
+  const cx = box.x + box.w / 2
+  const cy = box.y + box.h / 2
+  const limit = Math.max(160, Math.max(box.w, box.h) + 180)
+  const frameArea = Math.max(1, (iframe?.clientWidth || 1) * (iframe?.clientHeight || 1))
+  let best = null
+  let bestD = limit
+  for (const el of doc.querySelectorAll('[data-markset-id]')) {
+    if (SKIP.has(el.tagName) || isTombstone(el) || isTombstone(el.parentElement)) continue
+    if (el === doc.body || el === doc.documentElement) continue
+    if (el.hasAttribute('data-markset-shaped-shadow')) continue
+    if (!isGraphicEl(el) && !isWidgetEl(el) && !isTextEl(el)) continue
+    const r = el.getBoundingClientRect()
+    if (r.width * r.height > frameArea * 0.55) continue
+    const d = Math.hypot(r.left + r.width / 2 - cx, r.top + r.height / 2 - cy)
+    if (d < bestD) {
+      best = el
+      bestD = d
+    }
+  }
+  return best
+}
+
+function paintStrokes() {
+  return (getPaintMarks() || []).filter((m) => m?.points?.length >= 6 && !isHandwritingPaint(m))
+}
+
+function moduleCoveredByPaint(el, box) {
+  if (!el || !box) return false
+  const hit = overlapScore(el, box)
+  return centerInPaint(el, box) && hit.coverEl >= 0.52
+}
+
+function paintIsAroundModule(el, box) {
+  if (!el || !box) return true
+  const hit = overlapScore(el, box)
+  const r = el.getBoundingClientRect()
+  const pcx = box.x + box.w / 2
+  const pcy = box.y + box.h / 2
+  const ecx = r.left + r.width / 2
+  const ecy = r.top + r.height / 2
+  const beside = Math.hypot(pcx - ecx, pcy - ecy) > Math.max(r.width, r.height) * 0.4
+  if (!centerInPaint(el, box) && hit.coverEl < 0.72) return true
+  if (hit.coverEl < 0.42) return true
+  if (beside && hit.coverEl < 0.62) return true
+  return false
+}
+
+function decideShadow(els, box, extraPts) {
+  const marks = paintStrokes()
+  if (marks.length >= 2) {
+    const roles = classifyPaintRoles(marks)
+    if (roles.dests.length && roles.sources.length) {
+      const srcBox = iframeUnionBox(polysOfMarks(roles.sources))
+      const host =
+        (els || []).find((el) => moduleCoveredByPaint(el, srcBox)) ||
+        nearestToBox(srcBox) ||
+        els?.[0]
+      return { shaped: true, pts: roles.dests[roles.dests.length - 1].points, host }
+    }
+  }
+  const shapePts = pickShadowStroke(els, extraPts)
+  const pbox = shapePts?.length ? aabb(toIframePoly(shapePts)) : box
+  const covered = pbox ? (els || []).filter((el) => moduleCoveredByPaint(el, pbox)) : []
+  const host =
+    (pbox ? covered.sort((a, b) => overlapScore(b, pbox).area - overlapScore(a, pbox).area)[0] : null) ||
+    els?.[0] ||
+    (pbox ? nearestToBox(pbox) : null)
+  if (pbox && host && moduleCoveredByPaint(host, pbox) && !paintIsAroundModule(host, pbox)) {
+    return { shaped: false, pts: shapePts, host }
+  }
+  if (shapePts?.length >= 6) return { shaped: true, pts: shapePts, host }
+  return { shaped: false, pts: shapePts, host }
+}
+
+export function peekShadowLabel() {
+  const box = iframeUnionBox(drawingPolys())
+  const host = box ? nearestToBox(box) : null
+  const d = decideShadow(host ? [host] : [], box, null)
+  return d.shaped ? '按笔迹在周边加上阴影' : '给圈中模块加上投影'
+}
+
+function pickShadowStroke(els, extraPts) {
+  const marks = paintStrokes()
+  if (!marks.length && extraPts?.length >= 6) return extraPts
+  if (!marks.length) return extraPts || null
+  if (marks.length === 1) return marks[0].points
+  const el = els?.[0]
+  const r = el?.getBoundingClientRect?.()
+  let best = marks[marks.length - 1]
+  let bestScore = -1
+  marks.forEach((m, idx) => {
+    const poly = toIframePoly(m.points)
+    const box = aabb(poly)
+    let wrap = false
+    if (r) {
+      const hit = intersectBoxes(box, { x: r.left, y: r.top, w: r.width, h: r.height })
+      const coverEl = hit ? (hit.w * hit.h) / Math.max(1, r.width * r.height) : 0
+      wrap = coverEl > 0.72 && box.w * box.h > r.width * r.height * 0.85
+    }
+    const score = (wrap ? 0 : 10) + idx + pathLength(m.points) / 120
+    if (score >= bestScore) {
+      best = m
+      bestScore = score
+    }
+  })
+  return best.points
+}
+
+function shadowPathPts(screenPts) {
+  const poly = toIframePoly(screenPts)
+  if (!poly.length) return []
+  if (poly.length < 8) return strokeToPolygon(poly, 14)
+  const box = aabb(poly)
+  const closed = dist(poly[0], poly[poly.length - 1]) < Math.max(16, Math.max(box.w, box.h) * 0.28)
+  if (!closed && poly.length < 16) return strokeToPolygon(poly, Math.max(8, Math.min(26, Math.max(box.h, box.w) * 0.22)))
+  const step = Math.max(1, Math.floor(poly.length / 56))
+  const pts = poly.filter((_, i) => i % step === 0 || i === poly.length - 1)
+  if (dist(pts[0], pts[pts.length - 1]) > 2) pts.push({ x: pts[0].x, y: pts[0].y })
+  return pts
+}
+
+function attachShapedShadow(el, screenPts) {
+  if (!el?.isConnected || !screenPts?.length) return false
+  const hull = shadowPathPts(screenPts)
+  if (hull.length < 3) return false
+  const box = aabb(hull)
+  if (box.w < 8 && box.h < 8) return false
+  const r = el.getBoundingClientRect()
+  const doc = el.ownerDocument
+  const svgNS = 'http://www.w3.org/2000/svg'
+  el.querySelectorAll('[data-markset-shaped-shadow]').forEach((node) => node.remove())
+  const svg = doc.createElementNS(svgNS, 'svg')
+  svg.setAttribute('data-markset-shaped-shadow', '1')
+  svg.setAttribute('aria-hidden', 'true')
+  svg.setAttribute('viewBox', `0 0 ${Math.max(12, box.w)} ${Math.max(12, box.h)}`)
+  svg.setAttribute('preserveAspectRatio', 'none')
+  svg.style.cssText = [
+    'position:absolute',
+    `left:${Math.round(box.x - r.left)}px`,
+    `top:${Math.round(box.y - r.top)}px`,
+    `width:${Math.max(12, box.w)}px`,
+    `height:${Math.max(12, box.h)}px`,
+    'pointer-events:none',
+    'z-index:0',
+    'overflow:visible',
+  ].join(';')
+  const fid = `markset-shadow-blur-${Math.random().toString(36).slice(2, 8)}`
+  const defs = doc.createElementNS(svgNS, 'defs')
+  const filter = doc.createElementNS(svgNS, 'filter')
+  filter.setAttribute('id', fid)
+  filter.setAttribute('x', '-40%')
+  filter.setAttribute('y', '-40%')
+  filter.setAttribute('width', '180%')
+  filter.setAttribute('height', '180%')
+  const blur = doc.createElementNS(svgNS, 'feGaussianBlur')
+  blur.setAttribute('stdDeviation', String(Math.max(2, Math.min(10, Math.round(Math.max(box.w, box.h) * 0.045)))))
+  filter.append(blur)
+  defs.append(filter)
+  const shape = doc.createElementNS(svgNS, 'path')
+  const d = hull
+    .map((p, i) => `${i ? 'L' : 'M'}${Math.round(p.x - box.x)} ${Math.round(p.y - box.y)}`)
+    .join(' ')
+  shape.setAttribute('d', `${d} Z`)
+  shape.setAttribute('fill', 'rgba(36, 24, 14, 0.4)')
+  shape.setAttribute('filter', `url(#${fid})`)
+  svg.append(defs, shape)
+  const pos = doc.defaultView?.getComputedStyle(el)?.position
+  if (!pos || pos === 'static') el.style.position = 'relative'
+  el.style.overflow = 'visible'
+  for (const child of [...el.children]) {
+    if (child.hasAttribute('data-markset-shaped-shadow')) continue
+    const cpos = doc.defaultView?.getComputedStyle(child)?.position
+    if (!cpos || cpos === 'static') child.style.position = 'relative'
+    if (!child.style.zIndex) child.style.zIndex = '1'
+  }
+  adaptLayout(el, 'shadow')
+  el.insertBefore(svg, el.firstChild)
+  el.dataset.marksetShadow = 'shape'
+  return true
+}
+
+function inferCssShadow(pts, el) {
+  if (!pts?.length || !el) return 'drop-shadow(6px 10px 8px rgba(36, 24, 14, 0.45))'
+  const box = aabb(toIframePoly(pts))
+  const r = el.getBoundingClientRect()
+  const ox = Math.round(Math.max(-36, Math.min(36, box.x + box.w / 2 - (r.left + r.width / 2))))
+  const oy = Math.round(Math.max(-20, Math.min(40, box.y + box.h / 2 - (r.top + r.height * 0.6))))
+  const blur = Math.round(Math.max(6, Math.min(28, Math.max(box.w, box.h) * 0.22)))
+  return `drop-shadow(${ox}px ${oy}px ${blur}px rgba(36, 24, 14, 0.4))`
+}
+
+function applyOpToEls(els, kind, { color, title, box, dx, dy, scheme, paint }) {
   let count = 0
   const mode = colorModeOf(kind, title)
   if (kind === 'delete-deco' || kind === 'clear-deco' || kind === 'clear-anno' || kind === 'soften') {
@@ -1991,7 +2297,7 @@ function applyOpToEls(els, kind, { color, title, box, dx, dy, scheme }) {
     }
   } else if (kind.startsWith('delete')) {
     for (const el of els) {
-      el.remove()
+      leaveTombstone(el)
       count += 1
     }
   } else if (kind === 'scheme') {
@@ -2033,11 +2339,21 @@ function applyOpToEls(els, kind, { color, title, box, dx, dy, scheme }) {
       count += 1
     }
   } else if (kind === 'shadow') {
-    for (const el of els) {
-      replaceFilterPart(el, 'shadow', 'drop-shadow(6px 10px 8px rgba(36, 24, 14, 0.45))')
-      el.dataset.marksetShadow = '1'
-      adaptLayout(el, 'shadow')
+    const decision = decideShadow(els, box, paint)
+    const host = decision.host || els[0]
+    if (decision.shaped && decision.pts?.length >= 6 && host && attachShapedShadow(host, decision.pts)) {
       count += 1
+      console.log('[markset shadow] shape')
+    } else {
+      const targets = host ? uniqueEls([host, ...els]) : els
+      for (const el of targets) {
+        const css = inferCssShadow(decision.pts, el)
+        replaceFilterPart(el, 'shadow', css)
+        el.dataset.marksetShadow = '1'
+        adaptLayout(el, 'shadow')
+        count += 1
+      }
+      if (count) console.log('[markset shadow] css drop-shadow')
     }
   } else if (kind === 'reflect') {
     for (const el of els) {
@@ -2069,7 +2385,7 @@ function applyOpToEls(els, kind, { color, title, box, dx, dy, scheme }) {
   return { count }
 }
 
-export function executeCircledOp(op, { color = '', label = '', onBefore, dx = 0, dy = 0, scheme = null } = {}) {
+export function executeCircledOp(op, { color = '', label = '', onBefore, dx = 0, dy = 0, scheme = null, paint = null } = {}) {
   const doc = getDoc()
   const iframe = frameEl()
   if (!doc?.body || !iframe) return { ok: false, reason: '没有导入的网页' }
@@ -2098,27 +2414,32 @@ export function executeCircledOp(op, { color = '', label = '', onBefore, dx = 0,
     seen.add(key)
     const beforeEv = els.map((el) => evidenceOf(el))
     const before = els.map((el) => snapshotNode(el))
-    const applied = applyOpToEls(els, kind, { color, title, box, dx, dy, scheme })
+    const applied = applyOpToEls(els, kind, { color, title, box, dx, dy, scheme, paint })
     if (applied.reason && !applied.count) continue
     if (!applied.count) continue
     const afterEv = els.map((el) => evidenceOf(el))
     if (!verifyKind(kind, beforeEv, afterEv)) continue
     onBefore?.(title)
-    const after = before.map((shot, i) => {
-      const el = els[i]
-      if (!el?.isConnected) return { ...shot, removed: true }
-      return snapshotNode(el)
+    const after = before.map((shot) => {
+      const live = shot.webId ? findByWebId(shot.webId) : null
+      if (!live?.isConnected) return { ...shot, removed: true }
+      return snapshotNode(live)
     })
     recordWebEdit(title, before, after)
     fitHeight()
     console.log(`[markset exec] ${kind} n=${applied.count} via=${strategy} ${els.map((el) => el.tagName).join(',')}`)
     const removed = kind.startsWith('delete') && kind !== 'delete-deco'
+    const shaped = kind === 'shadow' && els.some((el) => el?.getAttribute?.('data-markset-shadow') === 'shape')
     return {
       ok: true,
       count: applied.count,
       message: removed
         ? `已删除圈中内容，共 ${applied.count} 处。可还原这一处`
-        : `已改圈中内容，共 ${applied.count} 处。可还原这一处`,
+        : shaped
+          ? '已按你画的形状在周边加上阴影。可还原这一处'
+          : kind === 'shadow'
+            ? '已给圈中模块加上投影。可还原这一处'
+            : `已改圈中内容，共 ${applied.count} 处。可还原这一处`,
     }
   }
   restoreWebHtml(html)
@@ -2141,6 +2462,119 @@ function writebackOp(kind, commandText) {
   return ''
 }
 
+function isRewriteInstruction(text) {
+  return /润色|写得更长|写得更短|更口语|更正式|保持原意|扩写|精简|改措辞|通顺/.test(String(text || ''))
+}
+
+function explicitReplacement(text) {
+  const t = String(text || '').trim()
+  const m = t.match(/^(?:请)?(?:把这段|把这些字|把圈中(?:的)?文字|将这段)?(?:文字)?(?:改成|换成|改为|改写为)[:：]?\s*[「『“"'']?(.+?)[」』”"'']?$/)
+  if (!m?.[1]) return ''
+  const next = m[1].trim()
+  if (!next || next.length > 120 || isRewriteInstruction(next)) return ''
+  return next
+}
+
+function rewritePrompt(kind, commandText) {
+  const t = String(commandText || '').trim()
+  if (kind === 'longer') return t || '把这段写得更长一些，保持原意和关键信息'
+  if (kind === 'shorter') return t || '把这段写得更短一些，保持原意'
+  if (kind === 'spoken') return t || '改成更口语，保持原意'
+  if (kind === 'formal') return t || '改成更正式，保持原意'
+  if (t) return t
+  return '润色这段，保持原意和关键信息，不要解释'
+}
+
+function dropCoveringAncestors(els) {
+  return (els || []).filter((el) => el && !(els || []).some((o) => o && o !== el && el.contains(o)))
+}
+
+function collectRewriteEls() {
+  const box = iframeUnionBox(drawingPolys())
+  const iframe = frameEl()
+  const frameArea = Math.max(1, (iframe?.clientWidth || 1) * (iframe?.clientHeight || 1))
+  const hits = box ? scanOverlapEls(box) : []
+  const usable = (el) => el && isTextEl(el) && !isImageEl(el) && textOf(el).length >= 2
+  let els = []
+  if (box) {
+    els = leafEls(hits, box).filter(usable)
+    if (!els.length) els = hits.map((h) => h.el).filter(usable)
+    if (!els.length) {
+      els = pickContentEls(hits, box, frameArea, { large: false, kind: 'color-text' }).filter(usable)
+    }
+    els = els.filter((el) => aimedLeaf(el, box) || staysInPaint(el, box) || overlapScore(el, box).coverEl >= 0.16)
+  }
+  if (!els.length) {
+    els = circledEditSpans()
+      .map((s) => findByWebId(s.webId))
+      .filter(usable)
+  }
+  if (!els.length && hits.length) {
+    els = hits.map((h) => h.el).filter((el) => textOf(el).length >= 2 && !isImageEl(el))
+  }
+  return dropCoveringAncestors(uniqueEls(els)).slice(0, 8)
+}
+
+export async function rewriteCircledText(commandText, { onBefore, kind = 'polish' } = {}) {
+  if (!isWebDocActive()) return { ok: false, reason: '没有导入的网页' }
+  const els = collectRewriteEls()
+  if (!els.length) {
+    return { ok: false, reason: '圈中没有可改的文字。请把圈贴在标题或段落上' }
+  }
+  const instruction = rewritePrompt(kind, commandText)
+  const local = explicitReplacement(instruction)
+  onBefore?.(local ? '替换文字' : '润色网页文字')
+  const before = els.map((el) => snapshotNode(el))
+  let count = 0
+  let usedModel = false
+  const page = String(meta.title || '').trim()
+  for (const el of els) {
+    const original = textOf(el)
+    if (!original || original.length < 2) continue
+    let next = local
+    if (!next) {
+      usedModel = true
+      console.log(`[markset rewrite] 调用模型 ${els.length} 处「${original.slice(0, 24)}」指令「${instruction.slice(0, 36)}」`)
+      const data = await rewriteText(
+        [
+          instruction,
+          page ? `这段文字出现在网页「${page}」上` : '',
+          '只改这一段可见文字，保持原语言，不要解释，不要把指令写进正文。',
+        ]
+          .filter(Boolean)
+          .join('。'),
+        original,
+      )
+      next = String(data?.text || '').trim()
+    }
+    if (!next || next === original || isRewriteInstruction(next)) continue
+    if (replaceText(el, original, next)) count += 1
+  }
+  if (!count) {
+    return {
+      ok: false,
+      reason: usedModel
+        ? '模型已调用，但没有改出不同的文字。可把要求写具体一点，例如：更正式、更短，或写「改成……」'
+        : '没有改到圈中的文字',
+    }
+  }
+  const after = before.map((shot) => {
+    const live = shot.webId ? findByWebId(shot.webId) : null
+    return live ? snapshotNode(live) : { ...shot, removed: true }
+  })
+  recordWebEdit(local ? '替换文字' : '润色文字', before, after)
+  ping()
+  fitHeight()
+  console.log(`[markset rewrite] ok n=${count} model=${usedModel}`)
+  return {
+    ok: true,
+    count,
+    message: usedModel
+      ? `已调用模型改写圈中文字，共 ${count} 处。可还原这一处`
+      : `已换成指定文字，共 ${count} 处。可还原这一处`,
+  }
+}
+
 export async function runWebWriteback(kind, notify, { onBefore } = {}) {
   const circled = circledEditSpans()
   const picked = targets().filter((s) => s.willEdit !== false)
@@ -2154,8 +2588,9 @@ export async function runWebWriteback(kind, notify, { onBefore } = {}) {
   const scope = snap.scope || 'inside'
   const commandText = inferCommandText(snap.commandText, web.filter((s) => s.kind === 'text'))
   const parsed = parseCommand(commandText)
+  const rewriteLike = kind === 'rewrite' || kind === 'unify'
   const routed = writebackOp(kind, commandText)
-  if (routed || (parsed.color && kind !== 'rewrite' && kind !== 'replace')) {
+  if (routed || (parsed.color && kind !== 'rewrite' && kind !== 'replace' && !isRewriteInstruction(commandText))) {
     const op = routed || 'color'
     const result = executeCircledOp(op, {
       color: parsed.color,
@@ -2171,29 +2606,43 @@ export async function runWebWriteback(kind, notify, { onBefore } = {}) {
     notify(result.message)
     return true
   }
+  if (kind === 'rewrite' || isRewriteInstruction(commandText)) {
+    try {
+      const result = await rewriteCircledText(commandText, { onBefore, kind })
+      notify(result.ok ? result.message : result.reason)
+      return result.ok
+    } catch (err) {
+      notify(
+        err?.code === 'client-gate' || err?.code === 'no_client_gate' || err?.code === 'calls_disabled'
+          ? '服务器禁止调用：把 .env 里 MARKSET_ALLOW_MODEL_CALLS 改为 1 并重启'
+          : err?.message || '改写失败',
+      )
+      return false
+    }
+  }
   if (!web.length) {
     notify('没圈到可改的网页内容。请把圈画在要改的文字或图片上')
     return false
   }
+
+  const paintBox = iframeUnionBox(drawingPolys())
+  let items = web
+    .map((s) => ({ span: s, el: findByWebId(s.webId) }))
+    .filter((x) => {
+      if (!x.el) return false
+      if (!paintBox) return true
+      return aimedLeaf(x.el, paintBox) || staysInPaint(x.el, paintBox) || overlapScore(x.el, paintBox).coverEl >= 0.28
+    })
+  if (!items.length) {
+    items = web.map((s) => ({ span: s, el: findByWebId(s.webId) })).filter((x) => x.el)
+  }
+
   if ((kind === 'rewrite' || kind === 'unify' || kind === 'replace') && !commandText && !parsed.color) {
     notify('先写下新名字或选出颜色')
     return false
   }
 
-  const paintBox = iframeUnionBox(drawingPolys())
-  const items = web
-    .map((s) => ({ span: s, el: findByWebId(s.webId) }))
-    .filter((x) => {
-      if (!x.el) return false
-      if (!paintBox) return true
-      return aimedLeaf(x.el, paintBox) || staysInPaint(x.el, paintBox) || overlapScore(x.el, paintBox).coverEl >= 0.45
-    })
-  const useModel = isClientModelGateOn() && (kind === 'rewrite' || kind === 'unify') && items.some((x) => x.span.kind === 'text')
-  if (useModel) {
-    const ok = window.confirm(`将调用云端改写 ${items.filter((x) => x.span.kind === 'text').length} 处文字，会消耗额度。确定？`)
-    if (!ok) return false
-  }
-
+  const useModel = rewriteLike && items.some((x) => x.span.kind === 'text')
   onBefore?.(kind === 'delete' ? '删网页内容' : '改网页')
 
   const before = items.map((x) => snapshotNode(x.el))
@@ -2353,6 +2802,158 @@ export function insertWebImage(src) {
   return { ok: true, message: '已在圈中空白插入图片。可还原这一处' }
 }
 
+function rasterizeEl(el) {
+  try {
+    const img = el?.tagName === 'IMG' ? el : el?.querySelector?.('img')
+    if (img?.src?.startsWith('data:')) return img.src
+    if (!img) return ''
+    const w = img.naturalWidth || Math.round(img.getBoundingClientRect().width)
+    const h = img.naturalHeight || Math.round(img.getBoundingClientRect().height)
+    if (!w || !h) return img.src || ''
+    const canvas = (img.ownerDocument || document).createElement('canvas')
+    canvas.width = w
+    canvas.height = h
+    canvas.getContext('2d').drawImage(img, 0, 0)
+    return canvas.toDataURL('image/png')
+  } catch {
+    const img = el?.tagName === 'IMG' ? el : el?.querySelector?.('img')
+    return img?.src || ''
+  }
+}
+
+function clipScene(text, n = 72) {
+  return String(text || '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, n)
+}
+
+function imageRole(el, r, frameW) {
+  const blob = `${el?.id || ''} ${el?.className || ''} ${el?.getAttribute?.('alt') || ''} ${el?.getAttribute?.('aria-label') || ''}`.toLowerCase()
+  if (looksLikeLogo(el) || /logo|brand|icon/.test(blob)) return '网站Logo或图标'
+  if (r.width < 44 && r.height < 44) return '小图标'
+  if (frameW && r.width > frameW * 0.55 && r.height > 72) return '页眉或主视觉大图'
+  if (r.y < 130) return '页顶配图'
+  const wrap = el.closest?.('header, nav, footer, aside, main, article, figure')
+  const tag = wrap?.tagName || ''
+  if (tag === 'HEADER' || tag === 'NAV') return '导航或页眉配图'
+  if (tag === 'FOOTER') return '页脚配图'
+  if (tag === 'ASIDE') return '侧栏配图'
+  if (tag === 'FIGURE') return '正文插图'
+  return '网页配图'
+}
+
+function nearbyCopy(el) {
+  const root = el.closest?.('section, article, header, main, figure, li, div') || el.parentElement
+  const heading = root?.querySelector?.('h1, h2, h3, h4')
+  const bits = []
+  const h = clipScene(heading?.innerText, 48)
+  if (h) bits.push(`附近标题「${h}」`)
+  const around = clipScene(
+    [el.previousElementSibling?.innerText, el.nextElementSibling?.innerText, root && root !== el ? root.innerText : '']
+      .filter(Boolean)
+      .join(' '),
+    80,
+  )
+  if (around && around !== h) bits.push(`周围文字「${around}」`)
+  return bits
+}
+
+function imageScenePrompt(el) {
+  const doc = getDoc()
+  const frame = iframeBox()
+  const pageTitle = clipScene(meta.title || doc?.title, 40)
+  let host = ''
+  try {
+    host = meta.sourceUrl ? new URL(meta.sourceUrl, 'https://local.invalid').hostname : ''
+    if (host === 'local.invalid') host = ''
+  } catch {
+    host = ''
+  }
+  const bits = [`应用场景：网页「${pageTitle || '未命名页面'}」${host ? `（${host}）` : ''}上的配图`]
+  if (!el) {
+    bits.push('放在用户圈出的空白位置，作为该页插图')
+    bits.push('风格需能融入当前网页，构图干净，不要大段文字或水印')
+    return bits.join('。')
+  }
+  const r = el.getBoundingClientRect()
+  bits.push(`用途是${imageRole(el, r, frame?.width)}`)
+  bits.push(`位置比例约 ${Math.max(1, Math.round(r.width))}×${Math.max(1, Math.round(r.height))}`)
+  const alt = clipScene(el.getAttribute?.('alt') || el.querySelector?.('img')?.getAttribute?.('alt'), 36)
+  if (alt) bits.push(`原图说明「${alt}」`)
+  bits.push(...nearbyCopy(el))
+  bits.push('请生成适合这个网页位置、能和周围内容放在一起的图，不要大段文字或水印')
+  return bits.join('。')
+}
+
+export function circledImageSeed() {
+  const el = resolveCircledEls('color-image').find((node) => isGraphicEl(node) || isImageEl(node) || hasPaintedBg(node))
+  if (!el) {
+    const box = insertHostBox()?.box
+    return {
+      imageDataUrl: '',
+      width: Math.round(box?.w || 0),
+      height: Math.round(box?.h || 0),
+      scene: imageScenePrompt(null),
+    }
+  }
+  const r = el.getBoundingClientRect()
+  return {
+    imageDataUrl: rasterizeEl(el),
+    width: Math.round(r.width),
+    height: Math.round(r.height),
+    scene: imageScenePrompt(el),
+  }
+}
+
+function putImageOnEl(el, src) {
+  if (!el || !src) return null
+  if (el.tagName === 'IMG') {
+    el.removeAttribute('srcset')
+    el.src = src
+    return el
+  }
+  if (el.tagName === 'SVG' || el.tagName === 'CANVAS' || el.tagName === 'PICTURE') {
+    const img = el.ownerDocument.createElement('img')
+    img.src = src
+    img.alt = el.getAttribute('aria-label') || el.getAttribute('alt') || '生成的图'
+    const r = el.getBoundingClientRect()
+    img.style.width = `${Math.max(12, Math.round(r.width))}px`
+    img.style.height = `${Math.max(12, Math.round(r.height))}px`
+    img.style.objectFit = 'cover'
+    el.replaceWith(img)
+    stampIds(el.ownerDocument)
+    return img
+  }
+  const inner = el.querySelector?.('img')
+  if (inner) {
+    inner.removeAttribute('srcset')
+    inner.src = src
+    return inner
+  }
+  el.style.backgroundImage = `url("${src}")`
+  if (!el.style.backgroundSize) el.style.backgroundSize = 'cover'
+  if (!el.style.backgroundRepeat) el.style.backgroundRepeat = 'no-repeat'
+  return el
+}
+
+export function applyGeneratedWebImage(src) {
+  const url = String(src || '').trim()
+  if (!url) return { ok: false, reason: '没有生成出图片' }
+  const els = uniqueEls(resolveCircledEls('color-image').filter((el) => isGraphicEl(el) || isImageEl(el) || hasPaintedBg(el)))
+  if (!els.length) return insertWebImage(url)
+  const before = els.map((el) => snapshotNode(el))
+  const after = []
+  for (const el of els) {
+    const node = putImageOnEl(el, url)
+    if (node?.isConnected) after.push(snapshotNode(node))
+  }
+  if (!after.length) return { ok: false, reason: '圈中的图没能换上' }
+  recordWebEdit('换成生成的图', before, after)
+  fitHeight()
+  return { ok: true, message: '已用生成的图换上。可还原这一处' }
+}
+
 function fileName() {
   const raw = String(meta.title || 'markset-page').replace(/[\\/:*?"<>|]+/g, ' ').trim() || 'markset-page'
   return `${raw.slice(0, 40)}.html`
@@ -2362,7 +2963,7 @@ function cleanExportDoc(raw) {
   const parsed = new DOMParser().parseFromString(raw, 'text/html')
   parsed.getElementById(SKIN_ID)?.remove()
   parsed.getElementById(BADGE_HOST)?.remove()
-  parsed.querySelectorAll('[data-markset-badge-host],[data-markset-edit-badge]').forEach((el) => el.remove())
+  parsed.querySelectorAll('[data-markset-badge-host],[data-markset-edit-badge],[data-markset-tombstone]').forEach((el) => el.remove())
   const keepSkin = parsed.createElement('style')
   keepSkin.textContent = `
 [data-markset-anno="underline"] { text-decoration: underline 2px; text-underline-offset: 3px; }

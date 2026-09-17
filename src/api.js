@@ -1,13 +1,9 @@
 const CALL_HEADER = { 'Content-Type': 'application/json', 'X-MarkSet-Call': '1' }
 
-let clientGate = false
-
-export function setClientModelGate(on) {
-  clientGate = Boolean(on)
-}
+export function setClientModelGate(_on) {}
 
 export function isClientModelGateOn() {
-  return clientGate
+  return true
 }
 
 export async function fetchHealth() {
@@ -17,11 +13,6 @@ export async function fetchHealth() {
 }
 
 async function post(path, payload) {
-  if (!clientGate) {
-    const err = new Error('client-gate')
-    err.code = 'client-gate'
-    throw err
-  }
   const res = await fetch(path, {
     method: 'POST',
     headers: CALL_HEADER,
@@ -42,6 +33,10 @@ export function rewriteText(instruction, text) {
 
 export function inpaintImage({ prompt, imageDataUrl, maskDataUrl }) {
   return post('/api/inpaint', { prompt, imageDataUrl, maskDataUrl })
+}
+
+export function generateImage({ prompt, imageDataUrl, width, height }) {
+  return post('/api/generate-image', { prompt, imageDataUrl, width, height })
 }
 
 export function segmentImage({ imageDataUrl, box, points }) {
@@ -68,8 +63,7 @@ export async function planIntent(payload) {
 }
 
 export async function importPage(payload) {
-  const headers = { 'Content-Type': 'application/json' }
-  if (clientGate) headers['X-MarkSet-Call'] = '1'
+  const headers = { ...CALL_HEADER }
   const res = await fetch('/api/import-page', {
     method: 'POST',
     headers,

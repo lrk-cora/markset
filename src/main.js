@@ -1,7 +1,7 @@
 import './styles.css'
 import { applyDemoPage, applyImportedPage, createEditor, refreshDecorations } from './editor.js'
 import { bindChromeKeys, renderChrome, toast } from './chrome.js'
-import { fetchHealth, importPage, setClientModelGate } from './api.js'
+import { fetchHealth, importPage } from './api.js'
 import { canSnap, consumePackagingHint, consumeSkipObjectSnap, peekPackagingHint, peekSkipObjectSnap, setSnapOn, snapImageHits } from './contour.js'
 import { aabb, looksLikeBoxStroke, looksLikeDrawnLine } from './geometry.js'
 import {
@@ -58,14 +58,8 @@ onInkRecognized(({ text, confident }) => {
 renderChrome(editor)
 
 function forceModelsOff() {
-  setClientModelGate(false)
   setSnapOn(false)
-  const allow = document.getElementById('allow-models')
   const snap = document.getElementById('snap-contour')
-  if (allow) {
-    allow.checked = false
-    allow.closest('label')?.classList.remove('is-on')
-  }
   if (snap) {
     snap.checked = false
     snap.closest('label')?.classList.remove('is-on')
@@ -147,21 +141,6 @@ document.getElementById('btn-import-html')?.addEventListener('click', () => {
 document.getElementById('btn-export-html')?.addEventListener('click', () => {
   if (exportWebDoc()) toast('已导出为网页文件，可用浏览器打开')
   else toast('先导入 HTML 文件，再导出')
-})
-
-document.getElementById('allow-models')?.addEventListener('change', (e) => {
-  const on = e.target.checked
-  setClientModelGate(on)
-  e.target.closest('label')?.classList.toggle('is-on', on)
-  if (!on) {
-    setSnapOn(false)
-    const snap = document.getElementById('snap-contour')
-    if (snap) {
-      snap.checked = false
-      snap.closest('label')?.classList.remove('is-on')
-    }
-  }
-  toast(on ? '已允许调用。改写/改图仍会再确认一次' : '已禁止调用云端模型')
 })
 
 document.getElementById('snap-contour')?.addEventListener('change', (e) => {
@@ -457,7 +436,7 @@ bindLasso({
       return false
     }
     if (rawPoints?.length) setPaintGesture(rawPoints, { silent: true })
-    const webHits = isWebDocActive() ? hitWebDoc(polygon, { loose: true }) : null
+    const webHits = isWebDocActive() ? hitWebDoc(polygon) : null
     const textHits = webHits ? webHits.texts : hitText(editor.view, polygon, { skipCovered: shift && !subtract })
     const rawImageHits = webHits ? webHits.images : hitImages(editor.view, polygon)
     const imageHits =

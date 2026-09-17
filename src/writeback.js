@@ -20,10 +20,7 @@ import { getSnapshot, ping, targets, undoLastWrite } from './store.js'
 let running = false
 
 function gateMessage(err) {
-  if (err.code === 'client-gate' || err.code === 'no_client_gate') {
-    return '未勾选「允许调用云端模型」'
-  }
-  if (err.code === 'calls_disabled') {
+  if (err.code === 'client-gate' || err.code === 'no_client_gate' || err.code === 'calls_disabled') {
     return '服务器禁止调用：把 markset/.env 里 MARKSET_ALLOW_MODEL_CALLS 改为 1 并重启 npm run dev'
   }
   return err.message || '调用失败'

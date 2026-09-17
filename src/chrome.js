@@ -788,6 +788,11 @@ export function renderChrome(editor) {
   const boxes = []
   const corners = {}
 
+  const typedEl = layer.querySelector('[data-typed-req]')
+  const typedCaret =
+    typedEl && document.activeElement === typedEl
+      ? { start: typedEl.selectionStart, end: typedEl.selectionEnd }
+      : null
   layer.replaceChildren()
 
   for (const span of snap.spans) {
@@ -916,6 +921,19 @@ export function renderChrome(editor) {
   renderList(editor)
   inspector.textContent = JSON.stringify(toSpec(), null, 2)
   syncUndoButton()
+  if (typedCaret) {
+    const next = layer.querySelector('[data-typed-req]')
+    if (next) {
+      next.focus({ preventScroll: true })
+      try {
+        const start = Number.isFinite(typedCaret.start) ? typedCaret.start : next.value.length
+        const end = Number.isFinite(typedCaret.end) ? typedCaret.end : start
+        next.setSelectionRange(start, end)
+      } catch {
+        /* ignore */
+      }
+    }
+  }
 }
 
 function localUndoIsLatest() {

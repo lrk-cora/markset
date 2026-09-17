@@ -141,7 +141,7 @@ export function setColorMode(on) {
 function uiTarget(e) {
   const el = e.target instanceof Element ? e.target : e.target.parentElement
   return el?.closest?.(
-    '.hl-handle, .img-handle, .badge, .scheme-tag, .toolbar, .novice-card, .card-guesses, .topbar, .inspector, .suggest, .confirm, .change-badge, .change-toggle, .coach, [data-guess-index]',
+    '.hl-handle, .img-handle, .badge, .scheme-tag, .toolbar, .novice-card, .card-guesses, .topbar, .inspector, .suggest, .confirm, .change-badge, .change-toggle, .coach, [data-guess-index], [data-typed-req], input, textarea',
   )
 }
 

@@ -40,6 +40,7 @@ function models(env) {
     plannerModel: env.DASHSCOPE_PLANNER_MODEL || 'qwen3-vl-plus',
     ocrModel: env.DASHSCOPE_OCR_MODEL || 'qwen-vl-ocr-latest',
     inpaintModel: env.DASHSCOPE_INPAINT_MODEL || 'wanx2.1-imageedit',
+    t2iModel: env.DASHSCOPE_T2I_MODEL || 'wanx2.1-t2i-turbo',
   }
 }
 
@@ -49,8 +50,8 @@ function missing(env) {
   }
 }
 
-function allowModelCalls(env, req) {
-  return env.MARKSET_ALLOW_MODEL_CALLS === '1' && req.headers['x-markset-call'] === '1'
+function allowModelCalls(env, _req) {
+  return env.MARKSET_ALLOW_MODEL_CALLS === '1'
 }
 
 function redact(text, env) {
@@ -193,7 +194,7 @@ async function rewrite(env, payload) {
       {
         role: 'system',
         content:
-          'You rewrite the selected Chinese product-page text. Return only the rewritten text, no quotes or explanation.',
+          'You rewrite the selected webpage text. Keep the original language unless the instruction asks to change it. Return only the rewritten text, with no quotes, labels, or explanation. Never replace the passage with the instruction itself.',
       },
       {
         role: 'user',
@@ -380,38 +381,8 @@ function wanxError(body, fallback) {
   )
 }
 
-async function wanxInpaint(env, { model, prompt, imageUrl, maskUrl }) {
+async function waitWanxTask(env, taskId) {
   const origin = dashNativeOrigin(env)
-  const started = await fetch(`${origin}/api/v1/services/aigc/image2image/image-synthesis`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${env.DASHSCOPE_API_KEY}`,
-      'Content-Type': 'application/json',
-      'X-DashScope-Async': 'enable',
-    },
-    body: JSON.stringify({
-      model,
-      input: {
-        function: 'description_edit_with_mask',
-        prompt,
-        base_image_url: imageUrl,
-        mask_image_url: maskUrl,
-      },
-      parameters: { n: 1 },
-    }),
-  })
-  const first = await started.json().catch(() => ({}))
-  if (!started.ok) {
-    const err = new Error(wanxError(first, `万相 ${started.status}`))
-    err.status = 502
-    throw err
-  }
-  const taskId = first.output?.task_id
-  if (!taskId) {
-    const err = new Error(wanxError(first, '万相未返回任务号'))
-    err.status = 502
-    throw err
-  }
   for (let i = 0; i < 45; i += 1) {
     await sleep(2000)
     const st = await fetch(`${origin}/api/v1/tasks/${taskId}`, {
@@ -436,6 +407,104 @@ async function wanxInpaint(env, { model, prompt, imageUrl, maskUrl }) {
   throw err
 }
 
+async function wanxPost(env, path, payload) {
+  const origin = dashNativeOrigin(env)
+  const started = await fetch(`${origin}${path}`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${env.DASHSCOPE_API_KEY}`,
+      'Content-Type': 'application/json',
+      'X-DashScope-Async': 'enable',
+    },
+    body: JSON.stringify(payload),
+  })
+  const first = await started.json().catch(() => ({}))
+  if (!started.ok) {
+    const err = new Error(wanxError(first, `万相 ${started.status}`))
+    err.status = 502
+    throw err
+  }
+  const taskId = first.output?.task_id
+  if (!taskId) {
+    const err = new Error(wanxError(first, '万相未返回任务号'))
+    err.status = 502
+    throw err
+  }
+  return waitWanxTask(env, taskId)
+}
+
+function firstWanxUrl(data) {
+  const results = data?.output?.results || []
+  return results[0]?.url || results[0]?.image_url || ''
+}
+
+function pickWanxSize(w, h) {
+  const rw = Number(w) || 0
+  const rh = Number(h) || 0
+  if (!rw || !rh) return '1024*1024'
+  const ratio = rw / rh
+  if (ratio >= 1.45) return '1280*720'
+  if (ratio <= 0.7) return '720*1280'
+  return '1024*1024'
+}
+
+async function wanxInpaint(env, { model, prompt, imageUrl, maskUrl }) {
+  return wanxPost(env, '/api/v1/services/aigc/image2image/image-synthesis', {
+    model,
+    input: {
+      function: 'description_edit_with_mask',
+      prompt,
+      base_image_url: imageUrl,
+      mask_image_url: maskUrl,
+    },
+    parameters: { n: 1 },
+  })
+}
+
+async function generateWanxImage(env, payload) {
+  const { t2iModel, inpaintModel } = models(env)
+  const prompt = String(payload.prompt || '').trim()
+  if (!prompt) {
+    const err = new Error('missing prompt')
+    err.status = 400
+    throw err
+  }
+  const imageUrl = payload.imageDataUrl || payload.image_url || ''
+  const size = pickWanxSize(payload.width, payload.height)
+  let data = null
+  let model = t2iModel
+  if (imageUrl) {
+    try {
+      data = await wanxPost(env, '/api/v1/services/aigc/image2image/image-synthesis', {
+        model: inpaintModel,
+        input: {
+          function: 'description_edit',
+          prompt,
+          base_image_url: imageUrl,
+        },
+        parameters: { n: 1 },
+      })
+      model = inpaintModel
+    } catch {
+      data = null
+    }
+  }
+  if (!data) {
+    data = await wanxPost(env, '/api/v1/services/aigc/text2image/image-synthesis', {
+      model: t2iModel,
+      input: { prompt },
+      parameters: { size, n: 1 },
+    })
+  }
+  const url = firstWanxUrl(data)
+  if (!url) {
+    const err = new Error(wanxError(data, '万相未返回图片'))
+    err.status = 502
+    throw err
+  }
+  return { imageUrl: await inlineImage(url), model }
+}
+
 async function inpaint(env, payload) {
   const { inpaintModel } = models(env)
   const prompt = String(payload.prompt || '').trim() || '按标注修改选中区域，其余画面保持不变'
@@ -452,8 +521,7 @@ async function inpaint(env, payload) {
     imageUrl,
     maskUrl,
   })
-  const results = data.output?.results || []
-  const url = results[0]?.url || results[0]?.image_url
+  const url = firstWanxUrl(data)
   if (!url) {
     const err = new Error(wanxError(data, '万相未返回图片'))
     err.status = 502
@@ -503,7 +571,7 @@ export function marksetApi(env) {
               if (!allowModelCalls(env, req)) {
                 page.warnings = [
                   ...(page.warnings || []),
-                  '智能整理未执行：请勾选「允许调用云端模型」，且 .env 中 MARKSET_ALLOW_MODEL_CALLS=1',
+                  '智能整理未执行：请把 .env 中 MARKSET_ALLOW_MODEL_CALLS 改为 1 并重启 npm run dev',
                 ]
               } else if (miss.dashscope) {
                 page.warnings = [...(page.warnings || []), '智能整理未执行：未填 DASHSCOPE_API_KEY']
@@ -558,6 +626,15 @@ export function marksetApi(env) {
               return
             }
             send(res, 200, await inpaint(env, body))
+            return
+          }
+
+          if (url === '/api/generate-image') {
+            if (miss.dashscope) {
+              send(res, 503, { error: 'missing DASHSCOPE_API_KEY' })
+              return
+            }
+            send(res, 200, await generateWanxImage(env, body))
             return
           }
 
