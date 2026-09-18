@@ -20,6 +20,7 @@ import {
   closeSchemeSlot,
   restoreSchemeModuleColor,
   setSchemeModuleColor,
+  startReview,
   toggleSchemeSlot,
   undoLastLocalAction,
 } from './card-flow.js'
@@ -433,6 +434,7 @@ function insertImage(editor) {
       if (isWebDocActive()) {
         const result = insertWebImage(src)
         toast(result.ok ? result.message : result.reason)
+        if (result.ok) startReview()
         return
       }
       const current = slotTargets()

@@ -28,7 +28,9 @@ img, video { max-width: 100%; height: auto; }
 [data-markset-anno="box"] { outline: 2px solid #3c6fd4; outline-offset: 3px; }
 [data-markset-anno="circle"] { outline: 2px solid #3c6fd4; border-radius: 999px; outline-offset: 4px; }
 [data-markset-anno="frame"] { outline: 2px solid #3c6fd4; outline-offset: 4px; }
-[data-markset-shifted] { position: relative; z-index: 3; }
+[data-markset-shifted]:not([data-markset-shifted="flow"]) { position: relative; z-index: 3; }
+[data-markset-shifted="flow"] { position: relative; left: auto; top: auto; transform: none; z-index: auto; max-width: 100%; clear: both; }
+[data-markset-move-slot] { display: block; width: 100%; max-width: 100%; box-sizing: border-box; clear: both; }
 [data-markset-scaled] { transform-origin: center center; max-width: 100%; }
 [data-markset-flow] { overflow: visible; }
 [data-markset-tombstone] { display: inline-block; width: 0; overflow: hidden; margin: 0; padding: 0; border: 0; vertical-align: top; pointer-events: none; }
@@ -316,6 +318,24 @@ function insertShot(shot) {
 
 function applyShot(shot) {
   if (!shot) return
+  if (shot.relocated || shot.styleOnly) {
+    const cur = shot.webId ? findByWebId(shot.webId) : null
+    if (!cur) return
+    if (shot.relocated) {
+      detachMoveSlot(cur)
+      const parent = (shot.parentId && findByWebId(shot.parentId)) || cur.parentElement
+      const next = shot.nextId ? findByWebId(shot.nextId) : null
+      if (parent && (cur.parentElement !== parent || cur.nextElementSibling !== next)) {
+        if (next && next.parentElement === parent) parent.insertBefore(cur, next)
+        else parent.append(cur)
+      }
+    }
+    if (shot.cssText != null) cur.setAttribute('style', shot.cssText)
+    else cur.removeAttribute('style')
+    if (shot.shifted) cur.setAttribute('data-markset-shifted', shot.shifted)
+    else cur.removeAttribute('data-markset-shifted')
+    return
+  }
   const cur = shot.webId ? findByWebId(shot.webId) : null
   if (shot.removed) {
     if (cur && !isTombstone(cur)) leaveTombstone(cur)
@@ -329,6 +349,25 @@ function applyShot(shot) {
   if (!node) return
   if (cur) cur.replaceWith(node)
   else insertShot(shot)
+}
+
+function snapshotStyle(el) {
+  return {
+    webId: el.getAttribute('data-markset-id') || '',
+    html: '',
+    cssText: el.getAttribute('style') || '',
+    shifted: el.getAttribute('data-markset-shifted') || '',
+    styleOnly: true,
+    relocated: true,
+    parentId: el.parentElement?.getAttribute('data-markset-id') || '',
+    nextId: el.nextElementSibling?.getAttribute('data-markset-id') || '',
+    removed: false,
+    anchor: nodeAnchor(el),
+  }
+}
+
+function snapshotPlace(el) {
+  return snapshotStyle(el)
 }
 
 function tombstoneHtml(shot) {
@@ -432,10 +471,22 @@ export function popLastWebEdit() {
 }
 
 export function popWebEditsSince(at) {
+  undoWebEditsSince(at)
+}
+
+export function undoWebEditsSince(at) {
   const t = Number(at) || 0
-  if (!t) return popLastWebEdit()
-  webEdits = webEdits.filter((item) => (item.at || 0) < t)
+  const recent = t
+    ? webEdits.filter((item) => (item.at || 0) >= t)
+    : webEdits.slice(0, 1)
+  for (const item of recent) {
+    if (item.keep === false) continue
+    for (const shot of item.before || []) applyShot(shot)
+    item.keep = false
+  }
+  webEdits = t ? webEdits.filter((item) => (item.at || 0) < t) : webEdits.slice(1)
   ping()
+  fitHeight()
 }
 
 export function clearWebEdits() {
@@ -448,17 +499,69 @@ function areaOf(el) {
   return r ? r.width * r.height : 0
 }
 
+let lastPaintBox = null
+let lastShadowJob = null
+let paintRoleCache = { key: '', val: null }
+
+export function rememberPaintBox(polygon) {
+  const box = iframeUnionBox([polygon])
+  if (box && box.w >= 6 && box.h >= 6) lastPaintBox = box
+  return lastPaintBox
+}
+
+function paintBoxKey(marks) {
+  return (marks || [])
+    .map((m) => `${m.points?.length || 0}:${Math.round(m.points?.[0]?.x || 0)},${Math.round(m.points?.[0]?.y || 0)}`)
+    .join('|')
+}
+
+function isChromeStrip(el) {
+  if (!el) return false
+  const iframe = frameEl()
+  const r = el.getBoundingClientRect()
+  const fw = iframe?.clientWidth || 0
+  if (!fw || r.width < 8) return false
+  return r.top < 180 && r.width > fw * 0.62 && r.height < 96 && r.height > 10
+}
+
+function containsStackedStrips(el) {
+  if (!el) return false
+  const iframe = frameEl()
+  const fw = iframe?.clientWidth || 0
+  const kids = significantChildren(el)
+  const strips = kids.filter((kid) => {
+    if (isChromeStrip(kid)) return true
+    const r = kid.getBoundingClientRect()
+    return fw && r.width > fw * 0.58 && r.height < 110 && r.height > 16
+  })
+  return strips.length >= 2
+}
+
+function distinctiveClass(el) {
+  return [...(el?.classList || [])].filter(
+    (c) =>
+      c.length > 2 &&
+      !/^(is-|js-|active|open|on|off|clearfix|row|col|container|wrap|wrapper|inner|flex|grid|item|box|left|right|top|nav|header|footer|main|content)/i.test(c) &&
+      !/^markset/i.test(c),
+  )
+}
+
 function logoCluster(el, box) {
   let cur = el
+  const paintH = box?.h || 48
+  const fw = frameEl()?.clientWidth || 0
   for (let i = 0; i < 5 && cur.parentElement; i += 1) {
     const parent = cur.parentElement
     const pr = parent.getBoundingClientRect()
     const pa = pr.width * pr.height
     const ca = areaOf(cur)
     if (parent === parent.ownerDocument?.body) break
-    if (pa > 520 * 220) break
-    if (pr.height > 150 && pa > ca * 3.2) break
-    if (box && !staysInPaint(parent, box) && overlapScore(parent, box).extraTop > 20) break
+    if (containsStackedStrips(parent)) break
+    if (isChromeStrip(parent) && !looksLikeLogo(parent)) break
+    if (pa > 420 * 160) break
+    if (pr.height > Math.max(72, paintH * 1.45) && pa > ca * 2.1) break
+    if (fw && pr.width > fw * 0.68 && pr.height > paintH * 1.25) break
+    if (box && !staysInPaint(parent, box) && overlapScore(parent, box).extraTop > 12) break
     cur = parent
   }
   return cur
@@ -551,8 +654,9 @@ function sceneFromIframeBox(box) {
   const paintArea = Math.max(1, box.w * box.h)
   const hits = scanOverlapEls(box).filter((h) => isGraphicEl(h.el) || isTextEl(h.el) || isWidgetEl(h.el))
   const core = hits.filter((h) => {
+    if (isChromeStrip(h.el) && h.coverEl < 0.45) return false
     if (h.coverEl >= 0.28 && (centerInPaint(h.el, box) || h.coverBox >= 0.08)) return true
-    return centerInPaint(h.el, box) && h.coverBox >= 0.05 && (isGraphicEl(h.el) || isWidgetEl(h.el))
+    return centerInPaint(h.el, box) && h.coverBox >= 0.05 && (isGraphicEl(h.el) || isWidgetEl(h.el)) && h.coverEl >= 0.22
   })
   const incidental = hits.filter((h) => !core.includes(h) && (h.coverBox < 0.08 || (!centerInPaint(h.el, box) && h.coverEl < 0.45)))
   const coreArea = core.reduce((sum, h) => sum + Math.min(h.area, paintArea) * Math.min(1, h.coverEl), 0)
@@ -582,28 +686,34 @@ function paintLassoMarks() {
 
 function classifyPaintRoles(marks = paintLassoMarks()) {
   const all = marks || []
-  if (all.length < 2) return { sources: all, dests: [], all }
-  const scored = all.map((m) => {
-    const poly = m.points.length >= 3 ? strokeToPolygon(m.points) : m.points
-    const box = aabb(m.points)
-    const iframe = iframeUnionBox([poly])
-    const scene = sceneFromIframeBox(iframe)
-    const hits = hitWebDoc(poly, { loose: true })
-    const n = (hits.images?.found?.length || 0) + (hits.texts?.found?.length || 0)
-    return { mark: m, box, poly, scene, n, blank: scene.blank || scene.fill < 0.2 }
-  })
-  const dests = scored.filter((s) => s.blank)
-  const sources = scored.filter((s) => !s.blank)
-  if (dests.length && sources.length) {
-    return { sources: sources.map((s) => s.mark), dests: dests.map((s) => s.mark), all }
-  }
-  scored.sort((a, b) => b.n - a.n || a.box.w * a.box.h - b.box.w * b.box.h)
-  const primary = scored[0]
-  const extra = scored.slice(1).filter((s) => boxesFar(primary.box, s.box) && s.n <= primary.n)
-  if (extra.length) {
-    return { sources: [primary.mark], dests: extra.map((s) => s.mark), all }
-  }
-  return { sources: all, dests: [], all }
+  const key = paintBoxKey(all)
+  if (paintRoleCache.key === key && paintRoleCache.val) return paintRoleCache.val
+  const result = (() => {
+    if (all.length < 2) return { sources: all, dests: [], all }
+    const scored = all.map((m) => {
+      const poly = m.points.length >= 3 ? strokeToPolygon(m.points) : m.points
+      const box = aabb(m.points)
+      const iframe = iframeUnionBox([poly])
+      const scene = sceneFromIframeBox(iframe)
+      const hits = hitWebDoc(poly, { loose: true })
+      const n = (hits.images?.found?.length || 0) + (hits.texts?.found?.length || 0)
+      return { mark: m, box, poly, scene, n, blank: scene.blank || scene.fill < 0.28 }
+    })
+    const dests = scored.filter((s) => s.blank)
+    const sources = scored.filter((s) => !s.blank)
+    if (dests.length && sources.length) {
+      return { sources: sources.map((s) => s.mark), dests: dests.map((s) => s.mark), all }
+    }
+    scored.sort((a, b) => b.n - a.n || a.box.w * a.box.h - b.box.w * b.box.h)
+    const primary = scored[0]
+    const extra = scored.slice(1).filter((s) => boxesFar(primary.box, s.box) && (s.n < primary.n || s.scene.fill < primary.scene.fill * 0.7))
+    if (extra.length) {
+      return { sources: [primary.mark], dests: extra.map((s) => s.mark), all }
+    }
+    return { sources: all, dests: [], all }
+  })()
+  paintRoleCache = { key, val: result }
+  return result
 }
 
 function polysOfMarks(marks) {
@@ -641,7 +751,16 @@ export function looksLikeWebLayoutDest(rawPoints, polygon) {
   if (!far) return false
   const iframe = iframeUnionBox([polygon?.length ? polygon : pts])
   const scene = sceneFromIframeBox(iframe)
-  return scene.blank || scene.fill < 0.22
+  if (scene.blank || scene.fill < 0.38) return true
+  const srcFill = Math.max(
+    0,
+    ...sources.map((s) => {
+      const r = s.screenRect || liveScreenRect(s)
+      if (!r) return 0
+      return sceneFromIframeBox(toIframeRect(r))?.fill || 0
+    }),
+  )
+  return scene.fill < Math.max(0.18, srcFill * 0.72)
 }
 
 export function pairWebLayoutDest(rawPoints, polygon, color = SELECT_COLOR) {
@@ -883,7 +1002,8 @@ export function liveScreenRect(span) {
     const r = el?.getBoundingClientRect()
     const frame = iframeBox()
     if (r && frame) {
-      return { x: frame.left + r.left, y: frame.top + r.top, w: r.width, h: r.height }
+      const z = iframeZoom()
+      return { x: frame.left + r.left * z, y: frame.top + r.top * z, w: r.width * z, h: r.height * z }
     }
   }
   return span?.screenRect || span?.imageRect || null
@@ -892,23 +1012,33 @@ export function liveScreenRect(span) {
 function toViewport(r) {
   const frame = iframeBox()
   if (!frame || !r) return null
-  return { x: frame.left + r.left, y: frame.top + r.top, w: r.width, h: r.height }
+  const z = iframeZoom()
+  return { x: frame.left + r.left * z, y: frame.top + r.top * z, w: r.width * z, h: r.height * z }
+}
+
+function iframeZoom() {
+  const z = Number.parseFloat(getDoc()?.documentElement?.style?.zoom || '')
+  return Number.isFinite(z) && z > 0.05 ? z : 1
 }
 
 function toIframePoly(polygon) {
   const frame = iframeBox()
   if (!frame) return polygon
-  return (polygon || []).map((p) => ({ x: p.x - frame.left, y: p.y - frame.top }))
+  const z = iframeZoom()
+  return (polygon || []).map((p) => ({ x: (p.x - frame.left) / z, y: (p.y - frame.top) / z }))
 }
 
 function toIframeRect(rect) {
   const frame = iframeBox()
   if (!frame || !rect) return null
+  const z = iframeZoom()
+  const w = rect.w ?? rect.width ?? 0
+  const h = rect.h ?? rect.height ?? 0
   return {
-    x: rect.x - frame.left,
-    y: rect.y - frame.top,
-    w: rect.w,
-    h: rect.h,
+    x: (rect.x - frame.left) / z,
+    y: (rect.y - frame.top) / z,
+    w: w / z,
+    h: h / z,
   }
 }
 
@@ -1066,7 +1196,7 @@ function centerInPoly(el, poly) {
 
 function considerEl(el, frameArea, seen, poly, { minCover = 0.12 } = {}) {
   if (!el || el === el.ownerDocument?.documentElement || el === el.ownerDocument?.body) return
-  if (SKIP.has(el.tagName) || isTombstone(el) || el.hasAttribute?.('data-markset-shaped-shadow')) return
+  if (SKIP.has(el.tagName) || isTombstone(el) || decoNode(el) || el.hasAttribute?.('data-markset-shaped-shadow')) return
   const target = promoteTarget(el)
   const r = target.getBoundingClientRect()
   if (r.width < 3 || r.height < 3) return
@@ -1149,6 +1279,7 @@ export function hitWebDoc(polygon, { loose = false } = {}) {
   const doc = getDoc()
   const iframe = frameEl()
   if (!doc?.body || !iframe) return empty
+  stampIds(doc)
   const poly = toIframePoly(polygon)
   const frameArea = Math.max(1, iframe.clientWidth * iframe.clientHeight)
   const seen = new Map()
@@ -1166,11 +1297,36 @@ export function hitWebDoc(polygon, { loose = false } = {}) {
   if (!seen.size) scanMarked(poly, frameArea, seen, minCover)
   if (loose && !seen.size) scanMarked(inflatePoly(poly, 8), frameArea, seen, 0.12)
   const paintArea = Math.max(1, aabb(poly).w * aabb(poly).h)
+  const paintBox = aabb(poly)
   let items = tightenHits([...seen.values()], poly, { loose })
-  items = items.filter((h) => {
+  items = items.flatMap((h) => {
+    if (!containsOutsiders(h.el, paintBox)) return [h]
+    return significantChildren(h.el)
+      .filter((kid) => !decoNode(kid) && (kidInPaint(kid, paintBox) || aimedLeaf(kid, paintBox)))
+      .map((kid) => ({
+        ...h,
+        el: kid,
+        area: Math.max(1, areaOf(kid)),
+        kind: isGraphicEl(kid) && !isPrimarilyText(kid) ? 'image' : 'text',
+        inPoly: centerInPoly(kid, poly),
+        cover: polygonCover(kid, poly),
+      }))
+  })
+  items = dropAncestors(items.filter((h) => {
+    if (!h?.el || decoNode(h.el)) return false
     if (isGraphicEl(h.el)) return h.inPoly || h.cover >= 0.08 || h.overlap >= 0.12
     return h.area <= paintArea * 10 || h.cover >= 0.4 || h.inPoly
-  })
+  }))
+  const logos = items.filter((h) => looksLikeLogo(h.el) || (isGraphicEl(h.el) && h.area < 220 * 90 && (h.inPoly || kidInPaint(h.el, paintBox))))
+  if (logos.length) {
+    const seed = logos.sort((a, b) => a.area - b.area)[0]
+    items = items.filter((h) => {
+      if (h.el === seed.el) return true
+      if (seed.el.contains(h.el) || h.el.contains(seed.el)) return h.area <= seed.area * 1.8
+      if (isChromeStrip(h.el) || containsStackedStrips(h.el) || h.area > seed.area * 6) return false
+      return false
+    })
+  }
   items.sort((a, b) => (b.inPoly - a.inPoly) || b.cover - a.cover || a.area - b.area)
   items = items.slice(0, loose ? 3 : MAX_HITS)
   const images = []
@@ -1273,6 +1429,68 @@ export function applyWebShadow() {
   return executeCircledOp('shadow', { label: '加阴影' }).ok
 }
 
+function similarModules(el) {
+  if (!el?.isConnected) return []
+  const doc = getDoc()
+  if (!doc) return []
+  const r = el.getBoundingClientRect()
+  const area = Math.max(1, r.width * r.height)
+  const cls = distinctiveClass(el)
+  const parent = el.parentElement
+  const grand = parent?.parentElement
+  const out = []
+  for (const node of doc.querySelectorAll(el.tagName)) {
+    if (node === el || isTombstone(node) || decoNode(node)) continue
+    const nr = node.getBoundingClientRect()
+    const na = nr.width * nr.height
+    if (na < 80 || nr.width < 8 || nr.height < 8) continue
+    if (na < area * 0.45 || na > area * 2.2) continue
+    if (nr.width < r.width * 0.5 || nr.width > r.width * 2.1) continue
+    if (nr.height < r.height * 0.5 || nr.height > r.height * 2.1) continue
+    const sameParent = parent && node.parentElement === parent
+    const sameGrid = grand && node.parentElement?.parentElement === grand
+    const classHit = cls.length && cls.some((c) => node.classList?.contains(c))
+    const bothLogo = looksLikeLogo(el) && looksLikeLogo(node)
+    const bothImg = isGraphicEl(el) && isGraphicEl(node)
+    if (sameParent || sameGrid || classHit || bothLogo || (bothImg && sameGrid)) out.push(node)
+    if (out.length >= 24) break
+  }
+  return uniqueEls(out)
+}
+
+export function countSimilarShadowHosts() {
+  const host = lastShadowJob?.hostId ? findByWebId(lastShadowJob.hostId) : null
+  if (!host) return 0
+  return similarModules(host).length
+}
+
+export function applySimilarWebShadows() {
+  const host = lastShadowJob?.hostId ? findByWebId(lastShadowJob.hostId) : null
+  if (!host || !lastShadowJob) return { ok: false, reason: '还没有刚加上的阴影可套用', count: 0 }
+  const peers = similarModules(host).filter((el) => el.getAttribute('data-markset-shadow') !== host.getAttribute('data-markset-shadow') || !el.dataset.marksetShadow)
+  if (!peers.length) return { ok: false, reason: '没有找到同类模块', count: 0 }
+  const before = peers.map((el) => snapshotNode(el))
+  let count = 0
+  for (const el of peers) {
+    if (lastShadowJob.shaped && lastShadowJob.pts?.length >= 6) {
+      if (attachShapedShadow(el, lastShadowJob.pts)) count += 1
+    } else {
+      replaceFilterPart(el, 'shadow', lastShadowJob.css || inferCssShadow(lastShadowJob.pts, el))
+      el.dataset.marksetShadow = '1'
+      adaptLayout(el, 'shadow')
+      count += 1
+    }
+  }
+  if (!count) return { ok: false, reason: '同类模块没能加上阴影', count: 0 }
+  recordWebEdit(
+    '同类模块加阴影',
+    before,
+    peers.map((el) => snapshotNode(el)),
+  )
+  fitHeight()
+  return { ok: true, count, message: `已给 ${count} 个同类模块加上同样的阴影。可还原这一处` }
+}
+
 export function applyWebReflect() {
   return executeCircledOp('reflect', { label: '加倒影' }).ok
 }
@@ -1300,37 +1518,84 @@ export function applyWebIndent({ all = false } = {}) {
 }
 
 export function applyWebLayoutMoves() {
-  const html = snapshotWebHtml()
+  const doc = getDoc()
+  if (doc) stampIds(doc)
   const pairs = inferWebLayoutPairs()
   if (!pairs.length) return 0
-  const modes = ['transform', 'absolute']
-  for (const mode of modes) {
-    if (mode !== 'transform') restoreWebHtml(html)
-    let n = 0
-    const before = []
-    const beforeEv = []
-    const afterEls = []
-    const dests = []
-    for (const pair of pairs) {
-      const el = findByWebId(pair.webId)
-      const dest = toIframeRect(pair.dest)
-      if (!el || !dest) continue
-      before.push(snapshotNode(el))
-      beforeEv.push(evidenceOf(el))
-      dests.push(dest)
-      moveElToDest(el, dest, mode)
-      afterEls.push(el)
-      n += 1
-    }
-    if (!n) continue
-    const afterEv = afterEls.map((el) => (el?.isConnected ? evidenceOf(el) : { connected: false, rect: { x: 0, y: 0, w: 0, h: 0 } }))
-    if (!verifyMove(beforeEv, afterEv, dests)) continue
-    recordWebEdit('挪位置', before, afterEls.map((el) => snapshotNode(el)))
-    fitHeight()
-    return n
+  const seen = new Set()
+  const jobs = []
+  for (const pair of pairs) {
+    const raw = findByWebId(pair.webId)
+    const dest = toIframeRect(pair.dest)
+    if (!raw || !dest) continue
+    const el = layoutMoveHost(raw, pair)
+    const id = el.getAttribute('data-markset-id') || el
+    if (seen.has(id)) continue
+    seen.add(id)
+    jobs.push({ el, dest, before: snapshotPlace(el), beforeEv: evidenceOf(el) })
   }
-  restoreWebHtml(html)
+  if (!jobs.length) return 0
+  const modes = ['flow', 'absolute']
+  for (const mode of modes) {
+    if (mode !== 'flow') {
+      for (const job of jobs) applyShot(job.before)
+    }
+    for (const job of jobs) {
+      job.el = (job.before.webId && findByWebId(job.before.webId)) || job.el
+      if (!job.el?.isConnected) continue
+      if (mode === 'flow') placeElInFlow(job.el, job.dest)
+      else moveElToDest(job.el, job.dest, 'absolute')
+    }
+    if (mode === 'flow') {
+      for (const job of jobs) {
+        if (job.el?.isConnected) resolveRemainingOverlap(job.el)
+      }
+    }
+    let afterEv = jobs.map((job) => (job.el?.isConnected ? evidenceOf(job.el) : { connected: false, rect: { x: 0, y: 0, w: 0, h: 0 } }))
+    let moved = mode === 'flow'
+      ? jobs.some((job, i) => layoutFlowChanged(job, afterEv[i]))
+      : verifyMove(
+        jobs.map((job) => job.beforeEv),
+        afterEv,
+        jobs.map((job) => job.dest),
+      )
+    if (mode === 'flow' && !moved) {
+      for (const job of jobs) {
+        if (!job.el?.isConnected) continue
+        placeElInFlow(job.el, job.dest)
+      }
+      afterEv = jobs.map((job) => (job.el?.isConnected ? evidenceOf(job.el) : { connected: false, rect: { x: 0, y: 0, w: 0, h: 0 } }))
+      moved = jobs.some((job, i) => layoutFlowChanged(job, afterEv[i]))
+    }
+    if (!moved) continue
+    recordWebEdit(
+      '挪位置',
+      jobs.map((job) => job.before),
+      jobs.map((job) => snapshotPlace(job.el)),
+    )
+    fitHeight()
+    return jobs.length
+  }
+  jobs.forEach((job) => applyShot(job.before))
   return 0
+}
+
+function layoutMoveHost(el, pair) {
+  const srcBox = pair?.sourceRect ? toIframeRect(pair.sourceRect) : null
+  let host = el
+  let parent = el.parentElement
+  for (let i = 0; i < 5 && parent && parent !== parent.ownerDocument?.body; i += 1) {
+    if (containsStackedStrips(parent) || isChromeStrip(parent)) break
+    if ((parent.children?.length || 0) >= 4) break
+    if (srcBox && containsOutsiders(parent, srcBox)) break
+    const pr = parent.getBoundingClientRect()
+    const cr = host.getBoundingClientRect()
+    if (pr.width * pr.height > cr.width * cr.height * 2.6) break
+    if (srcBox && !staysInPaint(parent, srcBox) && overlapScore(parent, srcBox).coverEl < 0.55) break
+    host = parent
+    parent = parent.parentElement
+  }
+  return host
 }
 
 function moveElToDest(el, dest, mode) {
@@ -1348,6 +1613,294 @@ function moveElToDest(el, dest, mode) {
     return
   }
   nudgeEl(el, dx, dy)
+}
+
+function layoutFlowChanged(job, after) {
+  if (!job?.el?.isConnected) return false
+  const parentId = job.el.parentElement?.getAttribute('data-markset-id') || ''
+  const nextId = job.el.nextElementSibling?.getAttribute('data-markset-id') || ''
+  if (parentId !== (job.before?.parentId || '') || nextId !== (job.before?.nextId || '')) return true
+  const b = job.beforeEv?.rect
+  const a = after?.rect
+  if (!b || !a) return false
+  return Math.hypot(a.x - b.x, a.y - b.y) > 8
+}
+
+function boxOfRect(r) {
+  if (!r) return null
+  if (r.w != null) return { x: r.x, y: r.y, w: r.w, h: r.h }
+  return { x: r.left, y: r.top, w: r.width, h: r.height }
+}
+
+function overlapRatio(a, b) {
+  const aa = boxOfRect(a)
+  const bb = boxOfRect(b)
+  if (!aa || !bb) return 0
+  const hit = intersectBoxes(aa, bb)
+  if (!hit) return 0
+  return (hit.w * hit.h) / Math.max(1, bb.w * bb.h)
+}
+
+function pageOverlapHits(box, moving) {
+  const doc = getDoc()
+  if (!doc?.body || !box || !moving) return []
+  const out = []
+  for (const other of doc.body.querySelectorAll('[data-markset-id]')) {
+    if (other === moving || moving.contains(other) || other.contains(moving) || decoNode(other) || SKIP.has(other.tagName)) continue
+    const hit = overlapScore(other, box)
+    if (hit.coverBox > 0.12 && hit.coverEl > 0.08) out.push(hit)
+  }
+  return out
+}
+
+function keepCardLook(el) {
+  const win = el.ownerDocument?.defaultView
+  const cs = win?.getComputedStyle(el)
+  const r = el.getBoundingClientRect()
+  if (!cs) return
+  const props = [
+    'display', 'flex-direction', 'align-items', 'justify-content', 'gap',
+    'padding', 'border', 'border-radius', 'background', 'background-color',
+    'box-shadow', 'color', 'font', 'font-size', 'font-weight', 'line-height',
+    'text-decoration', 'text-align',
+  ]
+  for (const prop of props) {
+    const val = cs.getPropertyValue(prop)
+    if (val) el.style.setProperty(prop, val)
+  }
+  el.style.boxSizing = 'border-box'
+  el.style.width = `${Math.round(r.width)}px`
+  el.style.maxWidth = '100%'
+  el.style.position = 'relative'
+  el.style.left = 'auto'
+  el.style.top = 'auto'
+  el.style.transform = 'none'
+  el.style.margin = '0'
+  el.style.zIndex = 'auto'
+  el.setAttribute('data-markset-shifted', 'flow')
+}
+
+function packParent(el) {
+  const parent = el.parentElement
+  if (!parent) return null
+  const d = parent.ownerDocument?.defaultView?.getComputedStyle(parent)?.display || ''
+  return /grid|flex/.test(d) ? parent : null
+}
+
+function reorderAmongSiblings(el, dest, parent) {
+  const kids = [...parent.children].filter((kid) => kid !== el && !decoNode(kid))
+  const midX = dest.x + dest.w / 2
+  const midY = dest.y + dest.h / 2
+  let best = null
+  for (const kid of kids) {
+    const r = kid.getBoundingClientRect()
+    if (midY < r.top - 8) {
+      best = kid
+      break
+    }
+    if (midY <= r.bottom + 8 && midX < r.left + r.width / 2) {
+      best = kid
+      break
+    }
+  }
+  if (best) parent.insertBefore(el, best)
+  else parent.append(el)
+  el.setAttribute('data-markset-shifted', 'flow')
+}
+
+function findFlowAnchor(dest, moving) {
+  const doc = getDoc()
+  if (!doc?.body) return null
+  const x = dest.x + dest.w / 2
+  const y = dest.y + dest.h / 2
+  let hit = null
+  try {
+    hit = doc.elementFromPoint(x, y)
+  } catch {
+    hit = null
+  }
+  if (!hit || hit === moving || moving.contains(hit) || decoNode(hit) || hit === doc.body) {
+    const scored = pageOverlapHits(dest, moving).sort((a, b) => b.coverBox - a.coverBox)
+    hit = scored[0]?.el || null
+  }
+  if (!hit || hit === doc.body || hit === doc.documentElement) {
+    return findBlockBelow(dest, moving)
+  }
+  while (hit && (hit === moving || moving.contains(hit) || decoNode(hit))) hit = hit.parentElement
+  let target = hit
+  const frame = iframeBox()
+  const frameArea = Math.max(1, (frame?.width || 1) * (frame?.height || 1))
+  while (target?.parentElement && target.parentElement !== doc.body) {
+    const parent = target.parentElement
+    if (parent === moving || moving.contains(parent)) {
+      target = parent
+      continue
+    }
+    const pr = parent.getBoundingClientRect()
+    if (pr.width * pr.height > frameArea * 0.45) break
+    if (containsStackedStrips(parent) || isChromeStrip(parent)) break
+    const d = parent.ownerDocument?.defaultView?.getComputedStyle(parent)?.display || ''
+    if (d === 'inline' || d === 'contents') break
+    target = parent
+  }
+  return target
+}
+
+function findBlockBelow(dest, moving) {
+  const doc = getDoc()
+  if (!doc?.body) return null
+  const blocks = [...doc.body.querySelectorAll('div, section, article, main, aside, header, footer, nav, p, h1, h2, h3, ul, ol, figure')]
+  let best = null
+  let bestTop = Infinity
+  for (const el of blocks) {
+    if (el === moving || moving.contains(el) || el.contains(moving) || decoNode(el) || SKIP.has(el.tagName)) continue
+    const r = el.getBoundingClientRect()
+    if (r.height < 20 || r.width < 40) continue
+    if (r.top < dest.y - 4) continue
+    if (r.top < bestTop) {
+      best = el
+      bestTop = r.top
+    }
+  }
+  return best
+}
+
+function destHitsSibling(el, dest, parent) {
+  if (!parent) return null
+  for (const kid of parent.children) {
+    if (kid === el || decoNode(kid)) continue
+    const r = kid.getBoundingClientRect()
+    if (overlapRatio(r, dest) > 0.28) return kid
+    const cx = dest.x + dest.w / 2
+    const cy = dest.y + dest.h / 2
+    if (cx >= r.left && cx <= r.right && cy >= r.top && cy <= r.bottom) return kid
+  }
+  return null
+}
+
+function detachMoveSlot(el) {
+  const slot = el?.parentElement
+  if (!slot?.hasAttribute?.('data-markset-move-slot')) return
+  const host = slot.parentElement
+  if (!host) return
+  host.insertBefore(el, slot)
+  slot.remove()
+}
+
+function ensureMoveSlot(el) {
+  if (el.parentElement?.hasAttribute?.('data-markset-move-slot')) return el.parentElement
+  const host = el.parentElement
+  const doc = el.ownerDocument
+  if (!host || !doc) return null
+  const slot = doc.createElement('div')
+  slot.setAttribute('data-markset-move-slot', '1')
+  host.insertBefore(slot, el)
+  slot.append(el)
+  stampIds(doc)
+  return slot
+}
+
+function clampNum(n, lo, hi) {
+  return Math.min(hi, Math.max(lo, n))
+}
+
+function findDestSlot(el, dest) {
+  const pack = packParent(el)
+  const parent = pack?.parentElement || el.parentElement
+  if (!parent) return null
+  const destMid = dest.y + dest.h / 2
+  const kids = [...parent.children].filter((kid) => kid !== el && !decoNode(kid) && !kid.hasAttribute?.('data-markset-move-slot'))
+  let before = null
+  for (const kid of kids) {
+    const r = kid.getBoundingClientRect()
+    if (destMid < r.top + r.height / 2) {
+      before = kid
+      break
+    }
+  }
+  return { parent, before }
+}
+
+function alignMovedElToDest(el, dest) {
+  const slot = el.parentElement?.hasAttribute?.('data-markset-move-slot') ? el.parentElement : el
+  const host = slot.parentElement
+  if (!host) return
+  const hr = host.getBoundingClientRect()
+  const r = el.getBoundingClientRect()
+  const cs = el.ownerDocument.defaultView.getComputedStyle(el)
+  const curML = parseFloat(cs.marginLeft) || 0
+  const curMT = parseFloat(cs.marginTop) || 0
+  const wantX = dest.x + dest.w / 2 - r.width / 2
+  const wantY = dest.y + dest.h / 2 - r.height / 2
+  const maxLeft = Math.max(0, hr.right - hr.left - r.width - 8)
+  const nextML = clampNum(curML + (wantX - r.left), 0, maxLeft)
+  el.style.marginLeft = `${Math.round(nextML)}px`
+  el.style.marginRight = 'auto'
+
+  const prev = slot.previousElementSibling
+  const next = slot.nextElementSibling
+  const minTop = (prev ? prev.getBoundingClientRect().bottom : hr.top) + 8
+  const r2 = el.getBoundingClientRect()
+  const maxTop = next ? next.getBoundingClientRect().top - r2.height - 8 : wantY + r2.height
+  const wantTop = clampNum(wantY, minTop, Number.isFinite(maxTop) ? maxTop : wantY)
+  const dy = wantTop - r2.top
+  if (Math.abs(dy) >= 1) el.style.marginTop = `${Math.round(curMT + dy)}px`
+  el.style.marginBottom = '12px'
+}
+
+function placeElInFlow(el, dest) {
+  detachMoveSlot(el)
+  const originParent = el.parentElement
+  const originNext = el.nextElementSibling
+  const pack = packParent(el)
+  const sibling = pack ? destHitsSibling(el, dest, pack) : null
+  if (sibling) {
+    reorderAmongSiblings(el, dest, pack)
+    if (el.parentElement !== originParent || el.nextElementSibling !== originNext) return
+  }
+  keepCardLook(el)
+  const slotAt = findDestSlot(el, dest)
+  if (slotAt?.parent) slotAt.parent.insertBefore(el, slotAt.before || null)
+  else el.ownerDocument?.body?.append(el)
+  ensureMoveSlot(el)
+  alignMovedElToDest(el, dest)
+}
+
+function resolveRemainingOverlap(el) {
+  const slot = el.parentElement?.hasAttribute?.('data-markset-move-slot') ? el.parentElement : el
+  const next = slot.nextElementSibling
+  if (!next || decoNode(next)) return
+  const r = slot.getBoundingClientRect()
+  const nr = next.getBoundingClientRect()
+  if (r.bottom > nr.top + 2) {
+    const cur = parseFloat(slot.style.marginBottom) || 0
+    slot.style.marginBottom = `${Math.round(cur + r.bottom - nr.top + 12)}px`
+  }
+}
+
+function decoNode(el) {
+  return Boolean(
+    el?.hasAttribute?.('data-markset-shaped-shadow') ||
+      el?.hasAttribute?.('data-markset-tombstone') ||
+      el?.hasAttribute?.('data-markset-badge-host') ||
+      el?.hasAttribute?.('data-markset-edit-badge'),
+  )
+}
+
+function evidenceChanged(before, after) {
+  if (!after) return false
+  if (!before) return true
+  if (after.connected !== before.connected) return true
+  if (after.html !== before.html || after.text !== before.text) return true
+  if (after.color !== before.color || after.bg !== before.bg || after.filter !== before.filter) return true
+  if (after.transform !== before.transform || after.fontSize !== before.fontSize || after.fontWeight !== before.fontWeight) return true
+  if (after.anno !== before.anno || after.shadow !== before.shadow || after.reflect !== before.reflect) return true
+  const br = before.rect || { x: 0, y: 0, w: 0, h: 0 }
+  const ar = after.rect || { x: 0, y: 0, w: 0, h: 0 }
+  if (Math.hypot(ar.x - br.x, ar.y - br.y) > 3) return true
+  const ba = Math.max(1, br.w * br.h)
+  if (Math.abs(ar.w * ar.h - ba) / ba > 0.04) return true
+  return false
 }
 
 function evidenceOf(el) {
@@ -1387,6 +1940,7 @@ function evidenceOf(el) {
 
 function verifyKind(kind, befores, afters) {
   if (!afters.length) return false
+  if (afters.some((a, i) => evidenceChanged(befores[i], a))) return true
   if (kind.startsWith('delete') && kind !== 'delete-deco' && kind !== 'clear-deco') {
     return afters.some((a, i) => !a.connected || a.rect.w * a.rect.h < Math.max(1, (befores[i]?.rect.w || 0) * (befores[i]?.rect.h || 0)) * 0.25)
   }
@@ -1414,12 +1968,13 @@ function verifyKind(kind, befores, afters) {
       if (a.filter !== b?.filter && /drop-shadow/i.test(a.filter || '')) return true
       if ((a.shadow || '') !== (b?.shadow || '')) return true
       if (/data-markset-shaped-shadow/.test(a.html || '') && !/data-markset-shaped-shadow/.test(b?.html || '')) return true
-      return false
+      if (/data-markset-shaped-shadow/.test(a.html || '') && a.html !== b?.html) return true
+      return Boolean(a.shadow)
     })
   }
   if (kind === 'reflect') return afters.some((a) => Boolean(a.reflect))
   if (kind === 'frame' || kind === 'box' || kind === 'circle' || kind === 'highlight' || kind === 'bold' || kind === 'underline' || kind === 'wavy' || kind === 'strike' || String(kind).startsWith('line')) {
-    return afters.some((a, i) => a.anno !== befores[i]?.anno || a.fontWeight !== befores[i]?.fontWeight || a.html !== befores[i]?.html)
+    return afters.some((a, i) => a.anno !== befores[i]?.anno || a.fontWeight !== befores[i]?.fontWeight || a.html !== befores[i]?.html || Boolean(a.anno))
   }
   if (String(kind).startsWith('nudge') || kind === 'move-nudge' || kind === 'move-layout') {
     return afters.some((a, i) => Math.hypot(a.rect.x - (befores[i]?.rect.x || 0), a.rect.y - (befores[i]?.rect.y || 0)) > 6)
@@ -1427,22 +1982,7 @@ function verifyKind(kind, befores, afters) {
   if (kind === 'clear-deco' || kind === 'delete-deco' || kind === 'clear-anno' || kind === 'soften') {
     return afters.some((a, i) => a.filter !== befores[i]?.filter || a.anno !== befores[i]?.anno || a.reflect !== befores[i]?.reflect || a.html !== befores[i]?.html)
   }
-  return afters.some((a, i) => {
-    const b = befores[i]
-    if (!b) return a.connected
-    return (
-      a.connected !== b.connected ||
-      a.color !== b.color ||
-      a.bg !== b.bg ||
-      a.filter !== b.filter ||
-      a.transform !== b.transform ||
-      a.anno !== b.anno ||
-      a.fontSize !== b.fontSize ||
-      a.fontWeight !== b.fontWeight ||
-      Math.hypot(a.rect.x - b.rect.x, a.rect.y - b.rect.y) > 4 ||
-      Math.abs(a.rect.w * a.rect.h - b.rect.w * b.rect.h) / Math.max(1, b.rect.w * b.rect.h) > 0.06
-    )
-  })
+  return afters.some((a, i) => evidenceChanged(befores[i], a))
 }
 
 function verifyMove(befores, afters, dests) {
@@ -1450,11 +1990,12 @@ function verifyMove(befores, afters, dests) {
     const b = befores[i]
     const dest = dests[i]
     if (!a?.connected || !b) return false
-    const moved = Math.hypot(a.rect.x - b.rect.x, a.rect.y - b.rect.y) > 6
-    if (!dest) return moved
+    const moved = Math.hypot(a.rect.x - b.rect.x, a.rect.y - b.rect.y) > 3
+    if (moved) return true
+    if (!dest) return false
     const beforeDist = Math.hypot(b.rect.x - dest.x, b.rect.y - dest.y)
     const afterDist = Math.hypot(a.rect.x - dest.x, a.rect.y - dest.y)
-    return moved && afterDist < beforeDist - 4
+    return afterDist < beforeDist - 4
   })
 }
 
@@ -1534,8 +2075,9 @@ function applyColor(el, name, kind) {
     el.dataset.marksetTint = fill
     return
   }
-  el.style.color = fill
-  el.style.fill = fill
+    el.style.color = fill
+    el.style.fill = fill
+    el.dataset.marksetTint = fill
 }
 
 export function applyWebColor(name) {
@@ -1597,24 +2139,90 @@ function centerInPaint(el, box) {
   return cx >= box.x && cx <= box.x + box.w && cy >= box.y && cy <= box.y + box.h
 }
 
+function currentPaintPolys() {
+  try {
+    return (drawingPolys() || []).map((p) => toIframePoly(p)).filter((p) => p?.length >= 3)
+  } catch {
+    return []
+  }
+}
+
+function paintCover(el, polys) {
+  if (!el || !polys?.length) return 0
+  return polys.reduce((best, poly) => Math.max(best, polygonCover(el, poly)), 0)
+}
+
+function kidInPaint(el, box, polys = currentPaintPolys()) {
+  if (!el) return false
+  if (polys.length) {
+    if (polys.some((poly) => centerInPoly(el, poly))) return true
+    return paintCover(el, polys) >= 0.46
+  }
+  if (!box) return false
+  return centerInPaint(el, box) || overlapScore(el, box).coverEl >= 0.5
+}
+
 function significantChildren(el) {
   return [...(el?.children || [])].filter((kid) => {
-    if (!kid || SKIP.has(kid.tagName)) return false
+    if (!kid || SKIP.has(kid.tagName) || decoNode(kid) || isTombstone(kid)) return false
     const r = kid.getBoundingClientRect()
-    return r.width >= 16 && r.height >= 12 && r.width * r.height >= 40 * 20
+    if (r.width < 8 || r.height < 6) return false
+    if (isWidgetEl(kid) || isGraphicEl(kid) || isTextEl(kid)) return true
+    if (r.width * r.height >= 12 * 10) return true
+    return textOf(kid).length >= 2 || kid.children?.length > 0
   })
 }
 
-function containsOutsiders(el, box) {
+function containsOutsiders(el, box, polys = currentPaintPolys()) {
+  if (!el || (!box && !polys.length)) return false
+  if (containsStackedStrips(el)) {
+    const iframe = frameEl()
+    const fw = iframe?.clientWidth || 0
+    const strips = significantChildren(el).filter((kid) => {
+      if (isChromeStrip(kid)) return true
+      const r = kid.getBoundingClientRect()
+      return fw && r.width > fw * 0.58 && r.height < 110 && r.height > 16
+    })
+    const inside = strips.filter((kid) => kidInPaint(kid, box, polys))
+    if (inside.length >= 1 && inside.length < strips.length) return true
+  }
   const kids = significantChildren(el)
   if (kids.length < 2) return false
-  const insiders = kids.filter((kid) => centerInPaint(kid, box) || overlapScore(kid, box).coverEl >= 0.5)
-  const outsiders = kids.filter((kid) => !centerInPaint(kid, box) && overlapScore(kid, box).coverEl < 0.4)
+  const insiders = kids.filter((kid) => kidInPaint(kid, box, polys))
+  const outsiders = kids.filter((kid) => !kidInPaint(kid, box, polys))
   return insiders.length >= 1 && outsiders.length >= 1
+}
+
+function keepPaintTargets(els, box) {
+  const live = uniqueEls((els || []).filter((el) => el?.isConnected && el !== el.ownerDocument?.body))
+  if (!live.length) return []
+  if (!box) return dropCoveringAncestors(live)
+  const polys = currentPaintPolys()
+  const drill = (el) => {
+    if (!containsOutsiders(el, box, polys)) return [el]
+    const kids = significantChildren(el).filter((kid) => aimedLeaf(kid, box) || kidInPaint(kid, box, polys))
+    return kids.length ? kids.flatMap(drill) : []
+  }
+  const drilled = uniqueEls(live.flatMap(drill)).filter((el) => !containsOutsiders(el, box, polys))
+  const inInk = drilled.filter((el) => kidInPaint(el, box, polys))
+  if (inInk.length) return dropCoveringAncestors(inInk)
+  const aimed = drilled.filter((el) => aimedLeaf(el, box))
+  if (aimed.length) return dropCoveringAncestors(aimed)
+  const centered = drilled.filter((el) => centerInPaint(el, box) && overlapScore(el, box).coverEl >= 0.28)
+  if (centered.length) return dropCoveringAncestors(centered)
+  return dropCoveringAncestors(drilled)
 }
 
 function staysInPaint(el, box) {
   if (!el || !box) return false
+  const polys = currentPaintPolys()
+  if (containsOutsiders(el, box, polys)) return false
+  if (polys.length) {
+    const cover = paintCover(el, polys)
+    if (cover < 0.55) return false
+    if (!polys.some((poly) => centerInPoly(el, poly)) && cover < 0.78) return false
+    return true
+  }
   const hit = overlapScore(el, box)
   if (hit.coverEl < 0.6) return false
   if (!centerInPaint(el, box) && hit.coverEl < 0.82) return false
@@ -1623,13 +2231,18 @@ function staysInPaint(el, box) {
   if (hit.extraLeft > Math.max(28, box.w * 0.1) && hit.extraRight > Math.max(28, box.w * 0.1) && hit.coverEl < 0.78) {
     return false
   }
-  if (containsOutsiders(el, box)) return false
   return true
 }
 
 function aimedLeaf(el, box) {
+  const polys = currentPaintPolys()
+  if (containsOutsiders(el, box, polys)) return false
+  if (polys.length) {
+    const cover = paintCover(el, polys)
+    if (polys.some((poly) => centerInPoly(el, poly))) return cover >= 0.12
+    return cover >= 0.4 || (isGraphicEl(el) && cover >= 0.2)
+  }
   const hit = overlapScore(el, box)
-  if (containsOutsiders(el, box)) return false
   if (centerInPaint(el, box)) return hit.coverEl >= 0.18
   return hit.coverEl >= 0.45 || (isGraphicEl(el) && hit.coverEl >= 0.22)
 }
@@ -1639,12 +2252,15 @@ function scanOverlapEls(box) {
   const iframe = frameEl()
   if (!doc?.body || !iframe) return []
   const frameArea = Math.max(1, iframe.clientWidth * iframe.clientHeight)
+  const polys = currentPaintPolys()
   const out = []
   for (const el of doc.querySelectorAll('[data-markset-id]')) {
     if (SKIP.has(el.tagName) || isTombstone(el) || el === doc.body || el === doc.documentElement) continue
     const hit = overlapScore(el, box)
     if (hit.area > frameArea * 0.82) continue
     if (hit.coverBox < 0.035 && hit.coverEl < 0.1) continue
+    if (containsOutsiders(el, box, polys)) continue
+    if (polys.length && !kidInPaint(el, box, polys) && hit.coverEl < 0.4) continue
     out.push(hit)
   }
   return out
@@ -1652,8 +2268,18 @@ function scanOverlapEls(box) {
 
 function pickModuleEl(hits, box, frameArea) {
   const paintArea = Math.max(1, box.w * box.h)
+  const logo = [...hits]
+    .filter((h) => {
+      if (!(looksLikeLogo(h.el) || (isGraphicEl(h.el) && h.area < 240 * 110))) return false
+      return kidInPaint(h.el, box) || h.coverEl >= 0.28
+    })
+    .sort((a, b) => a.area - b.area)[0]
+  if (logo && paintArea < frameArea * 0.12) return logo.el
   const ranked = hits
-    .filter((h) => staysInPaint(h.el, box) && h.coverBox >= 0.4 && h.area < frameArea * 0.55 && h.area > paintArea * 0.22)
+    .filter((h) => {
+      if (containsStackedStrips(h.el) || (isChromeStrip(h.el) && paintArea < h.area * 0.45)) return false
+      return staysInPaint(h.el, box) && h.coverBox >= 0.4 && h.area < frameArea * 0.55 && h.area > paintArea * 0.22
+    })
     .sort((a, b) => Math.abs(a.area - paintArea) - Math.abs(b.area - paintArea) || b.coverEl - a.coverEl)
   if (ranked[0]) return ranked[0].el
   const seeds = hits.filter((h) => h.coverEl >= 0.35).sort((a, b) => a.area - b.area).slice(0, 12)
@@ -1661,6 +2287,7 @@ function pickModuleEl(hits, box, frameArea) {
   for (const seed of seeds) {
     let parent = seed.el
     for (let i = 0; i < 6 && parent && parent !== parent.ownerDocument?.body; i += 1) {
+      if (containsStackedStrips(parent) || isChromeStrip(parent)) break
       const hit = overlapScore(parent, box)
       if (staysInPaint(parent, box) && hit.coverBox >= 0.45 && hit.area < frameArea * 0.55) {
         if (!best || hit.area > overlapScore(best, box).area) best = parent
@@ -1668,7 +2295,7 @@ function pickModuleEl(hits, box, frameArea) {
       parent = parent.parentElement
     }
   }
-  return best
+  return best || logo?.el || null
 }
 
 function commonCoveringParent(els, box, frameArea) {
@@ -1973,14 +2600,14 @@ function fallbackEls(box, kind) {
       els.filter((el) => isGraphicEl(el) || isWidgetEl(el)),
       box,
     )
-    if (vis.length) return vis
+    if (vis.length) return keepPaintTargets(vis, box)
   }
   if (preferText) {
     const texts = els.filter((el) => isPrimarilyText(el))
-    if (texts.length) return texts
+    if (texts.length) return keepPaintTargets(texts, box)
   }
   const vis = pickVisualEls(els, box)
-  return vis.length ? vis : els.slice(0, 4)
+  return keepPaintTargets(vis.length ? vis : els.slice(0, 4), box)
 }
 
 export function resolveCircledEls(kind = '') {
@@ -2004,21 +2631,21 @@ export function resolveCircledEls(kind = '') {
   const k = String(kind)
   if (/delete-image|color-image|shadow|reflect/.test(k)) {
     const vis = pickVisualEls(graphics, box)
-    return vis.length ? vis : graphics.slice(0, 3)
+    return keepPaintTargets(vis.length ? vis : graphics.slice(0, 3), box)
   }
-  if (/delete-text|color-text/.test(k)) return texts.slice(0, 8)
+  if (/delete-text|color-text/.test(k)) return keepPaintTargets(texts.slice(0, 8), box)
   if (k === 'scale-down' || k === 'scale-up') {
     if (graphics.length) {
       const vis = pickVisualEls([...graphics, ...texts], box)
-      return vis.length ? vis : graphics.slice(0, 3)
+      return keepPaintTargets(vis.length ? vis : graphics.slice(0, 3), box)
     }
-    return texts.slice(0, 8)
+    return keepPaintTargets(texts.slice(0, 8), box)
   }
   if (k === 'color' || k === 'color-bg' || k === 'scheme') {
     const vis = pickVisualEls(graphics, box)
-    return uniqueEls([...(vis.length ? vis : graphics), ...texts]).slice(0, 8)
+    return keepPaintTargets(uniqueEls([...(vis.length ? vis : graphics), ...texts]), box)
   }
-  return uniqueEls([...graphics, ...texts, ...els]).slice(0, 8)
+  return keepPaintTargets(uniqueEls([...graphics, ...texts, ...els]), box)
 }
 
 function gatherEls(kind, title, box, hits, frameArea, large) {
@@ -2066,7 +2693,10 @@ function gatherEls(kind, title, box, hits, frameArea, large) {
   }
   els = uniqueEls(els).filter((el) => el.isConnected && el !== doc?.body)
   if (!els.length) els = fallbackEls(box, kind)
-  return uniqueEls(els).filter((el) => el?.isConnected && el !== doc?.body)
+  return keepPaintTargets(
+    uniqueEls(els).filter((el) => el?.isConnected && el !== doc?.body),
+    box,
+  )
 }
 
 function elsByStrategy(kind, title, box, hits, frameArea, large, strategy) {
@@ -2318,6 +2948,7 @@ function applyOpToEls(els, kind, { color, title, box, dx, dy, scheme, paint }) {
       applyColor(el, name, isGraphicEl(el) || isWidgetEl(el) ? 'image' : 'text')
       for (const child of collectColorable(el)) {
         if (child === el) continue
+        if (box && !aimedLeaf(child, box) && !centerInPaint(child, box)) continue
         applyColor(child, name, isGraphicEl(child) || isWidgetEl(child) ? 'image' : 'text')
       }
       ci += 1
@@ -2325,14 +2956,15 @@ function applyOpToEls(els, kind, { color, title, box, dx, dy, scheme, paint }) {
     }
   } else if (kind === 'color' || kind === 'color-bg' || kind === 'color-text' || kind === 'color-image') {
     const name = color || '红色'
-    let painted = mode === 'bg' ? els : colorTargets(els, box, mode)
-    if (!painted.length) painted = els
+    let painted = mode === 'bg' ? keepPaintTargets(els, box) : colorTargets(els, box, mode)
+    if (!painted.length) painted = keepPaintTargets(els, box)
     for (const el of painted) {
       if (mode === 'bg') applyBgColor(el, name)
       else {
         applyColor(el, name, isGraphicEl(el) ? 'image' : 'text')
         for (const child of collectColorable(el)) {
           if (child === el) continue
+          if (box && !aimedLeaf(child, box) && !centerInPaint(child, box)) continue
           applyColor(child, name, isGraphicEl(child) ? 'image' : 'text')
         }
       }
@@ -2343,15 +2975,29 @@ function applyOpToEls(els, kind, { color, title, box, dx, dy, scheme, paint }) {
     const host = decision.host || els[0]
     if (decision.shaped && decision.pts?.length >= 6 && host && attachShapedShadow(host, decision.pts)) {
       count += 1
+      lastShadowJob = {
+        shaped: true,
+        pts: decision.pts,
+        css: '',
+        hostId: host.getAttribute('data-markset-id') || '',
+      }
       console.log('[markset shadow] shape')
     } else {
       const targets = host ? uniqueEls([host, ...els]) : els
+      const css = inferCssShadow(decision.pts, host || targets[0])
       for (const el of targets) {
-        const css = inferCssShadow(decision.pts, el)
-        replaceFilterPart(el, 'shadow', css)
+        replaceFilterPart(el, 'shadow', inferCssShadow(decision.pts, el))
         el.dataset.marksetShadow = '1'
         adaptLayout(el, 'shadow')
         count += 1
+      }
+      if (count && host) {
+        lastShadowJob = {
+          shaped: false,
+          pts: decision.pts,
+          css,
+          hostId: host.getAttribute('data-markset-id') || '',
+        }
       }
       if (count) console.log('[markset shadow] css drop-shadow')
     }
@@ -2391,6 +3037,7 @@ export function executeCircledOp(op, { color = '', label = '', onBefore, dx = 0,
   if (!doc?.body || !iframe) return { ok: false, reason: '没有导入的网页' }
   const box = iframeUnionBox(drawingPolys())
   if (!box || box.w < 6 || box.h < 6) return { ok: false, reason: '没有可用的圈。请再圈一次要改的地方' }
+  stampIds(doc)
   const frameArea = Math.max(1, iframe.clientWidth * iframe.clientHeight)
   const hits = scanOverlapEls(box)
   const paintArea = box.w * box.h
@@ -2402,12 +3049,13 @@ export function executeCircledOp(op, { color = '', label = '', onBefore, dx = 0,
   const seen = new Set()
   for (const strategy of strategies) {
     if (strategy !== 'circled') restoreWebHtml(html)
-    const els = (() => {
+    const raw = (() => {
       const picked = elsByStrategy(kind, title, box, scanOverlapEls(box), frameArea, large, strategy)
       if (kind !== 'scheme') return picked
       const wrap = pickSchemeWrap(picked, box)
       return wrap ? uniqueEls([wrap, ...picked]) : picked
     })()
+    const els = keepPaintTargets(raw, box)
     if (!els.length) continue
     const key = `${strategy}:${els.map((el) => el.getAttribute('data-markset-id') || el.tagName).join(',')}`
     if (seen.has(key)) continue
@@ -2418,7 +3066,8 @@ export function executeCircledOp(op, { color = '', label = '', onBefore, dx = 0,
     if (applied.reason && !applied.count) continue
     if (!applied.count) continue
     const afterEv = els.map((el) => evidenceOf(el))
-    if (!verifyKind(kind, beforeEv, afterEv)) continue
+    const accepted = verifyKind(kind, beforeEv, afterEv) || afterEv.some((a, i) => evidenceChanged(beforeEv[i], a))
+    if (!accepted) continue
     onBefore?.(title)
     const after = before.map((shot) => {
       const live = shot.webId ? findByWebId(shot.webId) : null
@@ -2502,7 +3151,7 @@ function collectRewriteEls() {
     if (!els.length) {
       els = pickContentEls(hits, box, frameArea, { large: false, kind: 'color-text' }).filter(usable)
     }
-    els = els.filter((el) => aimedLeaf(el, box) || staysInPaint(el, box) || overlapScore(el, box).coverEl >= 0.16)
+    els = els.filter((el) => aimedLeaf(el, box) || staysInPaint(el, box) || (centerInPaint(el, box) && overlapScore(el, box).coverEl >= 0.28))
   }
   if (!els.length) {
     els = circledEditSpans()
@@ -2510,9 +3159,9 @@ function collectRewriteEls() {
       .filter(usable)
   }
   if (!els.length && hits.length) {
-    els = hits.map((h) => h.el).filter((el) => textOf(el).length >= 2 && !isImageEl(el))
+    els = hits.map((h) => h.el).filter((el) => usable(el) && (aimedLeaf(el, box) || centerInPaint(el, box)))
   }
-  return dropCoveringAncestors(uniqueEls(els)).slice(0, 8)
+  return keepPaintTargets(els, box).slice(0, 8)
 }
 
 export async function rewriteCircledText(commandText, { onBefore, kind = 'polish' } = {}) {
@@ -2700,8 +3349,11 @@ export async function runWebWriteback(kind, notify, { onBefore } = {}) {
 
 function insertHostBox() {
   const doc = getDoc()
-  const box = iframeUnionBox(drawingPolys())
+  const fromDraw = iframeUnionBox(drawingPolys())
+  const fromAll = iframeUnionBox((getPaintMarks() || []).map((m) => m.points).filter((p) => p?.length >= 3))
+  const box = fromDraw || fromAll || lastPaintBox
   if (!doc?.body || !box) return null
+  lastPaintBox = box
   try {
     const pos = doc.defaultView?.getComputedStyle(doc.body)?.position
     if (!pos || pos === 'static') doc.body.style.position = 'relative'
@@ -2709,6 +3361,59 @@ function insertHostBox() {
     doc.body.style.position = 'relative'
   }
   return { doc, box }
+}
+
+export function insertHostScreenBox() {
+  const host = insertHostBox()
+  const frame = iframeBox()
+  if (!host || !frame) return null
+  const z = iframeZoom()
+  const b = host.box
+  return {
+    x: frame.left + b.x * z,
+    y: frame.top + b.y * z,
+    w: b.w * z,
+    h: b.h * z,
+  }
+}
+
+export function insertAroundCopy() {
+  const host = insertHostBox()
+  const doc = getDoc()
+  const bits = []
+  const pageTitle = clipScene(meta.title || doc?.title, 48)
+  if (pageTitle) bits.push(`页面标题「${pageTitle}」`)
+  let hostName = ''
+  try {
+    hostName = meta.sourceUrl ? new URL(meta.sourceUrl, 'https://local.invalid').hostname : ''
+    if (hostName === 'local.invalid') hostName = ''
+  } catch {
+    hostName = ''
+  }
+  if (hostName) bits.push(`站点 ${hostName}`)
+  if (!host) return bits.join('。')
+  const pad = Math.max(72, Math.min(240, Math.max(host.box.w, host.box.h)))
+  const around = {
+    x: host.box.x - pad,
+    y: host.box.y - pad,
+    w: host.box.w + pad * 2,
+    h: host.box.h + pad * 2,
+  }
+  const hits = scanOverlapEls(around)
+  const seen = new Set()
+  const headings = []
+  const copies = []
+  for (const hit of hits) {
+    const t = clipScene(textOf(hit.el), 72)
+    if (!t || t.length < 2 || seen.has(t)) continue
+    seen.add(t)
+    if (/^H[1-6]$/.test(hit.el.tagName)) headings.push(t)
+    else if (isPrimarilyText(hit.el)) copies.push(t)
+  }
+  if (headings.length) bits.push(`附近标题「${headings.slice(0, 4).join(' / ')}」`)
+  if (copies.length) bits.push(`周围文字「${copies.slice(0, 8).join('；')}」`)
+  bits.push('插入位置是用户圈出的空白，文案或配图需贴合周围页面的主题、语气和风格')
+  return bits.join('。')
 }
 
 export function insertWebText(text) {
@@ -2873,6 +3578,8 @@ function imageScenePrompt(el) {
   const bits = [`应用场景：网页「${pageTitle || '未命名页面'}」${host ? `（${host}）` : ''}上的配图`]
   if (!el) {
     bits.push('放在用户圈出的空白位置，作为该页插图')
+    const around = insertAroundCopy()
+    if (around) bits.push(around)
     bits.push('风格需能融入当前网页，构图干净，不要大段文字或水印')
     return bits.join('。')
   }
@@ -2940,6 +3647,8 @@ function putImageOnEl(el, src) {
 export function applyGeneratedWebImage(src) {
   const url = String(src || '').trim()
   if (!url) return { ok: false, reason: '没有生成出图片' }
+  const scene = describePaintScene()
+  if (scene.blank || scene.kind === 'blank' || scene.fill < 0.18) return insertWebImage(url)
   const els = uniqueEls(resolveCircledEls('color-image').filter((el) => isGraphicEl(el) || isImageEl(el) || hasPaintedBg(el)))
   if (!els.length) return insertWebImage(url)
   const before = els.map((el) => snapshotNode(el))
@@ -2948,7 +3657,7 @@ export function applyGeneratedWebImage(src) {
     const node = putImageOnEl(el, url)
     if (node?.isConnected) after.push(snapshotNode(node))
   }
-  if (!after.length) return { ok: false, reason: '圈中的图没能换上' }
+  if (!after.length) return insertWebImage(url)
   recordWebEdit('换成生成的图', before, after)
   fitHeight()
   return { ok: true, message: '已用生成的图换上。可还原这一处' }

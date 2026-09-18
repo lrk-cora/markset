@@ -27,16 +27,32 @@ async function post(path, payload) {
   return data
 }
 
-export function rewriteText(instruction, text) {
-  return post('/api/rewrite', { instruction, text })
+export function rewriteText(instruction, text, extra = {}) {
+  return post('/api/rewrite', { instruction, text, ...extra })
 }
 
 export function inpaintImage({ prompt, imageDataUrl, maskDataUrl }) {
   return post('/api/inpaint', { prompt, imageDataUrl, maskDataUrl })
 }
 
-export function generateImage({ prompt, imageDataUrl, width, height }) {
-  return post('/api/generate-image', { prompt, imageDataUrl, width, height })
+export function generateImage({
+  prompt,
+  imageDataUrl,
+  width,
+  height,
+  replaceExisting,
+  contextImageDataUrls,
+  pageContext,
+}) {
+  return post('/api/generate-image', {
+    prompt,
+    imageDataUrl,
+    width,
+    height,
+    replaceExisting: Boolean(replaceExisting),
+    contextImageDataUrls: contextImageDataUrls || [],
+    pageContext: pageContext || '',
+  })
 }
 
 export function segmentImage({ imageDataUrl, box, points }) {

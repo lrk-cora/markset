@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>MarkSet 交互案例 · 答辩对照</title>
+  <style>
+    :root {
+      --ink: #1c1916;
+      --muted: #5c564e;
+      --line: #e4ddd4;
+      --paper: #f7f3ec;
+      --card: #fffdf9;
+      --accent: #2f5fbf;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font: 16px/1.55 "Source Han Sans SC", "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+      color: var(--ink);
+      background: var(--paper);
+    }
+    header {
+      position: sticky;
+      top: 0;
+      z-index: 4;
+      background: #fffdf9ee;
+      border-bottom: 1px solid var(--line);
+      backdrop-filter: blur(8px);
+    }
+    header .inner {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 8px 28px;
+    }
+    main {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 20px 28px;
+    }
+    h1 { font-size: 16px; margin: 0; font-weight: 650; letter-spacing: 0.02em; }
+    h2 {
+      font-size: 20px;
+      margin: 36px 0 8px;
+      padding-top: 12px;
+      border-top: 1px solid var(--line);
+    }
+    .cat-note { color: var(--muted); margin: 0 0 18px; font-size: 14px; }
+    article {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 18px 18px 14px;
+      margin: 0 0 22px;
+    }
+    .kicker {
+      font-size: 12px;
+      letter-spacing: 0.12em;
+      color: var(--accent);
+      font-weight: 700;
+      margin: 0 0 4px;
+    }
+    h3 { margin: 0 0 8px; font-size: 18px; }
+    .how, .say { margin: 0 0 8px; font-size: 14px; }
+    .how b { font-weight: 650; }
+    .say { color: var(--muted); }
+    .pair {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+      margin-top: 12px;
+    }
+    figure {
+      margin: 0;
+      background: #f3eee6;
+      border-radius: 10px;
+      overflow: hidden;
+      border: 1px solid var(--line);
+    }
+    figure img {
+      display: block;
+      width: 100%;
+      height: 280px;
+      object-fit: contain;
+      background: #fff;
+    }
+    figcaption {
+      font-size: 12px;
+      color: var(--muted);
+      padding: 7px 10px;
+      border-top: 1px solid var(--line);
+    }
+    .wide figure img { height: 320px; }
+    @media (max-width: 860px) {
+      .pair { grid-template-columns: 1fr; }
+      figure img, .wide figure img { height: auto; }
+    }
+    @media print {
+      header { position: static; }
+      article { break-inside: avoid; }
+      figure img { height: 220px; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="inner">
+      <h1>MarkSet 交互案例对照</h1>
+    </div>
+  </header>
+  <main>
+    <h2 id="insert">一、空白处插入</h2>
+    <p class="cat-note">圈的是空位、没有完整选中已有模块。系统先判断，再让用户选择：AI 生成、自己写、或从本地插入。</p>
+
+    <article>
+      <p class="kicker">案例 1 · 生图插入</p>
+      <h3>圈空白，加一个小 logo</h3>
+      <p class="how"><b>操作：</b>在社交媒体卡片右侧圈一块空白，输入「加一个小 logo」，判断后选择插入/生成。</p>
+      <p class="say">说明：空白不当成旁边的图标。生成结果贴合古腾堡书籍气质，并落在圈定位置。</p>
+      <div class="pair">
+        <figure>
+          <img src="插入图1.png" alt="圈空白并输入加一个小logo" />
+          <figcaption>改前：圈空白，要求「加一个小 logo」</figcaption>
+        </figure>
+        <figure>
+          <img src="插入图2.png" alt="空白处插入PG书籍logo" />
+          <figcaption>改后：圈里出现书籍 logo，旁侧可撤回</figcaption>
+        </figure>
+      </div>
+    </article>
+
+    <article>
+      <p class="kicker">案例 2 · 生文插入</p>
+      <h3>圈空白条，插入一段总结</h3>
+      <p class="how"><b>操作：</b>在有声书介绍下方圈一条空白，输入「插入一段总结的话」，开始判断后执行。</p>
+      <p class="say">说明：模型结合周围页面写文案，而不是把指令原样贴上去。</p>
+      <div class="pair">
+        <figure>
+          <img src="插入文字1.png" alt="圈空白条并输入插入总结" />
+          <figcaption>改前：圈一条空白，要求插入总结</figcaption>
+        </figure>
+        <figure>
+          <img src="屏插入文字2.png" alt="空白处插入总结段落" />
+          <figcaption>改后：圈里插入一段贴合有声书主题的总结</figcaption>
+        </figure>
+      </div>
+    </article>
+
+    <article>
+      <p class="kicker">案例 3 · 已有图替换</p>
+      <h3>圈书封面，换成浅色封面</h3>
+      <p class="how"><b>操作：</b>圈中深色书封，输入「换成浅色封面」，选择生成新图换上。</p>
+      <p class="say">说明：不是整页换图，只改圈中这一本；标题仍对应该书。</p>
+      <div class="pair">
+        <figure>
+          <img src="换图1.png" alt="圈中书封并要求换成浅色封面" />
+          <figcaption>改前：圈 Lady Wedderburn 深色封面</figcaption>
+        </figure>
+        <figure>
+          <img src="换图2.png" alt="书封换成浅色生成图" />
+          <figcaption>改后：该位置换成浅色封面，邻书未动</figcaption>
+        </figure>
+      </div>
+    </article>
+
+    <h2 id="rewrite">二、改字、改色、配色</h2>
+    <p class="cat-note">圈中已有文字或几处文字。按语义改这一处，或给几处套同一套颜色风格。</p>
+
+    <article>
+      <p class="kicker">案例 4 · 扩写</p>
+      <h3>圈介绍段，扩写到约 200 词</h3>
+      <p class="how"><b>操作：</b>圈首页介绍段，输入「扩写这段话达到 200 词」，选择「扩写圈中文字」。</p>
+      <p class="say">说明：只改圈中这段，标题和下面 New Releases 不动。</p>
+      <div class="pair wide">
+        <figure>
+          <img src="改字1.png" alt="圈介绍段并要求扩写" />
+          <figcaption>改前：两句介绍</figcaption>
+        </figure>
+        <figure>
+          <img src="改字2.png" alt="介绍段扩写后" />
+          <figcaption>改后：扩成更长的介绍，旁侧可撤回</figcaption>
+        </figure>
+      </div>
+    </article>
+
+    <article>
+      <p class="kicker">案例 5 · 改颜色</p>
+      <h3>圈标题，换个色调</h3>
+      <p class="how"><b>操作：</b>圈主标题，输入「换个色调」，执行改色。</p>
+      <p class="say">说明：只改圈中标题颜色，正文保持原样。</p>
+      <div class="pair wide">
+        <figure>
+          <img src="颜色1.png" alt="圈标题并要求换色调" />
+          <figcaption>改前：棕色标题</figcaption>
+        </figure>
+        <figure>
+          <img src="颜色2.png" alt="标题改为蓝色" />
+          <figcaption>改后：标题改为蓝色</figcaption>
+        </figure>
+      </div>
+    </article>
+
+    <article>
+      <p class="kicker">案例 6 · 一套风格</p>
+      <h3>圈标题和正文，换一种颜色风格</h3>
+      <p class="how"><b>操作：</b>同时圈标题和介绍段，输入「换一种颜色风格」，选择「给圈中几处套一套颜色风格」，再点色板（如北欧）。</p>
+      <p class="say">说明：多处一起改时给的是配色方案，而不是只改一个色值。每处旁侧仍可单独撤回。</p>
+      <div class="pair wide">
+        <figure>
+          <img src="颜色风格1.png" alt="圈两处文字并要求换颜色风格" />
+          <figcaption>改前：圈中两处，判断为套风格</figcaption>
+        </figure>
+        <figure>
+          <img src="颜色风格2.png" alt="套北欧配色后的标题和正文" />
+          <figcaption>改后：两处套同一套配色，色条可再调</figcaption>
+        </figure>
+      </div>
+    </article>
+
+    <h2 id="layout">三、版式调整</h2>
+    <p class="cat-note">放大、挪模块、删除。圈偏一点时，按圈得更完整的那一块改，避免误改旁边的「find more」等。</p>
+
+    <article>
+      <p class="kicker">案例 7 · 缩放</p>
+      <h3>圈 New Releases，放大一点</h3>
+      <p class="how"><b>操作：</b>圈左侧标题，输入「放大一点」。右侧 find more 虽可能擦到边，但不作为主目标。</p>
+      <p class="say">说明：只放大圈中标题，书封行和 find more 不变。</p>
+      <div class="pair">
+        <figure>
+          <img src="大小1.png" alt="圈New Releases并要求放大" />
+          <figcaption>改前：圈 New Releases</figcaption>
+        </figure>
+        <figure>
+          <img src="大小2.png" alt="New Releases标题放大" />
+          <figcaption>改后：标题变大，右侧按钮未放大</figcaption>
+        </figure>
+      </div>
+    </article>
+
+    <article>
+      <p class="kicker">案例 8 · 移动布局</p>
+      <h3>圈模块和落点，移到指定位置</h3>
+      <p class="how"><b>操作：</b>一圈 Education 卡片，一圈左侧空白，输入「移动到指定位置」，点「移到画出的位置」。</p>
+      <p class="say">说明：后一圈空白当落点，不当成新选区。移动后卡片离开原网格，周围回流。</p>
+      <div class="pair">
+        <figure>
+          <img src="移动1.png" alt="圈模块与空白落点" />
+          <figcaption>改前：源模块 + 空白落点</figcaption>
+        </figure>
+        <figure>
+          <img src="移动2.png" alt="Education卡片移到左侧" />
+          <figcaption>改后：卡片落到圈出位置，布局让开</figcaption>
+        </figure>
+      </div>
+    </article>
+
+    <article>
+      <p class="kicker">案例 9 · 删除</p>
+      <h3>圈 Education 卡片，删除</h3>
+      <p class="how"><b>操作：</b>圈中整张 Education &amp; Reference，输入「删除」。</p>
+      <p class="say">说明：去掉这一模块，其余分类卡重新排，不误删旁边卡片。</p>
+      <div class="pair">
+        <figure>
+          <img src="删除1.png" alt="圈Education卡片并要求删除" />
+          <figcaption>改前：圈中 Education 卡片</figcaption>
+        </figure>
+        <figure>
+          <img src="删除2.png" alt="Education卡片已删除" />
+          <figcaption>改后：该卡消失，其余八张仍在</figcaption>
+        </figure>
+      </div>
+    </article>
+
+    <h2 id="shadow">四、阴影：整模块 vs 按笔迹成形</h2>
+    <p class="cat-note">圈整张卡片再写「加阴影」→ CSS 投影。圈模块外围、并画出形状 → 按笔迹生成异形阴影。同类卡片可以一键套用。</p>
+
+    <article>
+      <p class="kicker">案例 10 · 模块阴影</p>
+      <h3>圈整张卡片，加上阴影</h3>
+      <p class="how"><b>操作：</b>圈中 Arts &amp; Culture 整卡，输入「加上阴影」。</p>
+      <p class="say">说明：目标是模块本身，用卡片 drop-shadow，不是在旁边空白里插一块黑影。</p>
+      <div class="pair">
+        <figure>
+          <img src="阴影1.png" alt="圈Arts and Culture卡片并要求加阴影" />
+          <figcaption>改前：圈整张分类卡</figcaption>
+        </figure>
+        <figure>
+          <img src="阴影2.png" alt="卡片带CSS投影" />
+          <figcaption>改后：该卡带柔和投影</figcaption>
+        </figure>
+      </div>
+    </article>
+
+    <article>
+      <p class="kicker">案例 11 · 同类套用</p>
+      <h3>阴影应用到同类模块</h3>
+      <p class="how"><b>操作：</b>给一处加完阴影后，选择「同类模块也加上」。</p>
+      <p class="say">说明：同样大小和结构的分类卡一起加上同类型阴影，不必一张张圈。</p>
+      <div class="pair" style="grid-template-columns: 1fr;">
+        <figure>
+          <img src="加阴影3.png" alt="所有分类卡都带阴影" />
+          <figcaption>改后：九张分类卡都带上同类阴影</figcaption>
+        </figure>
+      </div>
+    </article>
+
+    <article>
+      <p class="kicker">案例 12 · 手绘异形阴影</p>
+      <h3>在模块下方画出形状，按这个形状加阴影</h3>
+      <p class="how"><b>操作：</b>不圈整张卡，而在 Education 卡片下方画出一块梯形区域，输入「添加这个形状的阴影」。</p>
+      <p class="say">说明：圈的是模块周边而不是模块本身，所以按笔迹形状生成阴影，而不是给卡片套 CSS 投影。</p>
+      <div class="pair">
+        <figure>
+          <img src="手绘阴影1.png" alt="在卡片下方画出阴影形状" />
+          <figcaption>改前：下方画出要生成的阴影轮廓</figcaption>
+        </figure>
+        <figure>
+          <img src="手绘阴影2.png" alt="按手绘形状生成的阴影" />
+          <figcaption>改后：阴影形状跟手绘区域一致</figcaption>
+        </figure>
+      </div>
+    </article>
+  </main>
+</body>
+</html>

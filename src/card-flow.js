@@ -1,4 +1,4 @@
-import { generateImage } from './api.js'
+import { generateImage, rewriteText } from './api.js'
 import { DEMO_CUP, getDemoPage, pageRelativeRect } from './editor.js'
 import { COLOR_TERMS } from './forbidden.js'
 import { COLORS, COLOR_SCHEMES } from './colors.js'
@@ -27,6 +27,8 @@ import {
   applyWebReflect,
   applyWebScale,
   applyWebShadow,
+  applySimilarWebShadows,
+  countSimilarShadowHosts,
   describePaintScene,
   executeCircledOp,
   inferWebLayoutPairs,
@@ -35,23 +37,22 @@ import {
   insertWebText,
   applyGeneratedWebImage,
   circledImageSeed,
+  insertAroundCopy,
   isWebDocActive,
   lassoPolys,
   listWebEdits,
   popLastWebEdit,
-  popWebEditsSince,
+  undoWebEditsSince,
   redoWebEdit,
   refreshWebTargetsFromDrawing,
   restoreWebEdit,
-  restoreWebHtml,
   rewriteCircledText,
   peekShadowLabel,
-  snapshotWebHtml,
 } from './web-doc.js'
 import { clearPaintMarks, getPaintMarks, setSubtractMode } from './overlay.js'
 import { redoChange, restoreChange } from './changes.js'
 import { clearInk, readInkText } from './ink.js'
-import { classifyDrawnGesture, drawnStampDataUrl, drawnStampScreenBox, looksLikeDrawnPattern } from './capture.js'
+import { captureInsertScene, classifyDrawnGesture, drawnStampDataUrl, drawnStampScreenBox, looksLikeDrawnPattern } from './capture.js'
 import {
   applyPageScheme,
   assignSchemeToModules,
@@ -108,9 +109,10 @@ const LOCAL_ANNO = new Set([
 const PAGE_LINE = new Set(LINE_KIND_IDS)
 
 const LOCAL_LABELS = {
-  'insert-text': '插入文字',
-  'insert-image': '插入图片',
-  'generate-image': '生成一张图换上',
+  'insert-text': '自己写文字插入',
+  'generate-text': 'AI生成一句文案插入',
+  'insert-image': '从本地选一张图插入',
+  'generate-image': 'AI生成一张图放到圈里',
   deco: '加装饰',
   indent: '空两格',
   'move-layout': '挪位置',
@@ -180,7 +182,7 @@ function snapshotLocal(editor, label) {
     imgShadow: img?.dataset.marksetShadow || '',
     decoHtml: host?.innerHTML || '',
     pagePaper: getPagePaper(),
-    webHtml: isWebDocActive() ? snapshotWebHtml() : null,
+    webDoc: isWebDocActive(),
   })
 }
 
@@ -227,10 +229,7 @@ export function undoLastLocalAction(editor) {
     if (host) host.innerHTML = snap.decoHtml
   }
   if ('pagePaper' in snap) setPagePaper(snap.pagePaper)
-  if (snap.webHtml != null) {
-    restoreWebHtml(snap.webHtml)
-    popWebEditsSince(snap.at)
-  }
+  if (snap.webDoc) undoWebEditsSince(snap.at)
   clearSchemeUi()
   if (ui.step === 'values' || ui.step === 'review') {
     ui.step = 'propose'
@@ -558,19 +557,23 @@ function parseNote(text) {
   if (/往右|向右|右移|向右挪/.test(t)) return 'nudge-right'
   if (/往上|向上|上移|往上挪/.test(t)) return 'nudge-up'
   if (/往下|向下|下移|往下挪/.test(t)) return 'nudge-down'
-  if (/挪位置|移到|放到|换位置/.test(t)) return 'move-layout'
+  if (/挪位置|移到|移动到|挪到|换位置|调整布局/.test(t) && !/logo|图标|图片|插画|文字/.test(t)) return 'move-layout'
   if (/加粗/.test(t)) return 'bold'
   if (/高亮/.test(t)) return 'highlight'
   if (/下划线/.test(t)) return 'underline'
   if (/加框|套个框|加边框|加个框/.test(t)) return 'frame'
-  if (/生成.*(图|图片|插画|配图)|文生图|AI画|画一张|换一张图|换成一张|换掉.*(图|图片|logo|配图)|重新生成/.test(t)) return 'generate-image'
-  if (/加图|插图|贴图|插入图片/.test(t)) return 'insert-image'
+  if (/生成.*(图|图片|插画|配图|logo|图标)|文生图|AI画|画一张|换一张图|换成一张|换掉.*(图|图片|logo|配图)|重新生成/.test(t)) return 'generate-image'
+  if (/(加|插|放|贴|来).{0,8}(小)?(logo|图标|图片|插画|配图|徽章|头像)|小logo|加logo/.test(t) && !/色|改字/.test(t)) return 'generate-image'
+  if (/logo|图标|徽章/.test(t) && /加|插|放|贴|来一个|空白/.test(t) && !/色|改字|文字/.test(t)) return 'generate-image'
+  if (/从本地|选一张图|上传图片|插入图片|加图|插图|贴图/.test(t)) return 'insert-image'
   if (/润色|改措辞|改写|更通顺|通顺一点|优化语言/.test(t)) return 'polish'
   if (/扩写|写长|写得更长|更长一些/.test(t)) return 'longer'
   if (/写短|写得更短|精简一下|缩短/.test(t) && !/缩小/.test(t)) return 'shorter'
   if (/口语/.test(t)) return 'spoken'
   if (/正式/.test(t)) return 'formal'
-  if (/加字|加点|加上|加个|插入|写一句|放一张|空白.*加|这里加|加东西/.test(t)) return 'insert'
+  if (/AI.*(写|生成).*(字|文案|句子)|生成一句|生成文案|帮我写一句|让模型写/.test(t) && !/图|logo|图标/.test(t)) return 'generate-text'
+  if (/加字|加点字|加上字|插入文字|写一句|来一句|欢迎语|标语|口号|文案/.test(t)) return 'insert-text'
+  if (/加字|加点|加上|加个|插入|写一句|放一张|空白.*加|这里加|加东西/.test(t) && !/logo|图|图标/.test(t)) return 'insert'
   if (/改颜色|改色|换色|变色|颜色|配色|上色|着色|染色/.test(t)) return 'color'
   if (/^[红蓝绿黄黑白灰橙紫粉]$/.test(t) || /改成.{0,2}[红蓝绿黄黑白灰橙紫粉]|[红蓝绿黄]色/.test(t)) return 'color'
   if (/色|彩/.test(t) && !/删|去|减/.test(t)) return 'color'
@@ -580,6 +583,112 @@ function parseNote(text) {
   if (/减|短|少|精简/.test(t)) return 'cut'
   if (/添|加|插|扩/.test(t)) return 'add'
   return 'custom'
+}
+
+function looksLikeImageAsk(text) {
+  const t = String(text || '')
+  if (!t) return false
+  if (/色|改字|文字颜色/.test(t) && !/logo|图/.test(t)) return false
+  return /logo|图标|图片|插画|配图|插图|徽章|头像|海报/.test(t) || /(加|插|放|贴|来).{0,8}图/.test(t)
+}
+
+function extractLiteralInsert(text) {
+  const t = String(text || '').trim()
+  if (!t) return ''
+  const quoted = t.match(/[「『“"](.+?)[」』”"]/)
+  if (quoted?.[1]?.trim()) return quoted[1].trim()
+  const named = t.match(/^(?:改成|写成|换成|插入文字|插入)[:：\s]*(.+)$/)
+  if (named?.[1] && !looksLikeImageAsk(named[1]) && !/欢迎语|标语|口号|文案|一句/.test(named[1])) {
+    return named[1].trim()
+  }
+  if (!/加|插|写一句|生成|来一句|帮我|请|空白/.test(t) && t.length >= 2 && t.length <= 80) return t
+  return ''
+}
+
+function looksLikeTextInstruction(text) {
+  const t = String(text || '').trim()
+  if (!t || looksLikeImageAsk(t) || extractLiteralInsert(t)) return false
+  const note = parseNote(t)
+  if (note && note !== 'insert' && note !== 'insert-text' && note !== 'generate-text' && note !== 'add' && note !== 'custom') return false
+  return /加一句|写一句|插入.*字|来一句|生成.*文|欢迎语|标语|口号|文案|帮我写|随便写|加点字|加字|空白.*字/.test(t)
+}
+
+function blankWantsInsert(ask, note, scene) {
+  if (!isWebDocActive()) return false
+  if (!(scene?.blank || sceneIsBlank()) || scene?.drawn) return false
+  if (inferWebLayoutPairs().length || looksLikeLayout(getSnapshot().spans)) return false
+  const n = String(note || parseNote(ask) || '')
+  if (
+    n === 'delete' ||
+    n.startsWith('delete') ||
+    n === 'color' ||
+    n.startsWith('color') ||
+    n === 'scheme' ||
+    n.startsWith('scale') ||
+    n === 'move-layout' ||
+    n.startsWith('nudge') ||
+    n === 'shadow' ||
+    n === 'reflect' ||
+    n === 'stamp' ||
+    n === 'frame' ||
+    n === 'circle' ||
+    n === 'clear-deco' ||
+    n === 'soften'
+  ) {
+    return false
+  }
+  const t = String(ask || '')
+  if (t && /删|色|缩小|放大|阴影|风格|挪|移到/.test(t) && !/加|插|logo|图|字|文案/.test(t)) return false
+  return true
+}
+
+function blankInsertGuesses(ask) {
+  const t = String(ask || '').trim()
+  const note = parseNote(t)
+  const generateImage = { id: 'generate-image', label: 'AI生成一张图放到圈里', note: 'generate-image', command: t }
+  const insertImage = { id: 'insert-image', label: '从本地选一张图插入', note: 'insert-image', command: '' }
+  const generateText = { id: 'generate-text', label: 'AI生成一句文案插入', note: 'generate-text', command: t }
+  const insertText = { id: 'insert-text', label: '自己写文字插入', note: 'insert-text', command: '' }
+  if (looksLikeImageAsk(t) || note === 'generate-image' || note === 'insert-image') {
+    return [generateImage, insertImage, generateText, insertText]
+  }
+  if (looksLikeTextInstruction(t) || note === 'insert-text' || note === 'generate-text' || note === 'insert') {
+    return [generateText, insertText, generateImage, insertImage]
+  }
+  return [generateText, generateImage, insertText, insertImage]
+}
+
+async function gatherInsertContext() {
+  let scene = { aroundImageDataUrl: '', circledImageDataUrl: '', pageImageDataUrl: '', pageText: '' }
+  try {
+    scene = await captureInsertScene()
+  } catch {
+    scene = { aroundImageDataUrl: '', circledImageDataUrl: '', pageImageDataUrl: '', pageText: '' }
+  }
+  let around = ''
+  try {
+    around = insertAroundCopy()
+  } catch {
+    around = ''
+  }
+  const images = [scene.aroundImageDataUrl, scene.circledImageDataUrl, scene.pageImageDataUrl].filter(Boolean)
+  const pageContext = [around, scene.pageText].filter(Boolean).join('\n').slice(0, 1800)
+  return { images, pageContext, around }
+}
+
+async function writeInsertCopy(instruction) {
+  const ctx = await gatherInsertContext()
+  const data = await rewriteText(
+    '这不是改写已有段落。请根据用户要求，并结合圈出空白及其周围的真实网页，新写一句要插入该空白处的短文案。只输出文案本身，不要解释，不要重复用户的指令。语言、语气、主题、长度都要贴合周围页面。若用户已用引号给出原文案，则原样使用那句。',
+    instruction || '写一句简短合适、能放进当前网页空白处的文案',
+    {
+      pageContext: ctx.pageContext,
+      imageDataUrls: ctx.images,
+    },
+  )
+  return String(data?.text || '')
+    .replace(/^["「『]|["」』]$/g, '')
+    .trim()
 }
 
 export function applyWrittenNote(text, { confident = false, note, silent = false } = {}) {
@@ -686,7 +795,7 @@ function sceneIsBlank() {
 
 function verbFamily(note) {
   const n = String(note || '')
-  if (n === 'add' || n === 'insert' || n === 'insert-text' || n === 'insert-image' || n === 'deco' || n === 'frame' || n === 'circle' || n === 'shadow' || n === 'reflect') {
+  if (n === 'add' || n === 'insert' || n === 'insert-text' || n === 'generate-text' || n === 'insert-image' || n === 'generate-image' || n === 'deco' || n === 'frame' || n === 'circle' || n === 'shadow' || n === 'reflect') {
     return 'add'
   }
   if (n.startsWith('delete') || n === 'clear-deco' || n === 'clear-anno') return 'delete'
@@ -701,6 +810,7 @@ function mapNoteToIntent(note, label) {
   if (n === 'delete' || n === 'delete-text' || n === 'delete-image') return n
   if (n === 'clear-deco' || n === 'delete-deco' || n === 'soften') return n === 'delete-deco' ? 'clear-deco' : n
   if (n === 'insert' || n === 'insert-text') return 'insert-text'
+  if (n === 'generate-text') return 'generate-text'
   if (n === 'insert-image') return 'insert-image'
   if (n === 'generate-image') return 'generate-image'
   if (n === 'add') return sceneIsBlank() ? 'insert-text' : 'frame'
@@ -734,6 +844,7 @@ const GUESS_IDS = new Set([
   'scheme',
   'stamp',
   'insert-text',
+  'generate-text',
   'insert-image',
   'generate-image',
   'insert',
@@ -811,6 +922,8 @@ const ID_ALIASES = {
   加图: 'insert-image',
   生成图: 'generate-image',
   换图: 'generate-image',
+  生成文字: 'generate-text',
+  写文案: 'generate-text',
 }
 
 function canonicalizeGuessId(id, label, note) {
@@ -852,6 +965,7 @@ function normalizeGuessItem(item) {
     fromText === 'soften' ||
     fromText === 'insert' ||
     fromText === 'insert-text' ||
+    fromText === 'generate-text' ||
     fromText === 'insert-image' ||
     fromText === 'generate-image' ||
     fromText === 'add' ||
@@ -1005,9 +1119,15 @@ function looksLikeStampGuess(verb, written, list = []) {
   return true
 }
 
-function reconcileGuesses(vl, local, verb, scene) {
+function reconcileGuesses(vl, local, verb, scene, { more = false } = {}) {
   const gesture = classifyDrawnGesture()
   const vlNorm = uniqueGuesses(vl || [])
+  const ask = `${ui.typedText || ''} ${ui.noteText || ''}`
+  if (!more && blankWantsInsert(ask, verb || ui.note, scene)) {
+    const inserts = blankInsertGuesses(ask)
+    const rest = (vlNorm.length ? vlNorm : local || []).filter((g) => !inserts.some((p) => p.id === g.id))
+    return uniqueGuesses([...inserts, ...rest]).slice(0, 4)
+  }
   if (gesture.kind === 'stamp') {
     const stamp = { id: 'stamp', label: gesture.label || '加上画出的图案', note: 'stamp', command: '' }
     const rest = vlNorm.filter(
@@ -1029,15 +1149,6 @@ function reconcileGuesses(vl, local, verb, scene) {
     return uniqueGuesses([line, ...vlNorm]).slice(0, 4)
   }
   if (vlNorm.length) {
-    const vlFam = verbFamily(vlNorm[0].id) || verbFamily(vlNorm[0].note) || verbFamily(parseNote(vlNorm[0].label)) || verbFamily(verb)
-    if (scene?.blank && vlFam === 'add' && !scene?.drawn) {
-      const inserts = [
-        { id: 'insert-text', label: '在圈里的空白处插入文字', note: 'insert-text', command: '' },
-        { id: 'generate-image', label: '生成一张图放到圈里', note: 'generate-image', command: '' },
-        { id: 'insert-image', label: '从本地选一张图插入', note: 'insert-image', command: '' },
-      ]
-      return relabelGuesses(uniqueGuesses([...vlNorm, ...inserts]), scene, verb)
-    }
     return relabelGuesses(vlNorm, scene, verb)
   }
   if (scene?.blank && verbFamily(verb) === 'add' && !scene?.drawn) {
@@ -1069,6 +1180,23 @@ function localGuesses(spans, editor) {
 }
 
 export function requestIntentGuesses(editor, { more = false } = {}) {
+  const typedNow = String(ui.typedText || '').trim()
+  if (!more) {
+    if (typedNow) applyWrittenNote(typedNow, { confident: true, silent: true })
+    else {
+      ui.note = ''
+      ui.noteText = ''
+      ui.noteConfident = false
+    }
+  }
+  const noteNow = parseNote(typedNow)
+  const depsNow = guessRuntime.deps
+  if (!more && depsNow && isWebDocActive()) {
+    if ((noteNow === 'move-layout' || /移动|挪到|移到|换位置/.test(typedNow)) && inferWebLayoutPairs().length) {
+      pickOption('move-layout', depsNow, editor)
+      return
+    }
+  }
   const token = ++guessToken
   ui.step = 'propose'
   ui.intent = null
@@ -1078,13 +1206,6 @@ export function requestIntentGuesses(editor, { more = false } = {}) {
     ui.judged = false
     ui.seenGuessLabels = []
     ui.fromModel = false
-    const typed = String(ui.typedText || '').trim()
-    if (typed) applyWrittenNote(typed, { confident: true, silent: true })
-    else {
-      ui.note = ''
-      ui.noteText = ''
-      ui.noteConfident = false
-    }
   }
   emit()
   runIntentGuesses(editor, token, { more })
@@ -1128,7 +1249,7 @@ async function runIntentGuesses(editor, token, { more = false } = {}) {
     local = localGuesses(getSnapshot().spans, editor).filter((g) => !seen.has(g.label))
     let next = (hit?.guesses || []).map(normalizeGuessItem).filter(Boolean)
     next = next.filter((g) => g.label && !seen.has(g.label))
-    next = reconcileGuesses(next, local, verb, scene)
+    next = reconcileGuesses(next, local, verb, scene, { more })
     if (!next.length) next = local.slice(0, 4)
     ui.guesses = next.slice(0, 4)
     ui.judged = true
@@ -1176,6 +1297,7 @@ function guessNeedsValue(id, command) {
     return false
   }
   if (id === 'scheme' || id === 'insert-text' || id === 'insert-image') return true
+  if (id === 'generate-text' && !command && !ui.typedText.trim() && !ui.moreText.trim()) return true
   if (id === 'generate-image' && !command && !ui.typedText.trim() && !ui.moreText.trim() && !ui.noteText.trim()) return true
   if (id === 'stamp') return false
   if (needsColor(id) && !ui.color && !command) return true
@@ -1207,24 +1329,31 @@ function runGenerateImage(editor, deps) {
     deps.toast('写一下要生成什么样的图')
     return
   }
-  deps.toast('正在生成图片，可能要十几秒…')
+  deps.toast('正在结合圈中位置和周围页面生成图片…')
   const seed = circledImageSeed()
-  const fullPrompt = [
-    `用户要求：${prompt}`,
-    seed.scene || '',
-    seed.imageDataUrl
-      ? '请在原图构图和用途的基础上按用户要求改，生成适合该网页位置的新图。'
-      : '请直接生成适合该网页位置的新图。',
-  ]
-    .filter(Boolean)
-    .join('\n')
-    .slice(0, 800)
-  generateImage({
-    prompt: fullPrompt,
-    imageDataUrl: seed.imageDataUrl,
-    width: seed.width,
-    height: seed.height,
-  })
+  Promise.resolve()
+    .then(() => gatherInsertContext())
+    .then((ctx) => {
+      const fullPrompt = [
+        `用户要求：${prompt}`,
+        seed.scene || ctx.around || '',
+        seed.imageDataUrl
+          ? '请在原图构图和用途的基础上按用户要求改，生成适合该网页位置、并能和周围页面放在一起的新图。'
+          : '请直接生成适合该网页空白位置、并能和周围页面放在一起的新图。',
+      ]
+        .filter(Boolean)
+        .join('\n')
+        .slice(0, 900)
+      return generateImage({
+        prompt: fullPrompt,
+        imageDataUrl: seed.imageDataUrl,
+        replaceExisting: Boolean(seed.imageDataUrl),
+        contextImageDataUrls: ctx.images,
+        pageContext: ctx.pageContext,
+        width: seed.width,
+        height: seed.height,
+      })
+    })
     .then((data) => {
       const src = data?.imageUrl
       if (!src) throw new Error('万相没有返回图片')
@@ -1246,6 +1375,60 @@ function runGenerateImage(editor, deps) {
     .catch((err) => {
       const gated = err?.code === 'client-gate' || err?.code === 'no_client_gate' || err?.code === 'calls_disabled'
       deps.toast(gated ? '服务器禁止调用：把 .env 里 MARKSET_ALLOW_MODEL_CALLS 改为 1 并重启' : err?.message || '没能生成图片')
+      emit()
+    })
+}
+
+function finishInsertedText(editor, deps, result) {
+  if (!result?.ok) {
+    deps.toast(result?.reason || '没能插入文字')
+    ui.intent = 'insert-text'
+    ui.step = 'values'
+    emit()
+    return
+  }
+  clearInk()
+  startReview()
+  emit()
+  deps.toast(result.message)
+}
+
+function commitInsertText(editor, deps, raw) {
+  const ask = String(raw || ui.productName || '').trim()
+  const literal = extractLiteralInsert(ask) || ask
+  if (!literal || /自己写文字插入|AI生成一句文案插入/.test(literal)) {
+    ui.intent = 'insert-text'
+    ui.step = 'values'
+    emit()
+    deps.toast('写下要插入的文字，或点「帮我写一句」')
+    return
+  }
+  deps.toast('正在插入文字…')
+  finishInsertedText(editor, deps, insertWebText(literal))
+}
+
+function commitGenerateText(editor, deps, raw) {
+  const ask = String(raw || ui.typedText || ui.moreText || ui.productName || '').trim()
+  const instruction = /自己写|AI生成|从本地|放到圈里|选一张图/.test(ask) ? '' : ask
+  if (!instruction) {
+    ui.intent = 'generate-text'
+    ui.step = 'values'
+    emit()
+    deps.toast('写一下希望生成什么样的文案')
+    return
+  }
+  deps.toast('正在结合周围页面生成要插入的文字…')
+  writeInsertCopy(instruction)
+    .then((text) => {
+      if (!text) throw new Error('没有生成文案')
+      finishInsertedText(editor, deps, insertWebText(text))
+    })
+    .catch((err) => {
+      const gated = err?.code === 'client-gate' || err?.code === 'no_client_gate' || err?.code === 'calls_disabled'
+      deps.toast(gated ? '服务器禁止调用：把 .env 里 MARKSET_ALLOW_MODEL_CALLS 改为 1 并重启' : err?.message || '没能生成文字')
+      ui.intent = 'generate-text'
+      ui.step = 'values'
+      ui.productName = ask
       emit()
     })
 }
@@ -1303,6 +1486,23 @@ function applyGuess(guess, editor, deps) {
     }
     if (id === 'generate-image') {
       runGenerateImage(editor, deps)
+      return
+    }
+    if (id === 'generate-text') {
+      commitGenerateText(editor, deps, written || command)
+      return
+    }
+    if (id === 'insert-text') {
+      const literal = extractLiteralInsert(written)
+      ui.intent = 'insert-text'
+      ui.step = 'values'
+      ui.productName = literal || ''
+      emit()
+      deps.toast('写下要插入的文字，或点「帮我写一句」')
+      return
+    }
+    if (id === 'insert-image') {
+      deps.insertImage?.(editor)
       return
     }
     const rewriteIds = new Set(['polish', 'longer', 'shorter', 'spoken', 'formal', 'custom', 'name', 'rewrite'])
@@ -1364,6 +1564,14 @@ function applyGuess(guess, editor, deps) {
         return
       }
       clearInk()
+      if (webOp === 'shadow' && countSimilarShadowHosts()) {
+        ui.intent = 'shadow'
+        ui.step = 'values'
+        ui.hideCard = false
+        emit()
+        deps.toast(`${result.message} 可点「同类模块也加上」`)
+        return
+      }
       startReview()
       emit()
       deps.toast(result.message)
@@ -1622,20 +1830,26 @@ function proposeOptions(spans, editor) {
     return bits
   }
 
+  const ask = `${ui.typedText || ''} ${ui.noteText || ''}`
+  if (blankWantsInsert(ask, note, scene) && !layoutReady) {
+    for (const g of blankInsertGuesses(ask)) add(g.id, g.label)
+    return bits
+  }
+
   const wantAdd =
     note === 'insert' ||
     note === 'insert-text' ||
+    note === 'generate-text' ||
     note === 'insert-image' ||
+    note === 'generate-image' ||
     note === 'add'
   if (wantAdd && note !== 'delete' && !String(note).startsWith('delete')) {
-    if (note === 'insert-image') add('insert-image', '在圈里的空白处插入图片')
-    add('insert-text', empty || note === 'add' || note === 'insert' || note === 'insert-text' ? '在圈里的空白处插入文字' : '插入一段文字')
-    add('insert-image', '在圈里的空白处插入图片')
+    for (const g of blankInsertGuesses(ask)) add(g.id, g.label)
     add('frame', '在这块空白加上一个框')
     add('deco', '在空白处加装饰或图案')
     if (note === 'add' && texts.length) add('longer', '扩写圈中文字')
     if (note === 'add' && images.length) add('shadow', shadowGuessLabel('给这张图加阴影'))
-    if (empty || note === 'insert' || note === 'insert-text' || note === 'insert-image' || note === 'add') return bits
+    if (empty || note === 'insert' || note === 'insert-text' || note === 'generate-text' || note === 'insert-image' || note === 'generate-image' || note === 'add') return bits
   }
 
   if (note === 'delete') {
@@ -1677,17 +1891,20 @@ function proposeOptions(spans, editor) {
     return bits
   }
 
-  if (note === 'generate-image') {
-    add('generate-image', images.length ? '按要求生成一张图换上' : '生成一张图放到圈里')
+  if (note === 'generate-image' || note === 'generate-text') {
+    if (note === 'generate-text' || empty || slots.length) {
+      for (const g of blankInsertGuesses(`${ui.typedText || ''} ${ui.noteText || ''}`)) add(g.id, g.label)
+      return bits
+    }
+    add('generate-image', images.length ? '按要求生成一张图换上' : 'AI生成一张图放到圈里')
     if (images.length) add('insert-image', '从本地选一张图插入')
-    if (slots.length || empty) add('insert-text', '插入一段文字')
+    add('generate-text', 'AI生成一句文案插入')
+    add('insert-text', '自己写文字插入')
     return bits
   }
 
-  if (note === 'insert-image') {
-    if (images.length) add('generate-image', '按要求生成一张图换上')
-    add('insert-image', '从本地选一张图插入')
-    add('generate-image', empty || slots.length ? '生成一张图放到圈里' : '按要求生成一张图换上')
+  if (note === 'insert-image' || note === 'insert-text') {
+    for (const g of blankInsertGuesses(`${ui.typedText || ''} ${ui.noteText || ''}`)) add(g.id, g.label)
     return bits
   }
 
@@ -1720,9 +1937,7 @@ function proposeOptions(spans, editor) {
       add('shadow', shadowGuessLabel())
       if (texts.length) add('longer', '扩写圈中文字')
       if (slots.length || empty) {
-        add('insert-text', '插入一段文字')
-        add('generate-image', '生成一张图放到圈里')
-        add('insert-image', '从本地选一张图插入')
+        for (const g of blankInsertGuesses(`${ui.typedText || ''} ${ui.noteText || ''}`)) add(g.id, g.label)
       }
       if (images.length) add('shadow', shadowGuessLabel('给这张图加阴影'))
       if (texts.length && images.length) add('fuse', '把圈中的字融入图')
@@ -1824,9 +2039,7 @@ function proposeOptions(spans, editor) {
   if (indentMarks.length === 1) return bits
   addDecorChoices(add, { texts, images, slots, empty })
   if (slots.length && !texts.length && !images.length && !indentMarks.length) {
-    add('insert-text', '插入文字')
-    add('generate-image', '生成一张图放到圈里')
-    add('insert-image', '从本地选一张图插入')
+    for (const g of blankInsertGuesses(`${ui.typedText || ''} ${ui.noteText || ''}`)) add(g.id, g.label)
   }
   if (texts.length) {
     add('name', '改名字')
@@ -1995,6 +2208,7 @@ function heading(step, intent) {
   if (intent === 'insert-text') return '要插入的文字'
   if (intent === 'insert-image') return '插入或生成图片'
   if (intent === 'generate-image') return '生成什么样的图'
+  if (intent === 'shadow') return '阴影已加上'
   if (intent === 'custom') return '写成什么样'
   if (intent === 'anchor') return '照着这里改别处'
   if (String(intent).startsWith('delete')) return '确认删除'
@@ -2173,17 +2387,23 @@ function pickOption(id, deps, editor) {
   }
   if (id === 'shadow') {
     if (!withLocalUndo(editor, '阴影', () => {
-      if (isWebDocActive()) {
-        const pts = ui.lastPaint
-        if (pts?.length >= 6 && applyShapedShadow(pts, editor)) return true
-        return applyWebShadow()
-      }
+      if (isWebDocActive()) return applyWebShadow()
+      const pts = ui.lastPaint
+      if (pts?.length >= 6 && applyShapedShadow(pts, editor)) return true
       return applyShadow(editor)
     })) {
-      deps.toast('先在杯子旁涂一块再加阴影')
+      deps.toast(isWebDocActive() ? '先圈要加阴影的模块' : '先在杯子旁涂一块再加阴影')
       return
     }
     clearPaintMarks()
+    if (isWebDocActive() && countSimilarShadowHosts()) {
+      ui.intent = 'shadow'
+      ui.step = 'values'
+      ui.hideCard = false
+      emit()
+      deps.toast('已加阴影。可点「同类模块也加上」套到同样的块')
+      return
+    }
     deps.toast('已按你画的形状加上投影。可点「撤回刚才」')
     startReview()
     emit()
@@ -2236,17 +2456,26 @@ function pickOption(id, deps, editor) {
     return
   }
   if (id === 'move-layout') {
+    deps.toast('正在移动…')
     let count = 0
-    const ok = withLocalUndo(editor, '挪位置', () => {
-      count = isWebDocActive() ? applyWebLayoutMoves() : applyLayoutMoves(editor)
-      return count
-    })
-    if (!ok) {
-      deps.toast('先圈要挪的模块，再圈它要去的空白位置。后一圈不会当成新选区')
-      return
+    if (isWebDocActive()) {
+      count = applyWebLayoutMoves()
+      if (!count) {
+        deps.toast('先圈要挪的模块，再圈它要去的空白位置。后一圈不会当成新选区')
+        return
+      }
+    } else {
+      const ok = withLocalUndo(editor, '挪位置', () => {
+        count = applyLayoutMoves(editor)
+        return count
+      })
+      if (!ok) {
+        deps.toast('先圈要挪的模块，再圈它要去的空白位置。后一圈不会当成新选区')
+        return
+      }
     }
     clearPaintMarks()
-    deps.toast(`已移到画出的位置，共 ${count} 处。可撤回`)
+    deps.toast(`已移到画出的位置，周围布局已让开，共 ${count} 处。可撤回`)
     startReview()
     emit()
     return
@@ -2924,6 +3153,11 @@ function fillPropose(bar, spans, editor, deps) {
   if (ui.guessing) hint.textContent = typed ? '正在根据圈画和输入的要求判断…' : '正在根据你画的和写下的判断意图…'
   else if (layoutSourceWaiting(spans) && !looksLikeLayout(spans) && !inferWebLayoutPairs().length) hint.textContent = '再圈它要放到的空白位置。后一圈会当成落点，不会当成新选区'
   else if (looksLikeLayout(spans) || inferWebLayoutPairs().length) hint.textContent = '已认出模块和落点。点「移到画出的位置」'
+  else if (ui.judged && isWebDocActive() && describePaintScene().blank && !inferWebLayoutPairs().length) {
+    hint.textContent = typed
+      ? `空白处已按「${typed}」判断。可选 AI 生成，或自己写 / 从本地插入。`
+      : '圈的是空白。可选 AI 生成文字或图片，也可以自己写或从本地插入。'
+  }
   else if (ui.judged) hint.textContent = typed ? `已按「${typed}」判断。点一项执行，或改输入后重新判断。` : '点一项就执行。不满意可再要几条。'
   else hint.textContent = '圈完后可在下面输入要求，也可以在圈旁手写。点「开始判断」。'
   bar.append(hint)
@@ -2954,9 +3188,18 @@ function fillPropose(bar, spans, editor, deps) {
 
   const tools = document.createElement('div')
   tools.className = 'card-row'
+  const layoutReadyNow = looksLikeLayout(spans) || inferWebLayoutPairs().length
+  if (layoutReadyNow) {
+    tools.append(
+      btn('移到画出的位置', { primary: true, pointer: true }, () => {
+        ui.guessing = false
+        pickOption('move-layout', deps, editor)
+      }),
+    )
+  }
   if (!ui.guessing && !ui.judged) {
     tools.append(
-      btn('开始判断', { primary: true, pointer: true }, () => {
+      btn('开始判断', { primary: !layoutReadyNow, pointer: true }, () => {
         requestIntentGuesses(editor, { more: false })
       }),
     )
@@ -3089,17 +3332,55 @@ function fillValues(bar, editor, deps) {
     })
     bar.append(input)
     bar.append(
-      btn('帮我想一句', {}, () => {
-        ui.productName = nextIdea(LINE_IDEAS, 'lineIdea')
-        replaceCommandText(ui.productName)
-        emit()
-        deps.toast(`已填入：${ui.productName}，再点可换一个`)
+      btn('帮我写一句', {}, () => {
+        deps.toast('正在结合周围页面写一句…')
+        writeInsertCopy(ui.typedText || ui.productName || '写一句简短合适的网页文案')
+          .then((text) => {
+            if (!text) throw new Error('没有生成文案')
+            ui.productName = text
+            replaceCommandText(text)
+            emit()
+            deps.toast(`已写好：${text}`)
+          })
+          .catch((err) => {
+            const gated = err?.code === 'client-gate' || err?.code === 'no_client_gate' || err?.code === 'calls_disabled'
+            deps.toast(gated ? '服务器禁止调用：把 .env 里 MARKSET_ALLOW_MODEL_CALLS 改为 1 并重启' : err?.message || '没能生成文字')
+          })
       }),
     )
     bar.append(
       btn('插入文字', { primary: true }, () => {
-        replaceCommandText(ui.productName)
-        deps.insertText(editor)
+        const text = String(ui.productName || '').trim()
+        if (!text) {
+          deps.toast('先写下要插入的文字')
+          return
+        }
+        finishInsertedText(editor, deps, insertWebText(text))
+      }),
+      btn('上一步', {}, goBack),
+    )
+    return
+  }
+
+  if (ui.intent === 'generate-text') {
+    const input = document.createElement('input')
+    input.type = 'text'
+    input.value = ui.productName || ui.typedText
+    input.placeholder = '例如：一句欢迎语、简短标语'
+    input.addEventListener('pointerdown', (e) => e.stopPropagation())
+    input.addEventListener('input', () => {
+      ui.productName = input.value
+      ui.moreText = input.value
+      replaceCommandText(input.value)
+    })
+    bar.append(input)
+    bar.append(
+      btn('生成并插入', { primary: true }, () => {
+        commitGenerateText(editor, deps, ui.productName || ui.typedText || ui.moreText)
+      }),
+      btn('改为自己写', {}, () => {
+        ui.intent = 'insert-text'
+        emit()
       }),
       btn('上一步', {}, goBack),
     )
@@ -3118,10 +3399,38 @@ function fillValues(bar, editor, deps) {
     return
   }
 
+  if (ui.intent === 'shadow') {
+    const n = countSimilarShadowHosts()
+    const note = document.createElement('p')
+    note.className = 'card-note'
+    note.textContent = n
+      ? `已给这一处加上阴影。检测到 ${n} 个同类模块（同样大小/结构的卡片或图片）。`
+      : '已给这一处加上阴影。没有找到可套用的同类模块。'
+    bar.append(note)
+    if (n) {
+      bar.append(
+        btn('同类模块也加上', { primary: true }, () => {
+          const result = applySimilarWebShadows()
+          deps.toast(result.ok ? result.message : result.reason || '没有套到同类模块')
+          startReview()
+          emit()
+        }),
+      )
+    }
+    bar.append(
+      btn('只改这一处', {}, () => {
+        startReview()
+        emit()
+      }),
+      btn('上一步', {}, goBack),
+    )
+    return
+  }
+
   if (ui.intent === 'generate-image') {
     const note = document.createElement('p')
     note.className = 'card-note'
-    note.textContent = '会按这句话生成一张图，换到你圈中的位置。'
+    note.textContent = '圈的是空白就插入新图；圈中已有图片则换上。'
     bar.append(note)
     const input = document.createElement('input')
     input.type = 'text'

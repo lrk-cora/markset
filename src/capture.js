@@ -3,7 +3,7 @@ import { loadImageEl } from './mask.js'
 import { getSnapshot } from './store.js'
 import { getInkStrokes, inkToDataUrl } from './ink.js'
 import { getPaintMarks } from './overlay.js'
-import { describeCircledHits, isWebDocActive } from './web-doc.js'
+import { describeCircledHits, insertHostScreenBox, isWebDocActive } from './web-doc.js'
 
 function markLine(span) {
   const id = span.markId ? `#${String(span.markId).replace(/^#/, '')}` : '(no-id)'
@@ -382,6 +382,44 @@ function uniqueUrls(list) {
     out.push(url)
   }
   return out
+}
+
+function insertCropPoints() {
+  const pts = allStrokePoints()
+  if (pts.length >= 2) return pts
+  const box = insertHostScreenBox()
+  if (!box) return []
+  return [
+    { x: box.x, y: box.y },
+    { x: box.x + box.w, y: box.y },
+    { x: box.x + box.w, y: box.y + box.h },
+    { x: box.x, y: box.y + box.h },
+  ]
+}
+
+/** Circled blank plus surrounding page, for insert-text / insert-image generation. */
+export async function captureInsertScene() {
+  const imported = await captureImportedPage({ quality: 0.84, pixelRatio: 1 })
+  const demo = imported ? '' : await captureDemoPage()
+  const pageShot = imported || demo
+  const combined = await compositePageAndStrokes(pageShot)
+  const source = combined || pageShot
+  const pts = insertCropPoints()
+  const around = await fitDataUrl(await cropFromPoints(source, pts, { pad: 240, maxSide: 960 }), {
+    maxSide: 960,
+    quality: 0.84,
+  })
+  const closeup = await fitDataUrl(await cropFromPoints(source, pts, { pad: 28, maxSide: 640 }), {
+    maxSide: 640,
+    quality: 0.86,
+  })
+  const page = await fitDataUrl(source, { maxSide: 720, quality: 0.74 })
+  return {
+    aroundImageDataUrl: around,
+    circledImageDataUrl: closeup,
+    pageImageDataUrl: page,
+    pageText: importedPageText().slice(0, 1800),
+  }
 }
 
 /** Page + ink + numbered marks for intent understanding. */

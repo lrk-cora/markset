@@ -19,7 +19,7 @@ import { bindLasso, getStrokeColor, isAddMode, isColorMode, isLassoMode, isLayou
 import { applyScopeAfterSelect } from './scope.js'
 import { guessStrokePrompt } from './vision-tasks.js'
 import { ingestLayoutStroke } from './layout.js'
-import { exportWebDoc, hitWebDoc, isWebDocActive, looksLikeWebLayoutDest, pairWebLayoutDest, unmountWebDoc } from './web-doc.js'
+import { exportWebDoc, hitWebDoc, isWebDocActive, looksLikeWebLayoutDest, pairWebLayoutDest, rememberPaintBox, unmountWebDoc } from './web-doc.js'
 import { clearLocalUndos, dismissCoach, getCard, idleCard, keepCardForAppend, openPageRecolor, applyWrittenNote, resetCardForNewSelection, resetPagePaper, setPaintGesture, shouldTreatStrokeAsInk, canUndoLocal } from './card-flow.js'
 import { addInkStroke, clearInk, hasInk, isLikelyInk, onInkRecognized } from './ink.js'
 import { exitToView } from './view-mode.js'
@@ -436,6 +436,7 @@ bindLasso({
       return false
     }
     if (rawPoints?.length) setPaintGesture(rawPoints, { silent: true })
+    if (polygon?.length) rememberPaintBox(polygon)
     const webHits = isWebDocActive() ? hitWebDoc(polygon) : null
     const textHits = webHits ? webHits.texts : hitText(editor.view, polygon, { skipCovered: shift && !subtract })
     const rawImageHits = webHits ? webHits.images : hitImages(editor.view, polygon)

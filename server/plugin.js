@@ -179,14 +179,61 @@ async function transcribeInk(env, imageUrl, instruction) {
   throw lastErr || new Error('ocr failed')
 }
 
+function collectPayloadImages(payload) {
+  const out = []
+  const seen = new Set()
+  const extra = Array.isArray(payload?.imageDataUrls) ? payload.imageDataUrls : []
+  const context = Array.isArray(payload?.contextImageDataUrls) ? payload.contextImageDataUrls : []
+  for (const url of [payload?.imageDataUrl, payload?.image_url, payload?.contextImageDataUrl, ...extra, ...context]) {
+    if (!url || seen.has(url)) continue
+    seen.add(url)
+    out.push(url)
+    if (out.length >= 3) break
+  }
+  return out
+}
+
 async function rewrite(env, payload) {
-  const { rewriteModel } = models(env)
+  const { rewriteModel, plannerModel } = models(env)
   const instruction = String(payload.instruction || '').trim()
   const text = String(payload.text || '')
+  const pageContext = String(payload.pageContext || '').trim()
   if (!instruction) {
     const err = new Error('missing instruction')
     err.status = 400
     throw err
+  }
+  const images = collectPayloadImages(payload)
+  const userText = [
+    `指令：${instruction}`,
+    text ? `用户要求/原文：${text}` : '',
+    pageContext ? `圈出位置周围的页面文字：\n${pageContext.slice(0, 2000)}` : '',
+    images.length || pageContext
+      ? '只输出文案本身，不要解释，不要加引号。语气、语言、主题必须贴合周围网页。'
+      : '',
+  ]
+    .filter(Boolean)
+    .join('\n')
+  if (images.length) {
+    const content = [{ type: 'text', text: `${userText}\n附图：蓝线圈出要插入的空白，周围是真实网页。` }]
+    for (const url of images) content.push({ type: 'image_url', image_url: { url } })
+    try {
+      const textOut = await dashChat(env, {
+        model: plannerModel,
+        temperature: 0.45,
+        messages: [
+          {
+            role: 'system',
+            content:
+              'You write short webpage copy to insert into the circled blank. Match the surrounding page language, tone, topic, and length. Return only the copy.',
+          },
+          { role: 'user', content },
+        ],
+      })
+      return { text: textOut, model: plannerModel }
+    } catch {
+      /* fall back to text-only rewrite */
+    }
   }
   const textOut = await dashChat(env, {
     model: rewriteModel,
@@ -194,11 +241,11 @@ async function rewrite(env, payload) {
       {
         role: 'system',
         content:
-          'You rewrite the selected webpage text. Keep the original language unless the instruction asks to change it. Return only the rewritten text, with no quotes, labels, or explanation. Never replace the passage with the instruction itself.',
+          'You rewrite the selected webpage text. Keep the original language unless the instruction asks to change it. Return only the rewritten text, with no quotes, labels, or explanation. Never replace the passage with the instruction itself. If surrounding page context is given, match its topic and tone.',
       },
       {
         role: 'user',
-        content: `指令：${instruction}\n原文：${text}`,
+        content: userText,
       },
     ],
   })
@@ -461,26 +508,69 @@ async function wanxInpaint(env, { model, prompt, imageUrl, maskUrl }) {
   })
 }
 
+async function enrichImagePrompt(env, payload) {
+  const prompt = String(payload.prompt || '').trim()
+  const pageContext = String(payload.pageContext || '').trim()
+  const images = collectPayloadImages({
+    imageDataUrls: payload.contextImageDataUrls,
+    contextImageDataUrl: payload.contextImageDataUrl,
+  })
+  if (!images.length && !pageContext) return prompt
+  const { plannerModel } = models(env)
+  const content = [
+    {
+      type: 'text',
+      text: [
+        '根据用户要求和网页截图，写一段用于文生图的提示词。',
+        '截图里蓝线圈出的是要放图的空白；周围是真实页面。生成的图要能放进这个位置，风格、配色、主题跟周围网页一致。',
+        '提示词写清楚：主体、风格（图标/插画/照片）、色调、构图。不要大段文字、水印、UI边框。',
+        '只输出提示词，不要解释。',
+        `用户要求：${prompt}`,
+        pageContext ? `周围页面文字：${pageContext.slice(0, 1600)}` : '',
+        payload.width || payload.height
+          ? `目标尺寸约 ${Math.round(payload.width || 0)}×${Math.round(payload.height || 0)}`
+          : '',
+      ]
+        .filter(Boolean)
+        .join('\n'),
+    },
+  ]
+  for (const url of images) content.push({ type: 'image_url', image_url: { url } })
+  try {
+    const out = await dashChat(env, {
+      model: plannerModel,
+      temperature: 0.4,
+      messages: [{ role: 'user', content }],
+    })
+    return String(out || prompt)
+      .trim()
+      .slice(0, 1200) || prompt
+  } catch {
+    return [prompt, pageContext].filter(Boolean).join('\n').slice(0, 1200)
+  }
+}
+
 async function generateWanxImage(env, payload) {
   const { t2iModel, inpaintModel } = models(env)
-  const prompt = String(payload.prompt || '').trim()
-  if (!prompt) {
+  const rawPrompt = String(payload.prompt || '').trim()
+  if (!rawPrompt) {
     const err = new Error('missing prompt')
     err.status = 400
     throw err
   }
-  const imageUrl = payload.imageDataUrl || payload.image_url || ''
+  const prompt = await enrichImagePrompt(env, payload)
+  const replaceUrl = payload.replaceExisting ? payload.imageDataUrl || payload.image_url || '' : ''
   const size = pickWanxSize(payload.width, payload.height)
   let data = null
   let model = t2iModel
-  if (imageUrl) {
+  if (replaceUrl) {
     try {
       data = await wanxPost(env, '/api/v1/services/aigc/image2image/image-synthesis', {
         model: inpaintModel,
         input: {
           function: 'description_edit',
           prompt,
-          base_image_url: imageUrl,
+          base_image_url: replaceUrl,
         },
         parameters: { n: 1 },
       })

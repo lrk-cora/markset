@@ -294,6 +294,10 @@ body.is-lassoing {
   background: #b45309;
 }
 
+.badge.change-badge {
+  pointer-events: none;
+}
+
 .badge.change-badge .change-toggle {
   height: 20px;
   padding: 0 6px;
@@ -302,6 +306,7 @@ body.is-lassoing {
   background: #fff;
   font: 11px var(--sans);
   cursor: pointer;
+  pointer-events: auto;
 }
 
 .badge.change-badge.is-off .change-toggle {
