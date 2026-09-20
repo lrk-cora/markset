@@ -39,6 +39,23 @@ body.is-subtract.is-armed * {
   cursor: crosshair !important;
 }
 
+body.is-add.is-armed,
+body.is-add.is-armed * {
+  cursor: cell !important;
+}
+
+#btn-add.is-on {
+  border-color: #2f8f5b;
+  background: #d7efe3;
+  color: #145c38;
+}
+
+#btn-subtract.is-on {
+  border-color: #b44532;
+  background: #f6d9d3;
+  color: #7a2418;
+}
+
 body.is-lassoing {
   user-select: none;
   touch-action: none;

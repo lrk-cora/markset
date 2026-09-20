@@ -4,7 +4,7 @@ import { COLOR_TERMS } from './forbidden.js'
 import { COLORS, COLOR_SCHEMES } from './colors.js'
 import { parseCommand } from './plan-local.js'
 import { guessAnnotationIntent } from './vision-tasks.js'
-import { aabb, convexHull, dist, intersectBoxes, looksLikeDrawnLine, pathLength, strokeToPolygon } from './geometry.js'
+import { aabb, classifyStrokeKind, convexHull, dist, intersectBoxes, looksLikeDrawnLine, looksLikeEnclosingStroke, pathLength, strokeToPolygon } from './geometry.js'
 import { imageSpanFromNaturalBox } from './hit-test.js'
 import { collectOutsideEdits } from './scope.js'
 import {
@@ -49,10 +49,11 @@ import {
   rewriteCircledText,
   peekShadowLabel,
 } from './web-doc.js'
-import { clearPaintMarks, getPaintMarks, setSubtractMode } from './overlay.js'
+import { clearPaintMarks, getPaintMarks, setAddMode, setLassoMode, setSubtractMode } from './overlay.js'
 import { redoChange, restoreChange } from './changes.js'
 import { clearInk, readInkText } from './ink.js'
-import { captureInsertScene, classifyDrawnGesture, drawnStampDataUrl, drawnStampScreenBox, looksLikeDrawnPattern } from './capture.js'
+import { captureInsertScene, classifyDrawnGesture, currentSymbolShape, drawnStampDataUrl, drawnStampScreenBox, looksLikeDrawnPattern } from './capture.js'
+import { forgetSymbolHabit, habitForShape, habitGuess, rememberSymbolHabit, shapeTitle } from './symbol-habits.js'
 import {
   applyPageScheme,
   assignSchemeToModules,
@@ -704,6 +705,11 @@ export function applyWrittenNote(text, { confident = false, note, silent = false
 export function shouldTreatStrokeAsInk(pts) {
   if (ui.step !== 'propose') return false
   const spans = getSnapshot().spans
+  const hasSelection = spans.some((s) => s.kind === 'text' || s.kind === 'image' || s.kind === 'slot')
+  const kind = classifyStrokeKind(pts, { hasSelection })
+  if (kind.kind === 'symbol') return true
+  if (kind.kind === 'select' || kind.kind === 'symbol-target') return false
+  if (looksLikeEnclosingStroke(pts)) return false
   if (layoutSourceWaiting(spans) || looksLikeLayout(spans) || hasLayoutWork(spans)) return false
   if (pts?.length >= 8) {
     const box = aabb(pts)
@@ -1010,11 +1016,11 @@ function ensureTargetsForGuess() {
   if (!isWebDocActive()) {
     return getSnapshot().spans.filter((s) => s.kind === 'text' || s.kind === 'image')
   }
-  const extra = refreshWebTargetsFromDrawing(collectDrawingPolys())
+    const extra = refreshWebTargetsFromDrawing(collectDrawingPolys())
   const slots = getSnapshot().spans.filter((s) => s.kind === 'slot' || s.indentMark)
   const seen = new Set()
   const merged = []
-  for (const span of [...extra, ...getSnapshot().spans]) {
+  for (const span of [...getSnapshot().spans, ...extra]) {
     if (!span?.webId || span.kind === 'slot') continue
     if (seen.has(span.webId)) continue
     seen.add(span.webId)
@@ -1119,9 +1125,38 @@ function looksLikeStampGuess(verb, written, list = []) {
   return true
 }
 
+function habitOption() {
+  const mark = currentSymbolShape()
+  if (!mark.shape) return null
+  return habitGuess(habitForShape(mark.shape), mark.shape)
+}
+
+function rememberActiveSymbol(guess, id, label, command, written) {
+  if (guess?.habit || !id || id === 'stamp') return ''
+  const mark = currentSymbolShape()
+  if (!mark.shape) return ''
+  const prev = habitForShape(mark.shape)
+  const saved = rememberSymbolHabit({
+    shape: mark.shape,
+    intent: id,
+    label: (localLabel(id) !== '这项' ? localLabel(id) : '') || label || id,
+    note: guess?.note || id,
+    command,
+    ask: written,
+  })
+  if (!saved) return ''
+  if (!prev || prev.intent !== id) return `已记住：${shapeTitle(mark.shape)} = ${saved.label}`
+  return ''
+}
+
 function reconcileGuesses(vl, local, verb, scene, { more = false } = {}) {
   const gesture = classifyDrawnGesture()
   const vlNorm = uniqueGuesses(vl || [])
+  const habit = habitOption()
+  if (!more && habit) {
+    const rest = (vlNorm.length ? vlNorm : local || []).filter((g) => g.id !== habit.id)
+    return uniqueGuesses([habit, ...rest]).slice(0, 4)
+  }
   const ask = `${ui.typedText || ''} ${ui.noteText || ''}`
   if (!more && blankWantsInsert(ask, verb || ui.note, scene)) {
     const inserts = blankInsertGuesses(ask)
@@ -1435,7 +1470,7 @@ function commitGenerateText(editor, deps, raw) {
 
 let lastGuessAt = 0
 
-function applyGuess(guess, editor, deps) {
+export function applyGuess(guess, editor, deps) {
   if (guess?.wait || !guess?.id) {
     deps?.toast?.('这一条还不能执行，换一条或再给几条')
     return
@@ -1462,6 +1497,8 @@ function applyGuess(guess, editor, deps) {
   if (id === 'custom') ui.moreText = command || label
   if (command) replaceCommandText(command)
   else if (label) replaceCommandText(label)
+  const learned = rememberActiveSymbol(guess, id, label, command, written)
+  if (learned) deps.toast?.(learned)
 
   if (isWebDocActive()) {
     if (id === 'stamp') {
@@ -2339,7 +2376,7 @@ function fillHints(bar, _editor, spans) {
   if (ui.hintOverOn && images.some(looksLikeTableBleed)) {
     const row = document.createElement('p')
     row.className = 'card-hint is-warn'
-    row.textContent = '圈进桌边了。也可以按住 Alt 再圈要去掉的部分。'
+    row.textContent = '圈进旁边了。点「减选」再圈不要的部分，或按住 Alt 再圈。'
     row.prepend(
       btn('减掉多圈的', { primary: false }, () => {
         setSubtractMode(true)
@@ -3150,16 +3187,20 @@ function fillPropose(bar, spans, editor, deps) {
   const hint = document.createElement('p')
   hint.className = 'card-note'
   const typed = String(ui.typedText || '').trim()
+  const markNow = currentSymbolShape()
+  const habitNow = markNow.shape ? habitForShape(markNow.shape) : null
   if (ui.guessing) hint.textContent = typed ? '正在根据圈画和输入的要求判断…' : '正在根据你画的和写下的判断意图…'
   else if (layoutSourceWaiting(spans) && !looksLikeLayout(spans) && !inferWebLayoutPairs().length) hint.textContent = '再圈它要放到的空白位置。后一圈会当成落点，不会当成新选区'
   else if (looksLikeLayout(spans) || inferWebLayoutPairs().length) hint.textContent = '已认出模块和落点。点「移到画出的位置」'
+  else if (habitNow) hint.textContent = `认出${markNow.label}。可一键按习惯「${habitNow.label}」，或改输入后重新判断。`
+  else if (markNow.shape && !ui.judged) hint.textContent = `画出了${markNow.label}。输入它代表什么并执行一次，下次就会记住。`
   else if (ui.judged && isWebDocActive() && describePaintScene().blank && !inferWebLayoutPairs().length) {
     hint.textContent = typed
       ? `空白处已按「${typed}」判断。可选 AI 生成，或自己写 / 从本地插入。`
       : '圈的是空白。可选 AI 生成文字或图片，也可以自己写或从本地插入。'
   }
   else if (ui.judged) hint.textContent = typed ? `已按「${typed}」判断。点一项执行，或改输入后重新判断。` : '点一项就执行。不满意可再要几条。'
-  else hint.textContent = '圈完后可在下面输入要求，也可以在圈旁手写。点「开始判断」。'
+  else hint.textContent = '大圈是选区，五角星/叉/勾等小符号是标记。圈完可加选或减选，也可直接在内容上画符号。'
   bar.append(hint)
 
   const input = document.createElement('input')
@@ -3199,8 +3240,28 @@ function fillPropose(bar, spans, editor, deps) {
   }
   if (!ui.guessing && !ui.judged) {
     tools.append(
+      btn('加选', { pointer: true }, () => {
+        setAddMode(true)
+        deps.toast('再圈要加上的地方。按住 Shift 也可加选')
+      }),
+      btn('减选', { pointer: true }, () => {
+        setSubtractMode(true)
+        deps.toast('再圈不要的部分。按住 Alt 也可减选')
+      }),
       btn('开始判断', { primary: !layoutReadyNow, pointer: true }, () => {
         requestIntentGuesses(editor, { more: false })
+      }),
+    )
+  }
+  if (habitNow && !ui.guessing) {
+    tools.append(
+      btn(`一键：${markNow.label} = ${habitNow.label}`, { pointer: true }, () => {
+        applyGuess(habitGuess(habitNow, markNow.shape), editor, deps)
+      }),
+      btn('忘掉这个习惯', { pointer: true }, () => {
+        forgetSymbolHabit(markNow.shape)
+        deps.toast(`已忘掉${markNow.label}的习惯`)
+        emit()
       }),
     )
   }
@@ -3219,6 +3280,7 @@ function fillPropose(bar, spans, editor, deps) {
       cancelGuesses()
       clearInk()
       replaceSpans([])
+      setLassoMode(true)
       idleCard()
       deps.toast('已清掉这次笔迹，再画一次')
     }),

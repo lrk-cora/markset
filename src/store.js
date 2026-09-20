@@ -1,4 +1,4 @@
-import { aabb, clampBox, intersectBoxes, unionBoxes } from './geometry.js'
+import { aabb, boxHitsPolygon, clampBox, intersectBoxes, unionBoxes } from './geometry.js'
 import { tagFrozen } from './forbidden.js'
 import {
   clipMaskToRect,
@@ -183,6 +183,13 @@ export function appendSpans(spans, doc) {
   if (!spans.length) return
   let next = [...state.spans]
   for (const incoming of spans) {
+    if (incoming.webId) {
+      const i = next.findIndex((s) => s.webId === incoming.webId)
+      if (i >= 0) {
+        next[i] = { ...next[i], ...incoming, markId: next[i].markId, willEdit: true }
+        continue
+      }
+    }
     if (incoming.kind === 'text') {
       const i = next.findIndex((s) => s.kind === 'text' && s.block_id === incoming.block_id)
       if (i >= 0) {
@@ -195,6 +202,33 @@ export function appendSpans(spans, doc) {
   state.spans = withMarks(tagFrozen(next))
   state.suggest = []
   emit()
+}
+
+export function removeSpansByWebIds(ids) {
+  const set = new Set((ids || []).filter(Boolean))
+  if (!set.size) return false
+  const before = state.spans.length
+  state.spans = withMarks(state.spans.filter((s) => !s.webId || !set.has(s.webId)))
+  if (state.spans.length === before) return false
+  emit()
+  return true
+}
+
+export function subtractSpansByPolygon(polygon) {
+  if (!polygon?.length) return false
+  const before = state.spans.length
+  state.spans = withMarks(
+    state.spans.filter((span) => {
+      if (span.layoutRole === 'dest') return true
+      const r = span.screenRect || span.imageRect
+      if (r && boxHitsPolygon(r, polygon)) return false
+      if (span.poly?.length && boxHitsPolygon(aabb(span.poly), polygon)) return false
+      return true
+    }),
+  )
+  if (state.spans.length === before) return false
+  emit()
+  return true
 }
 
 export function removeMark(markId) {

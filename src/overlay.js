@@ -1,4 +1,4 @@
-import { pathLength, looksLikeXStroke, strokeToPolygon } from './geometry.js'
+import { pathLength, looksLikeXStroke, paintHitPolygon } from './geometry.js'
 import { ping } from './store.js'
 
 const MIN_PATH = 28
@@ -69,6 +69,11 @@ function syncButtons() {
   if (lasso) {
     lasso.setAttribute('aria-pressed', String(lassoMode && !subtractMode && !addMode && !colorMode))
     lasso.classList.toggle('is-on', lassoMode && !subtractMode && !addMode && !colorMode)
+  }
+  const add = document.getElementById('btn-add')
+  if (add) {
+    add.setAttribute('aria-pressed', String(addMode))
+    add.classList.toggle('is-on', addMode)
   }
   const sub = document.getElementById('btn-subtract')
   if (sub) {
@@ -150,16 +155,22 @@ let paintMarks = []
 export function getPaintMarks() {
   return paintMarks.map((m) => ({
     color: m.color,
+    role: m.role || 'select',
     points: m.points.map((p) => ({ x: p.x, y: p.y })),
   }))
 }
 
-export function keepPaintMark(points, { append = false, color = '#3c6fd4' } = {}) {
+export function hasPaintSelection() {
+  return paintMarks.some((m) => m.role !== 'subtract' && m.points?.length >= 3)
+}
+
+export function keepPaintMark(points, { append = false, color = '#3c6fd4', role = 'select' } = {}) {
   if (!points?.length) return
   if (!append) paintMarks = []
   paintMarks.push({
     points: points.map((p) => ({ x: p.x, y: p.y })),
     color,
+    role: role || 'select',
   })
   renderPaintMarks()
 }
@@ -169,20 +180,41 @@ export function clearPaintMarks() {
   renderPaintMarks()
 }
 
+function polyToPath(pts) {
+  if (!pts?.length) return ''
+  return `M ${pts.map((p) => `${p.x} ${p.y}`).join(' L ')} Z`
+}
+
 function renderPaintMarks() {
   const svg = document.getElementById('paint-layer')
   if (!svg) return
   svg.replaceChildren()
   for (const mark of paintMarks) {
+    if (mark.points.length < 3) continue
+    const poly = paintHitPolygon(mark.points, 8)
+    if (poly.length < 3) continue
+    const fill = document.createElementNS('http://www.w3.org/2000/svg', 'path')
+    fill.setAttribute('d', polyToPath(poly))
+    fill.setAttribute('stroke', 'none')
+    fill.setAttribute('pointer-events', 'none')
+    if (mark.role === 'subtract') {
+      fill.setAttribute('fill', 'rgba(180, 69, 50, 0.2)')
+    } else {
+      fill.setAttribute('fill', mark.role === 'add' ? 'rgba(47, 143, 91, 0.16)' : 'rgba(60, 111, 212, 0.14)')
+    }
+    svg.append(fill)
+  }
+  for (const mark of paintMarks) {
     if (mark.points.length < 2) continue
     const line = document.createElementNS('http://www.w3.org/2000/svg', 'polyline')
     line.setAttribute('fill', 'none')
     line.setAttribute('stroke', mark.color)
-    line.setAttribute('stroke-width', '4.5')
+    line.setAttribute('stroke-width', mark.role === 'subtract' ? '3.5' : '4.5')
     line.setAttribute('stroke-linecap', 'round')
     line.setAttribute('stroke-linejoin', 'round')
-    line.setAttribute('opacity', '0.72')
+    line.setAttribute('opacity', '0.78')
     line.setAttribute('vector-effect', 'non-scaling-stroke')
+    if (mark.role === 'subtract') line.setAttribute('stroke-dasharray', '7 5')
     line.setAttribute('points', mark.points.map((p) => `${p.x},${p.y}`).join(' '))
     svg.append(line)
   }
@@ -253,25 +285,31 @@ export function bindLasso({ onBegin, onMove, onFinish, onCancel }) {
       return
     }
     if (e) points.push({ x: e.clientX, y: e.clientY })
-    const polygon = strokeToPolygon(points, 8)
+    const polygon = paintHitPolygon(points, 8)
     const tooSmall = polygon.length < 3 || pathLength(points) < MIN_PATH
     if (tooSmall) {
       clearSvg()
       onCancel?.({ drew: true })
       return
     }
+    const wantsSubtract = Boolean(subtractHeld || subtractMode)
+    const wantsAdd = Boolean((addMode || shiftHeld) && !wantsSubtract)
     const persist = onFinish?.(polygon, {
-      shift: shiftHeld && !subtractHeld,
-      subtract: subtractHeld,
-      add: addMode && !subtractHeld,
-      color: colorMode && !subtractHeld,
+      shift: shiftHeld && !wantsSubtract,
+      subtract: wantsSubtract,
+      add: wantsAdd,
+      color: colorMode && !wantsSubtract,
       crossOut: looksLikeXStroke(points),
       rawPoints: points.map((p) => ({ x: p.x, y: p.y })),
     })
-    const color = drawColor({ erase: subtractHeld || subtractMode, shiftHeld })
+    const color = drawColor({ erase: wantsSubtract, shiftHeld: wantsAdd })
     if (persist !== false) {
-      const append = Boolean(persist?.append) || (shiftHeld && !subtractHeld) || isLayoutPen()
-      keepPaintMark(points, { append, color })
+      const prior = paintMarks.some((m) => m.role !== 'subtract' && m.points?.length >= 3)
+      let role = persist?.role || (wantsSubtract ? 'subtract' : wantsAdd ? 'add' : 'select')
+      if (role === 'add' && !prior) role = 'select'
+      const append =
+        Boolean(persist?.append) || role === 'add' || role === 'subtract' || isLayoutPen()
+      keepPaintMark(points, { append, color, role })
     }
     clearSvg()
   }

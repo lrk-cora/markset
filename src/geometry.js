@@ -36,6 +36,22 @@ export function pointInPolygon(x, y, pts) {
   return inside
 }
 
+export function pointInAnyPolygon(x, y, polys) {
+  return (polys || []).some((pts) => pts?.length >= 3 && pointInPolygon(x, y, pts))
+}
+
+/** True if the box center is inside a polygon, or the two overlap a lot. */
+export function boxHitsPolygon(box, poly) {
+  if (!box || !poly?.length) return false
+  const cx = box.x + box.w / 2
+  const cy = box.y + box.h / 2
+  if (pointInPolygon(cx, cy, poly)) return true
+  const hit = intersectBoxes(box, aabb(poly))
+  if (!hit) return false
+  const area = Math.max(1, box.w * box.h)
+  return (hit.w * hit.h) / area >= 0.45
+}
+
 export function segmentsIntersect(a, b, c, d) {
   const det = (b.x - a.x) * (d.y - c.y) - (b.y - a.y) * (d.x - c.x)
   if (Math.abs(det) < 1e-9) return false
@@ -62,11 +78,28 @@ export function isSelfIntersecting(pts) {
 
 export function looksLikeXStroke(pts) {
   if (!pts || pts.length < 8 || !isSelfIntersecting(pts)) return false
+  if (looksLikeStarStroke(pts)) return false
   const box = aabb(pts)
   if (box.w < 16 || box.h < 16) return false
+  const corners = turningCorners(pts)
+  if (corners >= 5) return false
   const len = pathLength(pts)
   const diag = Math.hypot(box.w, box.h)
-  return len > diag * 1.55
+  if (len > diag * 2.85) return false
+  return len > diag * 1.45 && corners <= 4
+}
+
+/** One-stroke pentagram: many turns and a long path, not a simple two-line X. */
+export function looksLikeStarStroke(pts) {
+  if (!pts || pts.length < 16) return false
+  const box = aabb(pts)
+  if (box.w < 18 || box.h < 18) return false
+  const corners = turningCorners(pts, 32)
+  const len = pathLength(pts)
+  const diag = Math.hypot(box.w, box.h)
+  if (corners >= 8) return true
+  if (corners >= 5 && (isSelfIntersecting(pts) || len > diag * 2.5)) return true
+  return corners >= 4 && isSelfIntersecting(pts) && len > diag * 3.1
 }
 
 /** Several straight strokes fanning out from a hub, e.g. sunburst around a logo. */
@@ -181,6 +214,187 @@ export function looksLikeBoxStroke(pts) {
   return sides >= 3
 }
 
+function polygonArea(pts) {
+  let a = 0
+  for (let i = 0; i < pts.length; i += 1) {
+    const j = (i + 1) % pts.length
+    a += pts[i].x * pts[j].y - pts[j].x * pts[i].y
+  }
+  return Math.abs(a) / 2
+}
+
+function turningCorners(pts, minDeg = 40) {
+  const step = Math.max(5, pathLength(pts) / 36)
+  const s = simplify(pts, step)
+  if (s.length < 4) return 0
+  let n = 0
+  for (let i = 1; i < s.length - 1; i += 1) {
+    const a = s[i - 1]
+    const b = s[i]
+    const c = s[i + 1]
+    const ang = Math.abs(Math.atan2(c.y - b.y, c.x - b.x) - Math.atan2(a.y - b.y, a.x - b.x))
+    const deg = (Math.min(ang, Math.PI * 2 - ang) * 180) / Math.PI
+    if (deg > minDeg && deg < 155) n += 1
+  }
+  return n
+}
+
+function roundness(pts) {
+  const box = aabb(pts)
+  const aspect = Math.min(box.w, box.h) / Math.max(1, Math.max(box.w, box.h))
+  const loop = dist(pts[0], pts[pts.length - 1]) > 3 ? [...pts, pts[0]] : pts
+  const area = polygonArea(loop)
+  const r = Math.max(box.w, box.h) / 2
+  if (r < 4) return 0
+  return Math.min(1, (area / Math.max(1, Math.PI * r * r)) * aspect)
+}
+
+/** Casual circle / C-shape / messy loop still counts as enclosing, not a neat rectangle. */
+export function looksLikeEnclosingStroke(pts) {
+  if (!pts || pts.length < 8) return false
+  const box = aabb(pts)
+  if (box.w < 28 || box.h < 18) return false
+  const peri = 2 * (box.w + box.h)
+  const len = pathLength(pts)
+  if (len < peri * 0.32) return false
+  if (looksLikeDrawnLine(pts) && Math.min(box.w, box.h) < 28) return false
+  const gap = dist(pts[0], pts[pts.length - 1])
+  const span = Math.max(box.w, box.h)
+  const minSpan = Math.min(box.w, box.h)
+  const closed = gap < span * 0.48 || (gap < Math.max(40, minSpan * 0.72) && gap < len * 0.38)
+  if (closed) return true
+  return gap < len * 0.48 && len > peri * 0.5 && box.w > 36 && box.h > 24
+}
+
+export function enclosingPolygon(pts) {
+  const cleaned = simplify(pts, 3)
+  if (cleaned.length < 3) return cleaned
+  const loop = dist(cleaned[0], cleaned[cleaned.length - 1]) > 2 ? [...cleaned, cleaned[0]] : cleaned
+  if (isSelfIntersecting(loop) || loop.length > 90) {
+    const hull = convexHull(cleaned)
+    if (hull.length >= 3) return inflatePolygon(hull, 10)
+  }
+  return inflatePolygon(loop, 10)
+}
+
+export function inflatePolygon(pts, pad) {
+  if (!pts?.length || !(pad > 0)) return pts || []
+  const box = aabb(pts)
+  const cx = box.x + box.w / 2
+  const cy = box.y + box.h / 2
+  return pts.map((p) => {
+    const dx = p.x - cx
+    const dy = p.y - cy
+    const len = Math.hypot(dx, dy) || 1
+    return { x: p.x + (dx / len) * pad, y: p.y + (dy / len) * pad }
+  })
+}
+
+export const SHAPE_LABELS = {
+  line: '横线',
+  wavy: '波浪线',
+  circle: '圈',
+  triangle: '三角形',
+  star: '五角星',
+  x: '叉',
+  check: '勾',
+  arrow: '箭头',
+  box: '小方框',
+}
+
+export function classifyStrokeShape(pts) {
+  if (!pts || pts.length < 4) return ''
+  const box = aabb(pts)
+  const len = pathLength(pts)
+  const chord = dist(pts[0], pts[pts.length - 1])
+  const enclosing = looksLikeEnclosingStroke(pts)
+  const corners = turningCorners(pts)
+  const round = roundness(pts)
+  if (looksLikeStarStroke(pts)) return 'star'
+  if (looksLikeXStroke(pts)) return 'x'
+  if (!enclosing && looksLikeDrawnLine(pts)) {
+    if (len > chord * 1.55 && box.w > box.h * 2.1) return 'wavy'
+    return 'line'
+  }
+  if (!enclosing && box.w > 22 && box.h > 22 && chord < Math.max(box.w, box.h) * 0.45) {
+    if (corners >= 2 && corners <= 3 && box.h > box.w * 0.65) return 'check'
+    if (corners >= 3 && corners <= 4 && round < 0.66) return 'triangle'
+  }
+  if (enclosing) {
+    if (corners >= 8 || (corners >= 5 && round < 0.62)) return 'star'
+    if (round > 0.7 && corners <= 4) return 'circle'
+    if (corners >= 3 && corners <= 4 && round < 0.66) return 'triangle'
+    if (looksLikeBoxStroke(pts)) return 'box'
+    if (round > 0.52) return 'circle'
+  }
+  return ''
+}
+
+export function classifyMarkShape(strokes) {
+  const list = (strokes || []).filter((s) => s?.length >= 2)
+  if (!list.length) return { shape: '', label: '' }
+  const flat = list.length === 1 ? list[0] : list.flat()
+  if (looksLikeStarStroke(flat) || classifyStrokeShape(flat) === 'star') {
+    return { shape: 'star', label: SHAPE_LABELS.star }
+  }
+  if (looksLikeRadialBurst(list)) return { shape: '', label: '' }
+  if (looksLikeArrowGesture(list)) return { shape: 'arrow', label: SHAPE_LABELS.arrow }
+  if (list.length === 2) {
+    const a = list[0]
+    const b = list[1]
+    const crosses =
+      looksLikeXStroke([...a, ...b]) ||
+      segmentsIntersect(a[0], a[a.length - 1], b[0], b[b.length - 1])
+    if (crosses && !looksLikeStarStroke(flat)) return { shape: 'x', label: SHAPE_LABELS.x }
+  }
+  if (looksLikeUnderlineGesture(list)) return { shape: 'line', label: SHAPE_LABELS.line }
+  const shape = classifyStrokeShape(flat)
+  return { shape, label: SHAPE_LABELS[shape] || '' }
+}
+
+/** Distinctive mark drawn as the selection itself (not a generic oval/box). */
+export function classifyLassoSymbol(pts) {
+  const shape = classifyStrokeShape(pts)
+  if (!shape || shape === 'box') return ''
+  if (shape === 'circle') {
+    const box = aabb(pts)
+    if (box.w > 140 || box.h > 140) return ''
+  }
+  return shape
+}
+
+const SYMBOL_SHAPES = new Set(['star', 'triangle', 'x', 'check', 'arrow', 'line', 'wavy'])
+
+/**
+ * Decide whether a stroke is a selection region, a compact intent symbol, or handwriting.
+ * Large irregular loops are always selection. Compact named shapes are symbols.
+ * After a selection exists, symbols annotate; without a selection they also pick the object under the mark.
+ */
+export function classifyStrokeKind(pts, { hasSelection = false, refine = false } = {}) {
+  if (!pts || pts.length < 4) return { kind: 'none', shape: '', label: '' }
+  if (refine) return { kind: hasSelection ? 'refine' : 'select', shape: '', label: '' }
+  const box = aabb(pts)
+  const long = Math.max(box.w, box.h)
+  const enclosing = looksLikeEnclosingStroke(pts)
+  const shape = classifyStrokeShape(pts)
+  const compact = long <= 220 && Math.min(box.w, box.h) <= 200
+  const named = (SYMBOL_SHAPES.has(shape) || (shape === 'circle' && compact)) && shape
+  const lineLike = shape === 'line' || shape === 'wavy'
+  if (named && long > 280 && !lineLike && (shape === 'circle' || shape === 'triangle')) {
+    return { kind: 'select', shape: '', label: '' }
+  }
+  if (named) {
+    return {
+      kind: 'symbol-target',
+      shape: named,
+      label: SHAPE_LABELS[named] || named,
+    }
+  }
+  if (enclosing) return { kind: 'select', shape: '', label: '' }
+  if (hasSelection) return { kind: 'ink', shape: '', label: '' }
+  return { kind: 'select', shape: '', label: '' }
+}
+
 export function convexHull(pts) {
   const p = [...pts].sort((a, b) => (a.x === b.x ? a.y - b.y : a.x - b.x))
   if (p.length <= 2) return p
@@ -244,6 +458,12 @@ export function strokeToPolygon(pts, radius = 18) {
     right.push({ x: cleaned[i].x - nx, y: cleaned[i].y - ny })
   }
   return left.concat(right.reverse())
+}
+
+/** Filled region for a casual loop; thick ribbon for a line-like stroke. */
+export function paintHitPolygon(pts, radius = 8) {
+  if (looksLikeEnclosingStroke(pts)) return enclosingPolygon(pts)
+  return strokeToPolygon(pts, radius)
 }
 
 /** Self-intersecting lassos fall back to the convex hull as an outer contour. */

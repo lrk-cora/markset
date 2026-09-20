@@ -3,7 +3,7 @@ import { applyDemoPage, applyImportedPage, createEditor, refreshDecorations } fr
 import { bindChromeKeys, renderChrome, toast } from './chrome.js'
 import { fetchHealth, importPage } from './api.js'
 import { canSnap, consumePackagingHint, consumeSkipObjectSnap, peekPackagingHint, peekSkipObjectSnap, setSnapOn, snapImageHits } from './contour.js'
-import { aabb, looksLikeBoxStroke, looksLikeDrawnLine } from './geometry.js'
+import { aabb, classifyStrokeKind, looksLikeBoxStroke, looksLikeDrawnLine, looksLikeEnclosingStroke } from './geometry.js'
 import {
   contentImageHits,
   findIndentTarget,
@@ -15,14 +15,13 @@ import {
   isTinyImageSpan,
   looksLikePriceBleed,
 } from './hit-test.js'
-import { bindLasso, getStrokeColor, isAddMode, isColorMode, isLassoMode, isLayoutPen, isSubtractMode, LAYOUT_PENS, SELECT_COLOR, setLassoMode, setStrokeColor, setSubtractMode } from './overlay.js'
+import { bindLasso, getPaintMarks, getStrokeColor, isAddMode, isColorMode, isLassoMode, isLayoutPen, isSubtractMode, LAYOUT_PENS, SELECT_COLOR, setAddMode, setLassoMode, setStrokeColor, setSubtractMode } from './overlay.js'
 import { applyScopeAfterSelect } from './scope.js'
 import { guessStrokePrompt } from './vision-tasks.js'
 import { ingestLayoutStroke } from './layout.js'
 import { exportWebDoc, hitWebDoc, isWebDocActive, looksLikeWebLayoutDest, pairWebLayoutDest, rememberPaintBox, unmountWebDoc } from './web-doc.js'
 import { clearLocalUndos, dismissCoach, getCard, idleCard, keepCardForAppend, openPageRecolor, applyWrittenNote, resetCardForNewSelection, resetPagePaper, setPaintGesture, shouldTreatStrokeAsInk, canUndoLocal } from './card-flow.js'
 import { addInkStroke, clearInk, hasInk, isLikelyInk, onInkRecognized } from './ink.js'
-import { exitToView } from './view-mode.js'
 import {
   appendSpans,
   applyImageStroke,
@@ -33,9 +32,11 @@ import {
   getSnapshot,
   hasChanges,
   refreshImageLayout,
+  removeSpansByWebIds,
   replaceCommandText,
   replaceSpans,
   subscribe,
+  subtractSpansByPolygon,
   undoLastInsert,
   unionImageSpan,
 } from './store.js'
@@ -173,9 +174,29 @@ document.getElementById('btn-lasso')?.addEventListener('click', () => {
     setStrokeColor(SELECT_COLOR)
     setLassoMode(true)
   } else setLassoMode(!isLassoMode())
+  if (isLassoMode() && !isAddMode() && !isSubtractMode()) toast('圈选：圈要改的地方。下一笔会换成新选区')
+})
+document.getElementById('btn-add')?.addEventListener('click', () => {
+  const on = !isAddMode()
+  setAddMode(on)
+  if (on) {
+    toast(
+      getSnapshot().spans.length || getPaintMarks().length
+        ? '加选：再圈漏掉的地方，会加进当前选区。按住 Shift 也可加选'
+        : '加选已打开。先圈一块，再圈漏掉的会自动加上',
+    )
+  }
 })
 document.getElementById('btn-subtract')?.addEventListener('click', () => {
-  setSubtractMode(!isSubtractMode())
+  const on = !isSubtractMode()
+  setSubtractMode(on)
+  if (on) {
+    toast(
+      getSnapshot().spans.length || getPaintMarks().length
+        ? '减选：再圈不要的部分，会从选区挖掉。按住 Alt 也可减选'
+        : '先圈要留的，再点减选圈掉不要的',
+    )
+  }
 })
 
 function bindPenColors() {
@@ -261,11 +282,42 @@ function emptyPaintToast(slot) {
   return '没涂到字或杯子。可加阴影、空两格，或加框 / 线 / 插入'
 }
 
+function applyWebRefine(textHits, imgs, polygon, { subtract, suggests, rawPoints }) {
+  const extra = [...textHits.found, ...imgs]
+  if (subtract) {
+    const ids = extra.map((s) => s.webId).filter(Boolean)
+    let did = false
+    if (ids.length && removeSpansByWebIds(ids)) did = true
+    if (subtractSpansByPolygon(polygon)) did = true
+    if (eraseSlots(polygon)) did = true
+    keepCardForAppend()
+    toast(did ? '已从选区去掉这一块' : '已记下挖掉的范围，执行时不再改这里')
+    return
+  }
+  if (!extra.length) {
+    const slot = emptyPaintSpan(rawPoints, polygon) || hitPageSlot(polygon, editor.view)
+    if (slot) extra.push(slot)
+  }
+  if (!extra.length) {
+    toast('再圈要加上的那一块')
+    return
+  }
+  appendSpans(extra, editor.view.state.doc)
+  keepCardForAppend()
+  finishSelect(suggests)
+  toast('已加进选区')
+}
+
 function applyHits(textHits, imageHits, polygon, { append, subtract, add, color, rawPoints }) {
   if (hasChanges()) dismissChanges()
   const suggests = [...textHits.suggest]
   const imgs = [...imageHits.found, ...((append || subtract || add || color) ? imageHits.suggest : [])]
   if (!append && !subtract && !add && !color) suggests.push(...imageHits.suggest)
+
+  if (isWebDocActive() && (subtract || add || append)) {
+    applyWebRefine(textHits, imgs, polygon, { subtract, suggests, rawPoints })
+    return
+  }
 
   if (subtract) {
     let did = false
@@ -417,13 +469,42 @@ function indentSpanFromStroke(rawPoints, polygon) {
   }
 }
 
+function symbolHitPoly(rawPoints, shape = '') {
+  const box = aabb(rawPoints)
+  const lineLike = shape === 'line' || shape === 'wavy'
+  const padX = lineLike ? 8 : 14
+  const padY = lineLike ? 8 : 14
+  const lift = lineLike ? Math.max(26, Math.min(52, box.w * 0.14)) : 0
+  return [
+    { x: box.x - padX, y: box.y - padY - lift },
+    { x: box.x + box.w + padX, y: box.y - padY - lift },
+    { x: box.x + box.w + padX, y: box.y + box.h + padY },
+    { x: box.x - padX, y: box.y + box.h + padY },
+  ]
+}
+
 bindLasso({
   onBegin() {
     ignoreClickUntil = Number.POSITIVE_INFINITY
   },
-  onFinish(polygon, { shift, subtract, add, color, crossOut, rawPoints }) {
+  onFinish(polygon, flags = {}) {
     ignoreClickUntil = performance.now() + 400
+    let { shift, subtract, add, color, rawPoints } = flags
+    const priorSel =
+      getSnapshot().spans.some((s) => s.layoutRole !== 'dest') ||
+      getPaintMarks().some((m) => m.role !== 'subtract' && m.role !== 'symbol' && m.points?.length >= 3)
+    if ((add || shift) && !subtract && !priorSel) {
+      add = false
+      shift = false
+    }
+    const strokeKind =
+      subtract || add || shift || color || isLayoutPen()
+        ? { kind: add || shift ? 'refine' : subtract ? 'refine' : 'select', shape: '', label: '' }
+        : classifyStrokeKind(rawPoints, { hasSelection: priorSel, refine: false })
+    let hitPoly = polygon
+    if (strokeKind.kind === 'symbol-target') hitPoly = symbolHitPoly(rawPoints, strokeKind.shape)
     if (
+      strokeKind.kind !== 'symbol-target' &&
       !shift &&
       !subtract &&
       !add &&
@@ -436,10 +517,12 @@ bindLasso({
       return false
     }
     if (rawPoints?.length) setPaintGesture(rawPoints, { silent: true })
-    if (polygon?.length) rememberPaintBox(polygon)
-    const webHits = isWebDocActive() ? hitWebDoc(polygon) : null
-    const textHits = webHits ? webHits.texts : hitText(editor.view, polygon, { skipCovered: shift && !subtract })
-    const rawImageHits = webHits ? webHits.images : hitImages(editor.view, polygon)
+    if (hitPoly?.length) rememberPaintBox(hitPoly, { union: add || shift, subtract })
+    const webHits = isWebDocActive()
+      ? hitWebDoc(hitPoly, { loose: strokeKind.kind === 'symbol-target' || looksLikeEnclosingStroke(rawPoints) })
+      : null
+    const textHits = webHits ? webHits.texts : hitText(editor.view, hitPoly, { skipCovered: shift && !subtract })
+    const rawImageHits = webHits ? webHits.images : hitImages(editor.view, hitPoly)
     const imageHits =
       subtract || add || color || isWebDocActive() ? rawImageHits : contentImageHits(rawImageHits)
     const hasImage = imageHits.found.length + imageHits.suggest.length > 0
@@ -451,6 +534,7 @@ bindLasso({
         !selected.some((c) => c.kind === 'image' && ((c.webId && s.webId && c.webId === s.webId) || c.block_id === s.block_id)),
     )
     if (
+      strokeKind.kind !== 'symbol-target' &&
       !shift &&
       !subtract &&
       !add &&
@@ -464,7 +548,18 @@ bindLasso({
       addInkStroke(rawPoints)
       return false
     }
-    if (isWebDocActive() && !subtract && !add && !color && looksLikeWebLayoutDest(rawPoints, polygon)) {
+    if (subtract && !getSnapshot().spans.length && !getPaintMarks().length) {
+      toast('先圈要留的，再点减选圈掉不要的')
+      return false
+    }
+    if (
+      isWebDocActive() &&
+      !subtract &&
+      !add &&
+      !color &&
+      strokeKind.kind !== 'symbol-target' &&
+      looksLikeWebLayoutDest(rawPoints, polygon)
+    ) {
       clearInk()
       keepCardForAppend()
       pairWebLayoutDest(rawPoints, polygon, getStrokeColor())
@@ -494,7 +589,7 @@ bindLasso({
     }
     if (!(shift || subtract || add || color)) clearInk()
     const apply = (images) =>
-      applyHits(textHits, images, polygon, {
+      applyHits(textHits, images, hitPoly, {
         append: (shift && !subtract && !add && !color) || (peekPackagingHint() && hasImage),
         subtract,
         add,
@@ -506,9 +601,13 @@ bindLasso({
     if (subtract || add || color || skipSnap || !canSnap() || !hasBig) {
       if (skipSnap) consumeSkipObjectSnap()
       apply(imageHits)
-      return
+      if (strokeKind.kind === 'symbol-target' && strokeKind.shape) {
+        toast(`认出${strokeKind.label}，已点中这块。请点「开始判断」确认后再执行`)
+      }
+      return strokeKind.kind === 'symbol-target' ? { role: 'symbol' } : undefined
     }
-    snapImageHits(imageHits, { polygon }, toast).then(apply)
+    snapImageHits(imageHits, { polygon: hitPoly }, toast).then(apply)
+    return strokeKind.kind === 'symbol-target' ? { role: 'symbol' } : undefined
   },
   onCancel({ drew } = {}) {
     ignoreClickUntil = drew ? performance.now() + 200 : 0

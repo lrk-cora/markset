@@ -1,9 +1,10 @@
-import { aabb, dist, looksLikeArrowGesture, looksLikeRadialBurst, looksLikeUnderlineGesture, pathLength } from './geometry.js'
+import { aabb, classifyLassoSymbol, classifyMarkShape, dist, looksLikeArrowGesture, looksLikeEnclosingStroke, looksLikeRadialBurst, looksLikeUnderlineGesture, pathLength, SHAPE_LABELS } from './geometry.js'
 import { loadImageEl } from './mask.js'
 import { getSnapshot } from './store.js'
 import { getInkStrokes, inkToDataUrl } from './ink.js'
 import { getPaintMarks } from './overlay.js'
 import { describeCircledHits, insertHostScreenBox, isWebDocActive } from './web-doc.js'
+import { habitForShape, habitGuess, shapeTitle } from './symbol-habits.js'
 
 function markLine(span) {
   const id = span.markId ? `#${String(span.markId).replace(/^#/, '')}` : '(no-id)'
@@ -126,18 +127,14 @@ function allStrokePoints() {
 }
 
 function looksLikeLasso(pts) {
-  if (!pts || pts.length < 8) return false
-  const box = aabb(pts)
-  const peri = 2 * (box.w + box.h)
-  const len = pathLength(pts)
-  const closed = dist(pts[0], pts[pts.length - 1]) < Math.max(box.w, box.h) * 0.35
-  return closed && box.w > 80 && box.h > 60 && len < peri * 2.8
+  return looksLikeEnclosingStroke(pts)
 }
 
 function handwritingStrokes() {
   const inks = getInkStrokes().filter((s) => s?.length >= 2)
   if (inks.length) return inks
   return getPaintMarks()
+    .filter((m) => m.role !== 'subtract' && m.role !== 'add')
     .map((m) => m.points)
     .filter((s) => s?.length >= 2 && !looksLikeLasso(s))
 }
@@ -196,9 +193,39 @@ export function looksLikeDrawnPattern() {
   return false
 }
 
+export function currentSymbolShape() {
+  const fromInk = classifyMarkShape(handwritingStrokes())
+  if (fromInk.shape) return fromInk
+  const marks = getPaintMarks().filter(
+    (m) => m?.points?.length >= 4 && m.role !== 'subtract' && m.role !== 'add',
+  )
+  for (const mark of [...marks].reverse()) {
+    const shape = classifyLassoSymbol(mark.points)
+    if (!shape) continue
+    const box = aabb(mark.points)
+    if (shape === 'circle' && (box.w > 140 || box.h > 140) && marks.length > 1) continue
+    return { shape, label: SHAPE_LABELS[shape] || shape }
+  }
+  return { shape: '', label: '' }
+}
+
 export function classifyDrawnGesture() {
   const strokes = handwritingStrokes().filter((s) => s?.length >= 2)
-  if (!strokes.length) return { kind: '', shape: '', label: '', hint: '' }
+  const mark = currentSymbolShape()
+  if (mark.shape) {
+    const habit = habitForShape(mark.shape)
+    if (habit) {
+      const guess = habitGuess(habit, mark.shape)
+      return {
+        kind: habit.intent,
+        shape: mark.shape,
+        label: guess.label,
+        hint: `用户习惯用${shapeTitle(mark.shape)}表示「${habit.label}」。直接按这个习惯执行。`,
+        habit: true,
+      }
+    }
+  }
+  if (!strokes.length) return { kind: '', shape: mark.shape || '', label: '', hint: mark.shape ? `画出了${shapeTitle(mark.shape)}。还没有习惯，执行一次后会记住它代表什么。` : '', unknownHabit: Boolean(mark.shape) }
   if (looksLikeRadialBurst(strokes)) {
     return {
       kind: 'stamp',
@@ -215,12 +242,21 @@ export function classifyDrawnGesture() {
       hint: '箭头表示布局：从模块指向要放到的位置，不是新选区，也不是插入文字。',
     }
   }
-  if (looksLikeUnderlineGesture(strokes)) {
+  if (looksLikeUnderlineGesture(strokes) && !habitForShape('line')) {
     return {
       kind: 'underline',
       shape: 'underline',
       label: '给圈中文字加下划线',
       hint: '横线画在文字下方，表示加下划线。',
+    }
+  }
+  if (mark.shape && ['star', 'triangle', 'circle', 'check', 'x', 'line', 'wavy'].includes(mark.shape)) {
+    return {
+      kind: '',
+      shape: mark.shape,
+      label: '',
+      hint: `画出了${shapeTitle(mark.shape)}。还没有习惯，先输入它代表什么并执行一次，下次就能一键调用。`,
+      unknownHabit: true,
     }
   }
   if (looksLikeDrawnPattern()) {
@@ -231,7 +267,7 @@ export function classifyDrawnGesture() {
       hint: '用户直接画了要加上的图形，应把该图案贴到所画位置。',
     }
   }
-  return { kind: '', shape: '', label: '', hint: '' }
+  return { kind: '', shape: mark.shape || '', label: '', hint: '', unknownHabit: Boolean(mark.shape) }
 }
 
 export function drawnStampScreenBox() {

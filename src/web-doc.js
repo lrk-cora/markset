@@ -1,6 +1,6 @@
 import { rewriteText } from './api.js'
 import { colorFill, colorRgb, COLOR_SCHEMES } from './colors.js'
-import { aabb, dist, intersectBoxes, looksLikeRadialBurst, pathLength, pointInPolygon, strokeToPolygon } from './geometry.js'
+import { aabb, boxHitsPolygon, dist, intersectBoxes, looksLikeEnclosingStroke, looksLikeRadialBurst, paintHitPolygon, pathLength, pointInPolygon, strokeToPolygon, unionBoxes } from './geometry.js'
 import { collectLayoutPairs } from './layout.js'
 import { getInkStrokes } from './ink.js'
 import { getPaintMarks, SELECT_COLOR } from './overlay.js'
@@ -502,10 +502,13 @@ function areaOf(el) {
 let lastPaintBox = null
 let lastShadowJob = null
 let paintRoleCache = { key: '', val: null }
+let paintRoleBusy = false
 
-export function rememberPaintBox(polygon) {
+export function rememberPaintBox(polygon, { union = false, subtract = false } = {}) {
   const box = iframeUnionBox([polygon])
-  if (box && box.w >= 6 && box.h >= 6) lastPaintBox = box
+  if (!box || box.w < 6 || box.h < 6) return lastPaintBox
+  if (subtract) return lastPaintBox
+  lastPaintBox = union && lastPaintBox ? unionBoxes(lastPaintBox, box) : box
   return lastPaintBox
 }
 
@@ -600,13 +603,7 @@ function visualTargets() {
 }
 
 function looksLikeLassoStroke(pts) {
-  if (!pts || pts.length < 8) return false
-  const box = aabb(pts)
-  if (box.w < 32 || box.h < 22) return false
-  const peri = 2 * (box.w + box.h)
-  const len = pathLength(pts)
-  const closed = dist(pts[0], pts[pts.length - 1]) < Math.max(box.w, box.h) * 0.42
-  return closed && len < peri * 3.2
+  return looksLikeEnclosingStroke(pts)
 }
 
 function isHandwritingPaint(mark) {
@@ -679,19 +676,39 @@ function sceneFromIframeBox(box) {
 }
 
 function paintLassoMarks() {
-  const paints = getPaintMarks().filter((m) => m.points?.length >= 3 && !isHandwritingPaint(m))
-  const lassos = paints.filter((m) => looksLikeLassoStroke(m.points))
+  const paints = getPaintMarks().filter(
+    (m) => m.points?.length >= 3 && m.role !== 'subtract' && !isHandwritingPaint(m),
+  )
+  const lassos = paints.filter((m) => looksLikeLassoStroke(m.points) || m.role === 'symbol')
   return lassos.length ? lassos : paints
+}
+
+export function subtractPolys() {
+  return polysOfMarks(
+    getPaintMarks().filter((m) => m.role === 'subtract' && m.points?.length >= 3 && !isHandwritingPaint(m)),
+  )
+}
+
+function spanHitsHoles(span, holes) {
+  if (!holes?.length) return false
+  const r = span?.screenRect || span?.imageRect
+  return Boolean(r && holes.some((poly) => boxHitsPolygon(r, poly)))
 }
 
 function classifyPaintRoles(marks = paintLassoMarks()) {
   const all = marks || []
   const key = paintBoxKey(all)
   if (paintRoleCache.key === key && paintRoleCache.val) return paintRoleCache.val
-  const result = (() => {
-    if (all.length < 2) return { sources: all, dests: [], all }
+  if (paintRoleBusy) return { sources: all, dests: [], all }
+  if (all.length < 2) {
+    const val = { sources: all, dests: [], all }
+    paintRoleCache = { key, val }
+    return val
+  }
+  paintRoleBusy = true
+  try {
     const scored = all.map((m) => {
-      const poly = m.points.length >= 3 ? strokeToPolygon(m.points) : m.points
+      const poly = m.points.length >= 3 ? paintHitPolygon(m.points) : m.points
       const box = aabb(m.points)
       const iframe = iframeUnionBox([poly])
       const scene = sceneFromIframeBox(iframe)
@@ -699,28 +716,37 @@ function classifyPaintRoles(marks = paintLassoMarks()) {
       const n = (hits.images?.found?.length || 0) + (hits.texts?.found?.length || 0)
       return { mark: m, box, poly, scene, n, blank: scene.blank || scene.fill < 0.28 }
     })
-    const dests = scored.filter((s) => s.blank)
-    const sources = scored.filter((s) => !s.blank)
+    const isAdd = (s) => s.mark.role === 'add'
+    const dests = scored.filter((s) => s.blank && !isAdd(s))
+    const sources = scored.filter((s) => !s.blank || isAdd(s))
+    let val
     if (dests.length && sources.length) {
-      return { sources: sources.map((s) => s.mark), dests: dests.map((s) => s.mark), all }
+      val = { sources: sources.map((s) => s.mark), dests: dests.map((s) => s.mark), all }
+    } else {
+      scored.sort((a, b) => b.n - a.n || a.box.w * a.box.h - b.box.w * b.box.h)
+      const primary = scored[0]
+      const extra = scored.slice(1).filter(
+        (s) =>
+          !isAdd(s) &&
+          boxesFar(primary.box, s.box) &&
+          (s.n < primary.n || s.scene.fill < primary.scene.fill * 0.7),
+      )
+      val = extra.length
+        ? { sources: [primary.mark], dests: extra.map((s) => s.mark), all }
+        : { sources: all, dests: [], all }
     }
-    scored.sort((a, b) => b.n - a.n || a.box.w * a.box.h - b.box.w * b.box.h)
-    const primary = scored[0]
-    const extra = scored.slice(1).filter((s) => boxesFar(primary.box, s.box) && (s.n < primary.n || s.scene.fill < primary.scene.fill * 0.7))
-    if (extra.length) {
-      return { sources: [primary.mark], dests: extra.map((s) => s.mark), all }
-    }
-    return { sources: all, dests: [], all }
-  })()
-  paintRoleCache = { key, val: result }
-  return result
+    paintRoleCache = { key, val }
+    return val
+  } finally {
+    paintRoleBusy = false
+  }
 }
 
 function polysOfMarks(marks) {
   const polys = []
   for (const mark of marks || []) {
     if (!mark?.points?.length) continue
-    polys.push(mark.points.length >= 3 ? strokeToPolygon(mark.points) : mark.points)
+    polys.push(mark.points.length >= 3 ? paintHitPolygon(mark.points) : mark.points)
   }
   return polys
 }
@@ -730,12 +756,41 @@ export function lassoPolys() {
   const source = roles.sources.length ? roles.sources : roles.all
   const polys = polysOfMarks(source)
   if (polys.length) return polys
+  const symbols = getPaintMarks().filter((m) => m.role === 'symbol' && m.points?.length >= 3)
+  if (symbols.length) return polysOfMarks(symbols)
   const destIds = new Set(getSnapshot().spans.filter((s) => s.layoutRole === 'dest').map((s) => s.markId))
   for (const span of getSnapshot().spans) {
     if (span.layoutRole === 'dest' || destIds.has(span.markId)) continue
     if (span.poly?.length) polys.push(span.poly)
   }
   return polys
+}
+
+function spanPoly(span) {
+  const r = liveScreenRect(span)
+  if (!r || r.w < 2 || r.h < 2) return null
+  return [
+    { x: r.x, y: r.y },
+    { x: r.x + r.w, y: r.y },
+    { x: r.x + r.w, y: r.y + r.h },
+    { x: r.x, y: r.y + r.h },
+  ]
+}
+
+function editRegionBox() {
+  const fromDraw = iframeUnionBox(drawingPolys())
+  if (fromDraw && fromDraw.w >= 4 && fromDraw.h >= 4) return fromDraw
+  const symbols = polysOfMarks(getPaintMarks().filter((m) => m.role === 'symbol' && m.points?.length >= 3))
+  const fromSymbol = iframeUnionBox(symbols)
+  if (fromSymbol && fromSymbol.w >= 4 && fromSymbol.h >= 4) return fromSymbol
+  const fromSpans = iframeUnionBox(
+    getSnapshot()
+      .spans.filter((s) => s.webId && s.kind !== 'slot' && s.willEdit !== false)
+      .map(spanPoly)
+      .filter(Boolean),
+  )
+  if (fromSpans && fromSpans.w >= 4 && fromSpans.h >= 4) return fromSpans
+  return lastPaintBox
 }
 
 function drawingPolys() {
@@ -811,7 +866,7 @@ export function inferWebLayoutPairs() {
   const pairs = []
   const seen = new Set()
   for (const mark of roles.sources) {
-    const poly = mark.points.length >= 3 ? strokeToPolygon(mark.points) : mark.points
+    const poly = mark.points.length >= 3 ? paintHitPolygon(mark.points) : mark.points
     const hits = hitWebDoc(poly, { loose: true })
     for (const span of [...(hits.images?.found || []), ...(hits.texts?.found || [])]) {
       if (!span.webId || seen.has(span.webId)) continue
@@ -1135,7 +1190,9 @@ function sampleHitPoints(poly) {
   ]
   for (const [fx, fy] of grid) pts.push({ x: box.x + box.w * fx, y: box.y + box.h * fy })
   if (poly.length <= 24) pts.push(...poly)
-  return pts.filter((p) => pointInPolygon(p.x, p.y, poly))
+  const inside = pts.filter((p) => pointInPolygon(p.x, p.y, poly))
+  if (inside.length) return inside
+  return pts.slice(0, 9)
 }
 
 function spanFromEl(el, kind) {
@@ -1194,7 +1251,7 @@ function centerInPoly(el, poly) {
   return pointInPolygon(r.x + r.width / 2, r.y + r.height / 2, poly)
 }
 
-function considerEl(el, frameArea, seen, poly, { minCover = 0.12 } = {}) {
+function considerEl(el, frameArea, seen, poly, { minCover = 0.08 } = {}) {
   if (!el || el === el.ownerDocument?.documentElement || el === el.ownerDocument?.body) return
   if (SKIP.has(el.tagName) || isTombstone(el) || decoNode(el) || el.hasAttribute?.('data-markset-shaped-shadow')) return
   const target = promoteTarget(el)
@@ -1283,7 +1340,9 @@ export function hitWebDoc(polygon, { loose = false } = {}) {
   const poly = toIframePoly(polygon)
   const frameArea = Math.max(1, iframe.clientWidth * iframe.clientHeight)
   const seen = new Map()
-  const minCover = loose ? 0.1 : 0.16
+  const paintBox0 = aabb(poly)
+  const compact = paintBox0.w * paintBox0.h < 90 * 90 || Math.max(paintBox0.w, paintBox0.h) < 72
+  const minCover = compact ? 0.03 : loose ? 0.08 : 0.1
   for (const p of sampleHitPoints(poly)) {
     let stack = []
     try {
@@ -1292,13 +1351,13 @@ export function hitWebDoc(polygon, { loose = false } = {}) {
       const one = doc.elementFromPoint(p.x, p.y)
       if (one) stack = [one]
     }
-    for (const el of stack.slice(0, 8)) considerEl(el, frameArea, seen, poly, { minCover })
+    for (const el of stack.slice(0, compact ? 12 : 8)) considerEl(el, frameArea, seen, poly, { minCover })
   }
   if (!seen.size) scanMarked(poly, frameArea, seen, minCover)
-  if (loose && !seen.size) scanMarked(inflatePoly(poly, 8), frameArea, seen, 0.12)
-  const paintArea = Math.max(1, aabb(poly).w * aabb(poly).h)
-  const paintBox = aabb(poly)
-  let items = tightenHits([...seen.values()], poly, { loose })
+  if ((loose || compact) && !seen.size) scanMarked(inflatePoly(poly, compact ? 22 : 8), frameArea, seen, compact ? 0.04 : 0.12)
+  const paintArea = Math.max(1, paintBox0.w * paintBox0.h)
+  const paintBox = paintBox0
+  let items = tightenHits([...seen.values()], poly, { loose: loose || compact })
   items = items.flatMap((h) => {
     if (!containsOutsiders(h.el, paintBox)) return [h]
     return significantChildren(h.el)
@@ -1315,6 +1374,7 @@ export function hitWebDoc(polygon, { loose = false } = {}) {
   items = dropAncestors(items.filter((h) => {
     if (!h?.el || decoNode(h.el)) return false
     if (isGraphicEl(h.el)) return h.inPoly || h.cover >= 0.08 || h.overlap >= 0.12
+    if (compact) return h.inPoly || h.cover >= 0.04 || h.overlap >= 0.08 || h.area <= paintArea * 40
     return h.area <= paintArea * 10 || h.cover >= 0.4 || h.inPoly
   }))
   const logos = items.filter((h) => looksLikeLogo(h.el) || (isGraphicEl(h.el) && h.area < 220 * 90 && (h.inPoly || kidInPaint(h.el, paintBox))))
@@ -1327,8 +1387,9 @@ export function hitWebDoc(polygon, { loose = false } = {}) {
       return false
     })
   }
-  items.sort((a, b) => (b.inPoly - a.inPoly) || b.cover - a.cover || a.area - b.area)
-  items = items.slice(0, loose ? 3 : MAX_HITS)
+  if (compact) items.sort((a, b) => a.area - b.area || b.score - a.score)
+  else items.sort((a, b) => (b.inPoly - a.inPoly) || b.cover - a.cover || a.area - b.area)
+  items = items.slice(0, loose || compact ? 3 : MAX_HITS)
   const images = []
   const texts = []
   for (const hit of items) {
@@ -1344,8 +1405,10 @@ export function hitWebDoc(polygon, { loose = false } = {}) {
 export function refreshWebTargetsFromDrawing(polygons = []) {
   const found = []
   const seen = new Set()
+  const holes = subtractPolys()
   const add = (span) => {
     if (!span?.webId || seen.has(span.webId)) return
+    if (spanHitsHoles(span, holes)) return
     seen.add(span.webId)
     found.push(span)
   }
@@ -2141,7 +2204,9 @@ function centerInPaint(el, box) {
 
 function currentPaintPolys() {
   try {
-    return (drawingPolys() || []).map((p) => toIframePoly(p)).filter((p) => p?.length >= 3)
+    return polysOfMarks(paintLassoMarks())
+      .map((p) => toIframePoly(p))
+      .filter((p) => p?.length >= 3)
   } catch {
     return []
   }
@@ -2156,7 +2221,7 @@ function kidInPaint(el, box, polys = currentPaintPolys()) {
   if (!el) return false
   if (polys.length) {
     if (polys.some((poly) => centerInPoly(el, poly))) return true
-    return paintCover(el, polys) >= 0.46
+    return paintCover(el, polys) >= 0.32
   }
   if (!box) return false
   return centerInPaint(el, box) || overlapScore(el, box).coverEl >= 0.5
@@ -2219,8 +2284,8 @@ function staysInPaint(el, box) {
   if (containsOutsiders(el, box, polys)) return false
   if (polys.length) {
     const cover = paintCover(el, polys)
-    if (cover < 0.55) return false
-    if (!polys.some((poly) => centerInPoly(el, poly)) && cover < 0.78) return false
+    if (cover < 0.38) return false
+    if (!polys.some((poly) => centerInPoly(el, poly)) && cover < 0.62) return false
     return true
   }
   const hit = overlapScore(el, box)
@@ -2239,8 +2304,8 @@ function aimedLeaf(el, box) {
   if (containsOutsiders(el, box, polys)) return false
   if (polys.length) {
     const cover = paintCover(el, polys)
-    if (polys.some((poly) => centerInPoly(el, poly))) return cover >= 0.12
-    return cover >= 0.4 || (isGraphicEl(el) && cover >= 0.2)
+    if (polys.some((poly) => centerInPoly(el, poly))) return cover >= 0.08
+    return cover >= 0.28 || (isGraphicEl(el) && cover >= 0.16)
   }
   const hit = overlapScore(el, box)
   if (centerInPaint(el, box)) return hit.coverEl >= 0.18
@@ -2612,20 +2677,27 @@ function fallbackEls(box, kind) {
 
 export function resolveCircledEls(kind = '') {
   const polys = lassoPolys()
+  const holes = subtractPolys()
   const box = iframeUnionBox(polys)
   const found = []
   for (const poly of polys) {
     if (!poly?.length) continue
     const hits = hitWebDoc(poly, { loose: true })
     for (const s of [...(hits.images?.found || []), ...(hits.texts?.found || [])]) {
+      if (spanHitsHoles(s, holes)) continue
       const el = findByWebId(s.webId)
       if (el?.isConnected) found.push(el)
     }
   }
   if (box) found.push(...elsFromKnownSpans(box))
   found.push(...editTargetEls())
-  let els = uniqueEls(found).filter((el) => el?.isConnected && el !== el.ownerDocument?.body)
-  if (!els.length && box) els = fallbackEls(box, kind)
+  const notInHoles = (el) => {
+    if (!holes.length) return true
+    const r = toViewport(el.getBoundingClientRect())
+    return !r || !holes.some((poly) => boxHitsPolygon(r, poly))
+  }
+  let els = uniqueEls(found).filter((el) => el?.isConnected && el !== el.ownerDocument?.body && notInHoles(el))
+  if (!els.length && box) els = fallbackEls(box, kind).filter(notInHoles)
   const graphics = els.filter((el) => isGraphicEl(el) || isWidgetEl(el))
   const texts = els.filter((el) => isPrimarilyText(el))
   const k = String(kind)
@@ -3035,8 +3107,8 @@ export function executeCircledOp(op, { color = '', label = '', onBefore, dx = 0,
   const doc = getDoc()
   const iframe = frameEl()
   if (!doc?.body || !iframe) return { ok: false, reason: '没有导入的网页' }
-  const box = iframeUnionBox(drawingPolys())
-  if (!box || box.w < 6 || box.h < 6) return { ok: false, reason: '没有可用的圈。请再圈一次要改的地方' }
+  const box = editRegionBox()
+  if (!box || box.w < 4 || box.h < 4) return { ok: false, reason: '没有可用的圈。请再圈一次要改的地方' }
   stampIds(doc)
   const frameArea = Math.max(1, iframe.clientWidth * iframe.clientHeight)
   const hits = scanOverlapEls(box)

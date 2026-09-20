@@ -1,4 +1,4 @@
-import { aabb, dist, looksLikeXStroke, pathLength, segmentsIntersect } from './geometry.js'
+import { aabb, classifyStrokeKind, dist, looksLikeEnclosingStroke, looksLikeXStroke, pathLength, segmentsIntersect } from './geometry.js'
 
 const MAIN = ['改', '删', '色', '减', '添', '加']
 const EXTRA = ['换', '短', '插', '叉', '润']
@@ -195,8 +195,12 @@ export function isLikelyInk(rawPoints, { hasSelection, hasNewContent }) {
   if (!rawPoints?.length) return false
   const box = aabb(rawPoints)
   if (!(box.w > 4 && box.h > 4)) return false
+  const kind = classifyStrokeKind(rawPoints, { hasSelection: Boolean(hasSelection) })
+  if (kind.kind === 'symbol') return true
+  if (kind.kind === 'select' || kind.kind === 'symbol-target') return false
   const peri = 2 * (box.w + box.h)
   const len = pathLength(rawPoints)
+  if (looksLikeEnclosingStroke(rawPoints)) return false
   const closed = dist(rawPoints[0], rawPoints[rawPoints.length - 1]) < Math.max(box.w, box.h) * 0.32
   if (closed && box.w > 36 && box.h > 28 && len < peri * 2.5) return false
   const prev = inkBox()
