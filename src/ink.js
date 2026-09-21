@@ -1,4 +1,5 @@
 import { aabb, classifyStrokeKind, dist, looksLikeEnclosingStroke, looksLikeXStroke, pathLength, segmentsIntersect } from './geometry.js'
+import { listMarkFingerprints } from './symbol-habits.js'
 
 const MAIN = ['改', '删', '色', '减', '添', '加']
 const EXTRA = ['换', '短', '插', '叉', '润']
@@ -191,12 +192,16 @@ export function finishInkNow() {
   finishWriting()
 }
 
-export function isLikelyInk(rawPoints, { hasSelection, hasNewContent }) {
+export function isLikelyInk(rawPoints, { hasSelection, hasNewContent, selBox = null, knownFingerprints } = {}) {
   if (!rawPoints?.length) return false
   const box = aabb(rawPoints)
   if (!(box.w > 4 && box.h > 4)) return false
-  const kind = classifyStrokeKind(rawPoints, { hasSelection: Boolean(hasSelection) })
-  if (kind.kind === 'symbol') return true
+  const kind = classifyStrokeKind(rawPoints, {
+    hasSelection: Boolean(hasSelection),
+    selBox,
+    knownFingerprints: knownFingerprints || listMarkFingerprints(),
+  })
+  if (kind.kind === 'symbol' || kind.kind === 'ink') return true
   if (kind.kind === 'select' || kind.kind === 'symbol-target') return false
   const peri = 2 * (box.w + box.h)
   const len = pathLength(rawPoints)

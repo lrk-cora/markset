@@ -4,7 +4,7 @@ import { COLOR_TERMS } from './forbidden.js'
 import { COLORS, COLOR_SCHEMES } from './colors.js'
 import { parseCommand } from './plan-local.js'
 import { guessAnnotationIntent } from './vision-tasks.js'
-import { aabb, classifyStrokeKind, convexHull, dist, intersectBoxes, looksLikeDrawnLine, looksLikeEnclosingStroke, pathLength, strokeToPolygon } from './geometry.js'
+import { aabb, classifyStrokeKind, classifyStrokeShape, convexHull, dist, intersectBoxes, looksLikeDrawnLine, looksLikeEnclosingStroke, markTargetPolygon, paintHitPolygon, pathLength, strokeFingerprint, strokeToPolygon } from './geometry.js'
 import { imageSpanFromNaturalBox } from './hit-test.js'
 import { collectOutsideEdits } from './scope.js'
 import {
@@ -37,8 +37,10 @@ import {
   insertWebText,
   applyGeneratedWebImage,
   circledImageSeed,
+  circledPaintIsPhoto,
   insertAroundCopy,
   isWebDocActive,
+  hitWebDoc,
   lassoPolys,
   listWebEdits,
   popLastWebEdit,
@@ -47,13 +49,14 @@ import {
   refreshWebTargetsFromDrawing,
   restoreWebEdit,
   rewriteCircledText,
+  annotateCircledText,
   peekShadowLabel,
 } from './web-doc.js'
-import { clearPaintMarks, getPaintMarks, setAddMode, setLassoMode, setSubtractMode } from './overlay.js'
+import { clearPaintMarks, getPaintMarks, lastPaintPoints, setAddMode, setLassoMode, setLastPaintRole, setSubtractMode } from './overlay.js'
 import { redoChange, restoreChange } from './changes.js'
 import { clearInk, readInkText } from './ink.js'
-import { captureInsertScene, classifyDrawnGesture, currentSymbolShape, drawnStampDataUrl, drawnStampScreenBox, looksLikeDrawnPattern } from './capture.js'
-import { forgetSymbolHabit, habitForShape, habitGuess, rememberSymbolHabit, shapeTitle } from './symbol-habits.js'
+import { captureInsertScene, classifyDrawnGesture, currentSymbolShape, drawnStampDataUrl, drawnStampScreenBox, looksLikeDrawnPattern, strokeKindOptions } from './capture.js'
+import { forgetSymbolHabit, habitForShape, habitForStroke, habitGuess, rememberSymbolHabit, shapeFromMarkName, shapeTitle } from './symbol-habits.js'
 import {
   applyPageScheme,
   assignSchemeToModules,
@@ -275,12 +278,14 @@ let ui = {
   hintUnderOn: true,
   hintOverOn: true,
   lastPaint: null,
+  lastStrokeKind: null,
   hideCard: false,
   guesses: [],
   guessing: false,
   judged: false,
   seenGuessLabels: [],
   fromModel: false,
+  markName: '',
 }
 
 let guessToken = 0
@@ -392,6 +397,7 @@ export function startReview() {
   ui.noteConfident = false
   ui.typedText = ''
   ui.lastPaint = null
+  ui.lastStrokeKind = null
   clearInk()
   clearPaintMarks()
   replaceSpans([])
@@ -407,6 +413,7 @@ export function idleCard({ accept = false } = {}) {
   ui.noteConfident = false
   ui.typedText = ''
   ui.lastPaint = null
+  ui.lastStrokeKind = null
   if (accept) ui.hideCard = true
   clearSchemeUi()
   clearInk()
@@ -414,8 +421,9 @@ export function idleCard({ accept = false } = {}) {
   emit()
 }
 
-export function setPaintGesture(pts, { silent = false } = {}) {
+export function setPaintGesture(pts, { silent = false, kind = null } = {}) {
   ui.lastPaint = pts?.length ? pts.map((p) => ({ x: p.x, y: p.y })) : null
+  if (kind) ui.lastStrokeKind = kind
   if (!silent) emit()
 }
 
@@ -553,7 +561,9 @@ function parseNote(text) {
   if (/放大|变大|大一点|放大一点|更大/.test(t)) return 'scale-up'
   if (/底色|背景色|改背景|背景改/.test(t)) return 'color-bg'
   if (/字色|文字颜色|字体颜色|只改字/.test(t)) return 'color-text'
-  if (/只改(图|logo|图标).*色|图.*改成/.test(t) && /色/.test(t)) return 'color-image'
+  if (/封面|书封/.test(t)) return 'generate-image'
+  if (/(这张|那张)?(图|配图|插画|海报|照片|封面).{0,12}(改成|换成|改色|变色|改成.*色)/.test(t)) return 'generate-image'
+  if (/只改(图|logo|图标).*色|图.*改成/.test(t) && /色/.test(t)) return 'generate-image'
   if (/往左|向左|左移|向左挪/.test(t)) return 'nudge-left'
   if (/往右|向右|右移|向右挪/.test(t)) return 'nudge-right'
   if (/往上|向上|上移|往上挪/.test(t)) return 'nudge-up'
@@ -589,8 +599,9 @@ function parseNote(text) {
 function looksLikeImageAsk(text) {
   const t = String(text || '')
   if (!t) return false
-  if (/色|改字|文字颜色/.test(t) && !/logo|图/.test(t)) return false
-  return /logo|图标|图片|插画|配图|插图|徽章|头像|海报/.test(t) || /(加|插|放|贴|来).{0,8}图/.test(t)
+  if (/文字颜色|改字/.test(t) && !/封面|图/.test(t)) return false
+  if (/色/.test(t) && !/logo|图|封面|书封|配图|插画|照片|海报/.test(t)) return false
+  return /logo|图标|图片|插画|配图|插图|徽章|头像|海报|封面|书封/.test(t) || /(加|插|放|贴|来).{0,8}图/.test(t)
 }
 
 function extractLiteralInsert(text) {
@@ -685,6 +696,7 @@ async function writeInsertCopy(instruction) {
     {
       pageContext: ctx.pageContext,
       imageDataUrls: ctx.images,
+      mode: 'insert',
     },
   )
   return String(data?.text || '')
@@ -705,9 +717,8 @@ export function applyWrittenNote(text, { confident = false, note, silent = false
 export function shouldTreatStrokeAsInk(pts) {
   if (ui.step !== 'propose') return false
   const spans = getSnapshot().spans
-  const hasSelection = spans.some((s) => s.kind === 'text' || s.kind === 'image' || s.kind === 'slot')
-  const kind = classifyStrokeKind(pts, { hasSelection })
-  if (kind.kind === 'symbol') return true
+  const kind = classifyStrokeKind(pts, strokeKindOptions())
+  if (kind.kind === 'symbol' || kind.kind === 'ink') return true
   if (kind.kind === 'select' || kind.kind === 'symbol-target') return false
   if (looksLikeEnclosingStroke(pts)) return false
   if (layoutSourceWaiting(spans) || looksLikeLayout(spans) || hasLayoutWork(spans)) return false
@@ -826,7 +837,7 @@ function mapNoteToIntent(note, label) {
   if (n === 'shadow' || n === 'reflect') return n
   if (n === 'scale-down' || n === 'scale-up') return n
   if (n.startsWith('nudge-') || n === 'move-nudge' || n === 'move-layout') return n
-  if (n === 'frame' || n === 'bold' || n === 'highlight' || n === 'underline') return n
+  if (n === 'frame' || n === 'bold' || n === 'highlight' || n === 'underline' || n === 'wavy' || n === 'strike') return n
   if (n === 'indent' || n === 'move') return n === 'move' ? 'move-layout' : 'indent'
   if (n === 'cut') return 'shorter'
   if (n === 'change' || n === 'polish' || n === 'longer' || n === 'shorter' || n === 'spoken' || n === 'formal') {
@@ -928,6 +939,8 @@ const ID_ALIASES = {
   加图: 'insert-image',
   生成图: 'generate-image',
   换图: 'generate-image',
+  换封面: 'generate-image',
+  改封面: 'generate-image',
   生成文字: 'generate-text',
   写文案: 'generate-text',
 }
@@ -991,7 +1004,13 @@ function normalizeGuessItem(item) {
   if (id === 'add') id = sceneIsBlank() ? 'insert-text' : 'frame'
   if (id === 'insert') id = 'insert-text'
   if (!label && !id) return null
-  return { id, label: label || localLabel(id) || '按这个改', note, command }
+  return {
+    id,
+    label: label || localLabel(id) || '按这个改',
+    note,
+    command,
+    shape: String(item.shape || item.mark || '').trim(),
+  }
 }
 
 function ptsToPoly(pts) {
@@ -1066,7 +1085,7 @@ function relabelGuesses(list, scene, verb) {
   })
   const fam = verbFamily(verb) || verbFamily(mapped[0]?.id) || verbFamily(mapped[0]?.note)
   const prefer = []
-  if (looksLikeStampGuess(verb, ui.noteText, mapped)) {
+  if (looksLikeStampGuess(verb, ui.noteText, mapped) && !(circledPaintIsPhoto() && verb !== 'stamp')) {
     const gesture = classifyDrawnGesture()
     prefer.push({ id: 'stamp', label: gesture.label || '加上画出的图案', note: 'stamp', command: '' })
   }
@@ -1082,12 +1101,21 @@ function relabelGuesses(list, scene, verb) {
       command: '',
     })
   }
-  if (fam === 'color' || String(verb).startsWith('color') || verb === 'scheme') {
-    const mods = collectSchemeModules(guessRuntime.editor, { pageWide: false }).filter((m) => m.kind !== 'paper')
-    if (verb === 'scheme' || mods.length >= 2) {
-      prefer.push({ id: 'scheme', label: '给圈中几处套一套颜色风格', note: 'scheme', command: '' })
+  if (fam === 'color' || String(verb).startsWith('color') || verb === 'scheme' || verb === 'deco' || verb === 'unify' || verb === 'pattern') {
+    if (scene?.kind === 'image' || (circledPaintIsPhoto() && scene?.kind !== 'text')) {
+      prefer.push({
+        id: 'generate-image',
+        label: '按要求重新生成这张封面/配图',
+        note: 'generate-image',
+        command: '',
+      })
+    } else {
+      const mods = collectSchemeModules(guessRuntime.editor, { pageWide: false }).filter((m) => m.kind !== 'paper')
+      if (verb === 'scheme' || mods.length >= 2) {
+        prefer.push({ id: 'scheme', label: '给圈中几处套一套颜色风格', note: 'scheme', command: '' })
+      }
+      prefer.push({ id: verb.startsWith('color-') ? verb : 'color', label: `改${target}的颜色`, note: verb.startsWith('color-') ? verb : 'color', command: '' })
     }
-    prefer.push({ id: verb.startsWith('color-') ? verb : 'color', label: `改${target}的颜色`, note: verb.startsWith('color-') ? verb : 'color', command: '' })
   }
   if (verb === 'generate-image') {
     prefer.push({
@@ -1128,16 +1156,22 @@ function looksLikeStampGuess(verb, written, list = []) {
 function habitOption() {
   const mark = currentSymbolShape()
   if (!mark.shape) return null
-  return habitGuess(habitForShape(mark.shape), mark.shape)
+  const pts = lastPaintPoints() || ui.lastPaint
+  return habitGuess(habitForShape(mark.shape) || habitForStroke(pts), mark.shape)
 }
 
 function rememberActiveSymbol(guess, id, label, command, written) {
   if (guess?.habit || !id || id === 'stamp') return ''
   const mark = currentSymbolShape()
-  if (!mark.shape) return ''
-  const prev = habitForShape(mark.shape)
+  const named = shapeFromMarkName(guess?.shape || guess?.mark || ui.markName) || mark.shape
+  if (!named && !mark.shape) return ''
+  const shape = named || mark.shape
+  const pts = lastPaintPoints() || ui.lastPaint
+  const fp = mark.fingerprint || (String(shape).startsWith('mark:') ? shape.slice(5) : strokeFingerprint(pts))
+  const prev = habitForShape(shape) || habitForShape(mark.shape) || habitForStroke(pts)
   const saved = rememberSymbolHabit({
-    shape: mark.shape,
+    shape,
+    fingerprint: fp,
     intent: id,
     label: (localLabel(id) !== '这项' ? localLabel(id) : '') || label || id,
     note: guess?.note || id,
@@ -1145,8 +1179,33 @@ function rememberActiveSymbol(guess, id, label, command, written) {
     ask: written,
   })
   if (!saved) return ''
-  if (!prev || prev.intent !== id) return `已记住：${shapeTitle(mark.shape)} = ${saved.label}`
+  if (!prev || prev.intent !== id || prev.shape !== shape) return `已记住：${shapeTitle(shape, mark.label || ui.markName)} = ${saved.label}`
   return ''
+}
+
+function reinterpretLastStroke(asMark, editor, deps) {
+  const pts = lastPaintPoints() || ui.lastPaint
+  if (!pts?.length) {
+    deps.toast('没有刚画的笔迹可改判')
+    return
+  }
+  setLastPaintRole(asMark ? 'symbol' : 'select')
+  const named = classifyStrokeShape(pts)
+  const poly = asMark ? markTargetPolygon(pts, named) : paintHitPolygon(pts)
+  const onlyStroke = getPaintMarks().filter((m) => m.role !== 'subtract').length <= 1
+  if (isWebDocActive() && (asMark ? onlyStroke : true)) {
+    const hits = hitWebDoc(poly, { loose: true })
+    const spans = [...(hits.images?.found || []), ...(hits.texts?.found || [])]
+    if (spans.length) replaceSpans(spans)
+  }
+  ui.lastStrokeKind = {
+    kind: asMark ? (onlyStroke ? 'symbol-target' : 'symbol') : 'select',
+    shape: named || (asMark ? `mark:${strokeFingerprint(pts)}` : ''),
+    label: asMark ? shapeTitle(named, '自定义标记') : '',
+    fingerprint: strokeFingerprint(pts),
+  }
+  emit()
+  deps.toast(asMark ? '已按标记理解这笔，不用再画一遍。可点开始判断' : '已按框选理解这笔。可点开始判断')
 }
 
 function reconcileGuesses(vl, local, verb, scene, { more = false } = {}) {
@@ -1241,6 +1300,7 @@ export function requestIntentGuesses(editor, { more = false } = {}) {
     ui.judged = false
     ui.seenGuessLabels = []
     ui.fromModel = false
+    ui.markName = ''
   }
   emit()
   runIntentGuesses(editor, token, { more })
@@ -1263,7 +1323,7 @@ async function runIntentGuesses(editor, token, { more = false } = {}) {
       more,
       exclude: [...seen],
       handwriting: typed,
-      sceneText: [scene.text, gesture.hint].filter(Boolean).join('\n'),
+      sceneText: scene.text,
     })
     if (token !== guessToken) return
     const localInk = hit?.fromModel ? { text: '', confident: false } : readInkText()
@@ -1278,8 +1338,14 @@ async function runIntentGuesses(editor, token, { more = false } = {}) {
     ) {
       written = ''
     }
+    ui.markName = String(hit?.mark || hit?.guesses?.[0]?.shape || '').trim()
     const parsed = parseNote(written)
-    const verb = (parsed && parsed !== 'custom' ? parsed : '') || gesture.kind || hit?.note || ui.note
+    const verb =
+      (parsed && parsed !== 'custom' ? parsed : '') ||
+      hit?.note ||
+      hit?.intent ||
+      (gesture.habit ? gesture.kind : '') ||
+      ui.note
     if (written) applyWrittenNote(written, { confident: Boolean(hit?.fromModel || localInk.confident), note: verb, silent: true })
     local = localGuesses(getSnapshot().spans, editor).filter((g) => !seen.has(g.label))
     let next = (hit?.guesses || []).map(normalizeGuessItem).filter(Boolean)
@@ -1315,9 +1381,11 @@ async function runIntentGuesses(editor, token, { more = false } = {}) {
         const typed = String(ui.typedText || '').trim()
         const heard = typed
           ? `已按输入的「${typed}」判断`
-          : ui.noteText
-            ? `已认出「${ui.noteText}」`
-            : '已按圈和笔迹判断'
+          : ui.markName
+            ? `已认出标记「${ui.markName}」`
+            : ui.noteText
+              ? `已认出「${ui.noteText}」`
+              : '已按圈和笔迹判断'
         guessRuntime.deps?.toast?.(`${heard}，并给出操作。点一项执行`)
       } else {
         guessRuntime.deps?.toast?.(msg)
@@ -1351,12 +1419,58 @@ function imagePromptText() {
   return String(getSnapshot().commandText || '').trim()
 }
 
-function runGenerateImage(editor, deps) {
+function shouldGenerateForCircledPhoto(id, written, label) {
+  if (!isWebDocActive() || !circledPaintIsPhoto()) return false
+  const op = String(id || '')
+  if (
+    op === 'color-text' ||
+    op === 'generate-image' ||
+    op === 'insert-image' ||
+    op === 'insert-text' ||
+    op === 'generate-text' ||
+    op === 'stamp' ||
+    op === 'shadow' ||
+    op === 'reflect' ||
+    op === 'move-layout' ||
+    op === 'frame' ||
+    op === 'circle' ||
+    op.startsWith('delete') ||
+    op.startsWith('nudge') ||
+    op.startsWith('scale')
+  ) {
+    return false
+  }
+  if (LOCAL_ANNO.has(op)) return false
+  const blob = `${written || ''}${label || ''}`
+  if (/字色|文字颜色|只改字|润色|标题|书名/.test(blob) && !/封面|配图|插画|这张图/.test(blob)) return false
+  return (
+    op === 'color' ||
+    op === 'color-image' ||
+    op === 'color-bg' ||
+    op === 'scheme' ||
+    op === 'deco' ||
+    op === 'unify' ||
+    op === 'pattern' ||
+    op === 'custom' ||
+    /色|封面|配色|风格|换成|改成/.test(blob)
+  )
+}
+
+function photoGeneratePrompt(written, colorName) {
+  const ask = String(written || imagePromptText() || '').trim()
+  const color = String(colorName || ui.color || '').trim()
+  const useful = ask && !/^(改这一处颜色|改颜色|只改图的颜色|字和图一起改色|改成同一颜色|改圈中内容的颜色|套一套颜色风格|给圈中几处套一套颜色风格)$/.test(ask)
+  if (useful) return /铺满|封面|不要叠/.test(ask) ? ask : `${ask}。铺满原来的封面/配图位置，不要叠一本小书`
+  if (color) return `把这张图改成${color}的效果，铺满原来的封面/配图位置，不要叠一本小书`
+  return '按圈中封面重新生成一张铺满原位置的图，不要叠一本小书'
+}
+
+function runGenerateImage(editor, deps, promptOverride) {
   if (!isWebDocActive()) {
     deps.toast('生成换图目前用于导入的网页')
     return
   }
-  const prompt = imagePromptText()
+  const prompt = String(promptOverride || imagePromptText() || '').trim()
   if (!prompt) {
     ui.intent = 'generate-image'
     ui.step = 'values'
@@ -1373,7 +1487,7 @@ function runGenerateImage(editor, deps) {
         `用户要求：${prompt}`,
         seed.scene || ctx.around || '',
         seed.imageDataUrl
-          ? '请在原图构图和用途的基础上按用户要求改，生成适合该网页位置、并能和周围页面放在一起的新图。'
+          ? '请在原图构图和用途的基础上按用户要求改，生成适合该网页位置、并能和周围页面放在一起的新图。若原图是封面/配图，输出铺满该位置的画面本身，不要生成一本小书叠在旧图上，不要白边衬底。'
           : '请直接生成适合该网页空白位置、并能和周围页面放在一起的新图。',
       ]
         .filter(Boolean)
@@ -1521,8 +1635,10 @@ export function applyGuess(guess, editor, deps) {
       deps.toast(result.message)
       return
     }
-    if (id === 'generate-image') {
-      runGenerateImage(editor, deps)
+    if (id === 'generate-image' || shouldGenerateForCircledPhoto(id, written, label)) {
+      const namedColor = parsed.color || ui.color || colorFromWriting(written) || colorFromWriting(label) || colorFromWriting(command)
+      if (namedColor) ui.color = namedColor
+      runGenerateImage(editor, deps, id === 'generate-image' ? imagePromptText() : photoGeneratePrompt(written || command, namedColor) || imagePromptText())
       return
     }
     if (id === 'generate-text') {
@@ -1547,7 +1663,7 @@ export function applyGuess(guess, editor, deps) {
       ui.intent = id
       applyCommandText()
       const instruction = String(getSnapshot().commandText || written || label || '').trim()
-      deps.toast('正在改写圈中文字…')
+      deps.toast('正在按圈选和要求改写文字…')
       rewriteCircledText(instruction, {
         onBefore: (lab) => rememberLocal(editor, lab),
         kind: id,
@@ -1566,6 +1682,36 @@ export function applyGuess(guess, editor, deps) {
         .catch((err) => {
           const gated = err?.code === 'client-gate' || err?.code === 'no_client_gate' || err?.code === 'calls_disabled'
           deps.toast(gated ? '服务器禁止调用：把 .env 里 MARKSET_ALLOW_MODEL_CALLS 改为 1 并重启' : err?.message || '改写失败')
+          emit()
+        })
+      return
+    }
+    if (id === 'highlight' || id === 'bold' || id === 'underline' || id === 'wavy' || id === 'strike') {
+      ui.intent = id
+      applyCommandText()
+      const instruction = String(getSnapshot().commandText || written || label || '').trim()
+      const markName = String(guess.shape || ui.markName || '').trim()
+      const action = id === 'bold' ? '加粗' : id === 'underline' ? '下划线' : id === 'wavy' ? '波浪线' : id === 'strike' ? '删除线' : '高亮'
+      deps.toast(`正在把要求、标记和截图交给模型，只给对应的词加${action}…`)
+      annotateCircledText(instruction, {
+        onBefore: (lab) => rememberLocal(editor, lab),
+        kind: id,
+        markName,
+      })
+        .then((result) => {
+          if (!result.ok) {
+            deps.toast(result.reason || '没有标到圈中的词')
+            emit()
+            return
+          }
+          clearInk()
+          startReview()
+          emit()
+          deps.toast(result.message)
+        })
+        .catch((err) => {
+          const gated = err?.code === 'client-gate' || err?.code === 'no_client_gate' || err?.code === 'calls_disabled'
+          deps.toast(gated ? '服务器禁止调用：把 .env 里 MARKSET_ALLOW_MODEL_CALLS 改为 1 并重启' : err?.message || '标注失败')
           emit()
         })
       return
@@ -1647,6 +1793,10 @@ export function applyGuess(guess, editor, deps) {
     return
   }
   if (isWebDocActive() && (id === 'deco' || /风格|配色/.test(`${written}${label}`))) {
+    if (circledPaintIsPhoto()) {
+      runGenerateImage(editor, deps, photoGeneratePrompt(written, parsed.color || ui.color))
+      return
+    }
     applyDefaultScheme(editor, deps, { pageWide: /整页|整套|全部/.test(`${written}${label}`) })
     return
   }
@@ -1793,7 +1943,7 @@ function addDecorChoices(add, { texts, images, slots, empty }) {
 
 function addChangeChoices(add, { texts, images }) {
   const name = hasNameHint(texts)
-  const color = hasColorHint(texts) || images.length
+  const color = hasColorHint(texts)
   const pattern = images.length
   if (name && color && pattern) {
     add('name', '只改名字')
@@ -1999,6 +2149,11 @@ function proposeOptions(spans, editor) {
   }
 
   if (note === 'color') {
+    if (images.length && !texts.length) {
+      add('generate-image', '按颜色/外观要求重新生成这张图')
+      add('color', '还是用滤镜改色')
+      return bits
+    }
     if (texts.length + images.length >= 2) add('scheme', '用配色套到这几处')
     add('color', texts.length + images.length > 1 ? '改成同一颜色' : '改这一处颜色')
     if (texts.length) add('highlight', '加上高亮')
@@ -2035,7 +2190,7 @@ function proposeOptions(spans, editor) {
       add('longer', '扩写圈中文字')
       add('shorter', '写短一点')
     }
-    if (images.length) add('color', '改颜色')
+    if (images.length) add('generate-image', '按要求生成一张图换上')
     add('delete-text', texts.length && images.length ? '删掉圈里的' : images.length ? '删掉这块图' : '删掉这些字')
     return bits
   }
@@ -2085,10 +2240,9 @@ function proposeOptions(spans, editor) {
     add('polish', '润色这段')
     add('scale-down', '缩小这些字')
   }
-  if (images.length && !texts.length) add('color', '改颜色')
+  if (images.length && !texts.length) add('generate-image', '按要求生成一张图换上')
   if (images.length) {
     add('generate-image', '按要求生成一张图换上')
-    add('color-image', '只改图的颜色')
     add('scale-down', '缩小圈中这块')
     add('scale-up', '放大圈中这块')
     add('nudge-right', '往右挪一点')
@@ -2112,9 +2266,12 @@ function needsColor(intent) {
 function openColorPalette(deps, intent = 'color') {
   ui.intent = intent
   ui.color = ''
+  ui.photoRecolor = isWebDocActive() && intent !== 'color-text' && circledPaintIsPhoto()
   ui.step = 'values'
   emit()
-  deps?.toast?.('点色板或打开调色盘选颜色，选完会马上改圈中的内容')
+  deps?.toast?.(
+    ui.photoRecolor ? '这是图片/封面：选颜色后会调用生图模型重画，不会只改滤镜' : '点色板或打开调色盘选颜色，选完会马上改圈中的内容',
+  )
 }
 
 function openSchemeBars(editor, deps, { pageWide = false, silent = false } = {}) {
@@ -2138,6 +2295,9 @@ function openSchemeBars(editor, deps, { pageWide = false, silent = false } = {})
 
 function remapWebGuessId(id, written, label) {
   const blob = `${written || ''}${label || ''}`
+  if (circledPaintIsPhoto() && (id === 'scheme' || id === 'deco' || id === 'unify' || id === 'pattern' || /风格|配色/.test(blob))) {
+    return 'generate-image'
+  }
   if (id === 'color' || String(id).startsWith('color-')) return id
   if (/边框|加框|套个框/.test(label || '') || id === 'frame' || id === 'box' || id === 'border') return 'frame'
   if (id === 'scheme' || id === 'deco' || id === 'unify' || id === 'pattern' || /风格|配色/.test(blob)) return 'scheme'
@@ -2145,6 +2305,10 @@ function remapWebGuessId(id, written, label) {
 }
 
 function applyDefaultScheme(editor, deps, { pageWide = false } = {}) {
+  if (circledPaintIsPhoto()) {
+    runGenerateImage(editor, deps, photoGeneratePrompt(ui.typedText || ui.noteText, ui.color))
+    return
+  }
   openSchemeBars(editor, deps, { pageWide, silent: true })
   const sch = COLOR_SCHEMES[0]
   ui.scheme = sch.id
@@ -3095,6 +3259,11 @@ function runPickedColor(editor, deps, name) {
   ui.color = name
   applyCommandText()
   if (isWebDocActive()) {
+    if ((ui.photoRecolor || (ui.intent !== 'color-text' && circledPaintIsPhoto())) && ui.intent !== 'color-text') {
+      ui.photoRecolor = false
+      runGenerateImage(editor, deps, photoGeneratePrompt('', name))
+      return
+    }
     const op = ui.intent === 'color-bg' || ui.intent === 'color-text' || ui.intent === 'color-image' ? ui.intent : 'color'
     const result = executeCircledOp(op, {
       color: name,
@@ -3192,15 +3361,16 @@ function fillPropose(bar, spans, editor, deps) {
   if (ui.guessing) hint.textContent = typed ? '正在根据圈画和输入的要求判断…' : '正在根据你画的和写下的判断意图…'
   else if (layoutSourceWaiting(spans) && !looksLikeLayout(spans) && !inferWebLayoutPairs().length) hint.textContent = '再圈它要放到的空白位置。后一圈会当成落点，不会当成新选区'
   else if (looksLikeLayout(spans) || inferWebLayoutPairs().length) hint.textContent = '已认出模块和落点。点「移到画出的位置」'
-  else if (habitNow) hint.textContent = `认出${markNow.label}。可一键按习惯「${habitNow.label}」，或改输入后重新判断。`
-  else if (markNow.shape && !ui.judged) hint.textContent = `画出了${markNow.label}。输入它代表什么并执行一次，下次就会记住。`
+  else if (habitNow) hint.textContent = `认出${shapeTitle(markNow.shape, markNow.label)}。可一键按习惯「${habitNow.label}」，或改输入后重新判断。`
+  else if (ui.judged && ui.markName) hint.textContent = `模型认出这是${ui.markName}。点一项执行；若标记叫错可再判断一次。`
+  else if (markNow.shape && !ui.judged) hint.textContent = `画出了${shapeTitle(markNow.shape, markNow.label)}。输入它代表什么并执行一次，下次就会记住。`
   else if (ui.judged && isWebDocActive() && describePaintScene().blank && !inferWebLayoutPairs().length) {
     hint.textContent = typed
       ? `空白处已按「${typed}」判断。可选 AI 生成，或自己写 / 从本地插入。`
       : '圈的是空白。可选 AI 生成文字或图片，也可以自己写或从本地插入。'
   }
   else if (ui.judged) hint.textContent = typed ? `已按「${typed}」判断。点一项执行，或改输入后重新判断。` : '点一项就执行。不满意可再要几条。'
-  else hint.textContent = '大圈是选区，五角星/叉/勾等小符号是标记。圈完可加选或减选，也可直接在内容上画符号。'
+  else hint.textContent = '大圈是选区；星、叉、勾、横线或你自己的符号是标记。判错可点「按标记理解」或「按框选理解」，不用重画。'
   bar.append(hint)
 
   const input = document.createElement('input')
@@ -3252,10 +3422,16 @@ function fillPropose(bar, spans, editor, deps) {
         requestIntentGuesses(editor, { more: false })
       }),
     )
+    if (lastPaintPoints().length >= 4 || ui.lastPaint?.length >= 4) {
+      tools.append(
+        btn('按标记理解', { pointer: true }, () => reinterpretLastStroke(true, editor, deps)),
+        btn('按框选理解', { pointer: true }, () => reinterpretLastStroke(false, editor, deps)),
+      )
+    }
   }
   if (habitNow && !ui.guessing) {
     tools.append(
-      btn(`一键：${markNow.label} = ${habitNow.label}`, { pointer: true }, () => {
+      btn(`一键：${shapeTitle(markNow.shape, markNow.label)} = ${habitNow.label}`, { pointer: true }, () => {
         applyGuess(habitGuess(habitNow, markNow.shape), editor, deps)
       }),
       btn('忘掉这个习惯', { pointer: true }, () => {

@@ -156,23 +156,41 @@ export function getPaintMarks() {
   return paintMarks.map((m) => ({
     color: m.color,
     role: m.role || 'select',
+    shape: m.shape || '',
+    fingerprint: m.fingerprint || '',
     points: m.points.map((p) => ({ x: p.x, y: p.y })),
   }))
 }
 
 export function hasPaintSelection() {
-  return paintMarks.some((m) => m.role !== 'subtract' && m.points?.length >= 3)
+  return paintMarks.some((m) => m.role !== 'subtract' && m.role !== 'symbol' && m.points?.length >= 3)
 }
 
-export function keepPaintMark(points, { append = false, color = '#3c6fd4', role = 'select' } = {}) {
+export function keepPaintMark(points, { append = false, color = '#3c6fd4', role = 'select', shape = '', fingerprint = '' } = {}) {
   if (!points?.length) return
   if (!append) paintMarks = []
   paintMarks.push({
     points: points.map((p) => ({ x: p.x, y: p.y })),
     color,
     role: role || 'select',
+    shape: shape || '',
+    fingerprint: fingerprint || '',
   })
   renderPaintMarks()
+}
+
+export function setLastPaintRole(role) {
+  if (!paintMarks.length) return
+  paintMarks[paintMarks.length - 1] = {
+    ...paintMarks[paintMarks.length - 1],
+    role: role || paintMarks[paintMarks.length - 1].role,
+  }
+  renderPaintMarks()
+}
+
+export function lastPaintPoints() {
+  const m = paintMarks[paintMarks.length - 1]
+  return m?.points?.map((p) => ({ x: p.x, y: p.y })) || []
 }
 
 export function clearPaintMarks() {
@@ -190,6 +208,7 @@ function renderPaintMarks() {
   if (!svg) return
   svg.replaceChildren()
   for (const mark of paintMarks) {
+    if (mark.role === 'symbol') continue
     if (mark.points.length < 3) continue
     const poly = paintHitPolygon(mark.points, 8)
     if (poly.length < 3) continue
@@ -309,7 +328,13 @@ export function bindLasso({ onBegin, onMove, onFinish, onCancel }) {
       if (role === 'add' && !prior) role = 'select'
       const append =
         Boolean(persist?.append) || role === 'add' || role === 'subtract' || isLayoutPen()
-      keepPaintMark(points, { append, color, role })
+      keepPaintMark(points, {
+        append,
+        color,
+        role,
+        shape: persist?.shape || '',
+        fingerprint: persist?.fingerprint || '',
+      })
     }
     clearSvg()
   }

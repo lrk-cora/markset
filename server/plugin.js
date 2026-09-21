@@ -198,34 +198,76 @@ async function rewrite(env, payload) {
   const instruction = String(payload.instruction || '').trim()
   const text = String(payload.text || '')
   const pageContext = String(payload.pageContext || '').trim()
+  const mode = String(payload.mode || '').trim() || (payload.insert ? 'insert' : 'rewrite')
   if (!instruction) {
     const err = new Error('missing instruction')
     err.status = 400
     throw err
   }
   const images = collectPayloadImages(payload)
+  if (mode === 'annotate') {
+    const userText = [
+      `指令：${instruction}`,
+      text ? `原文：${text}` : '',
+      pageContext ? `圈出位置周围的页面文字：\n${pageContext.slice(0, 2000)}` : '',
+      '只输出 JSON：{"marks":["..."]}，不要解释。',
+      'marks 里每一项必须是原文中已经存在的连续片段。',
+      '若用户点名了几个词，或附图蓝圈/线/星/三角形只罩住几个词，只返回那些词。',
+      '附图中画在单词上的三角形、五角星、下划线标出的就是要标的词。',
+      '不要把整段原文放进 marks，除非指令明确要求标整段。',
+    ]
+      .filter(Boolean)
+      .join('\n')
+    const content = [{ type: 'text', text: `${userText}${images.length ? '\n附图：蓝线圈出用户关心的段落；圈内若另有标记或只罩住几个词，以那些为准。' : ''}` }]
+    for (const url of images) content.push({ type: 'image_url', image_url: { url } })
+    const textOut = await dashChat(env, {
+      model: images.length ? plannerModel : rewriteModel,
+      temperature: 0.1,
+      messages: [
+        {
+          role: 'system',
+          content:
+            'You pick phrases to highlight, bold, or underline in webpage text. Return JSON only: {"marks":["exact substring",...]}. Each mark must already appear in the original passage. If the user named words, or the screenshot shows a triangle/star/underline on some words, return only those words. Never return the whole paragraph unless the user asked to mark the entire passage. Return {"marks":[]} if nothing specific should be marked.',
+        },
+        images.length ? { role: 'user', content } : { role: 'user', content: userText },
+      ],
+    })
+    return { text: textOut, model: images.length ? plannerModel : rewriteModel }
+  }
   const userText = [
     `指令：${instruction}`,
-    text ? `用户要求/原文：${text}` : '',
+    text ? `${mode === 'insert' ? '用户要求' : '原文'}：${text}` : '',
     pageContext ? `圈出位置周围的页面文字：\n${pageContext.slice(0, 2000)}` : '',
     images.length || pageContext
-      ? '只输出文案本身，不要解释，不要加引号。语气、语言、主题必须贴合周围网页。'
+      ? mode === 'insert'
+        ? '只输出文案本身，不要解释，不要加引号。语气、语言、主题必须贴合周围网页。'
+        : '只输出改完后的整段可见文字，不要解释，不要加引号。'
       : '',
   ]
     .filter(Boolean)
     .join('\n')
   if (images.length) {
-    const content = [{ type: 'text', text: `${userText}\n附图：蓝线圈出要插入的空白，周围是真实网页。` }]
+    const content = [
+      {
+        type: 'text',
+        text:
+          mode === 'insert'
+            ? `${userText}\n附图：蓝线圈出要插入的空白，周围是真实网页。`
+            : `${userText}\n附图：蓝线圈出用户关心的文字。若圈只罩住整段里的几个词或几句，或指令写明只改其中几个词/几句，则只改那些，其余原文一字不动。必须返回改完后的完整段落，不要只返回被改的那几个词。`,
+      },
+    ]
     for (const url of images) content.push({ type: 'image_url', image_url: { url } })
     try {
       const textOut = await dashChat(env, {
         model: plannerModel,
-        temperature: 0.45,
+        temperature: mode === 'insert' ? 0.45 : 0.2,
         messages: [
           {
             role: 'system',
             content:
-              'You write short webpage copy to insert into the circled blank. Match the surrounding page language, tone, topic, and length. Return only the copy.',
+              mode === 'insert'
+                ? 'You write short webpage copy to insert into the circled blank. Match the surrounding page language, tone, topic, and length. Return only the copy.'
+                : 'You rewrite webpage text. Keep the original language unless asked to change it. If the circle or instruction only covers some words or sentences, change only those and return the COMPLETE original passage with those edits. Never return just the edited fragment. Never replace the passage with the instruction. Return only the passage.',
           },
           { role: 'user', content },
         ],
@@ -241,7 +283,7 @@ async function rewrite(env, payload) {
       {
         role: 'system',
         content:
-          'You rewrite the selected webpage text. Keep the original language unless the instruction asks to change it. Return only the rewritten text, with no quotes, labels, or explanation. Never replace the passage with the instruction itself. If surrounding page context is given, match its topic and tone.',
+          'You rewrite the selected webpage text. Keep the original language unless the instruction asks to change it. Return only the rewritten text, with no quotes, labels, or explanation. Never replace the passage with the instruction itself. If the instruction or a circled excerpt names only some words or sentences, change only those and return the complete original passage with those edits. If surrounding page context is given, match its topic and tone.',
       },
       {
         role: 'user',
@@ -263,15 +305,17 @@ function planSystem(task) {
   }
   if (task === 'intent') {
     return [
-      'Output JSON only: {"text":"缩小","note":"scale-down","guesses":[{"id":"scale-down","label":"把圈中内容缩小","note":"scale-down","command":""}]}.',
-      'The JSON above is only a schema. Choose ids that match THIS user writing, not the example.',
-      'You MUST read handwritten Chinese from the images. Image 1 is a white stroke board (blue = circle/paint, black = handwriting). Image 2 is a handwriting close-up. Image 3 is the circled region on the page. Image 4 is the full page.',
+      'Output JSON only: {"text":"缩小","note":"scale-down","mark":"五角星","guesses":[{"id":"scale-down","label":"把圈中内容缩小","note":"scale-down","command":"","shape":"五角星"}]}.',
+      'The JSON above is only a schema. Choose ids that match THIS user writing and drawing, not the example.',
+      'You MUST look at the images. Image 1 is a white stroke board (blue = lasso or symbol, black = handwriting or doodle). Image 2 is a close-up. Image 3 is the circled region on the page. Image 4 is the full page.',
+      'Symbols are annotations too. Identify stars, triangles, X marks, checks, underlines, arrows, and custom doodles FROM THE IMAGE. Local geometry often confuses triangle vs star; trust the picture. Put the Chinese name in mark and guesses[].shape.',
       'Field text = exact handwritten characters. If the user message already gives a transcription, copy it into text and trust it unless the image clearly disagrees.',
-      'Combine writing WITH where the blue stroke sits. Circle text → edit that text. Circle an image → edit that image. Circle mostly empty space → operate on the blank. An edge-grazing search box is not the target.',
-      'Map the written words to ops. 删/叉/× → delete. 红/蓝/绿色/改色 → color. 缩小 → scale-down. 放大 → scale-up. 阴影 → shadow. 倒影 → reflect. 加框 → frame. 加/插入 on blank with no drawing → insert-text. Drawn pattern / sunburst / star around an object → stamp. Arrow or source-circle plus dest-circle → move-layout. Other words: interpret them, do not default to delete or insert.',
-      'If there is NO handwriting, judge the drawing itself. Radiating lines around a logo are stamp (paste the drawn rays), not insert-text and not delete-deco. Do not treat a leftover empty blue box as the main intent when black strokes decorate an object.',
-      'Give 3 or 4 guesses, most likely first. The first guess MUST match the handwritten meaning, or the drawing if there is no writing. label is a short spoken Chinese sentence.',
-      'id is one of: insert-text, insert-image, stamp, deco, delete, delete-image, delete-text, delete-deco, clear-deco, color, color-bg, color-text, color-image, name, polish, custom, frame, circle, shadow, reflect, scale-down, scale-up, indent, move-layout, nudge-left, nudge-right, nudge-up, nudge-down, strike, longer, shorter, highlight, underline, soften.',
+      'Combine writing WITH where the blue stroke sits. Circle text → edit that text. Circle an image → edit that image. If the user asks to change only some words or sentences, or draws a triangle/star/underline on specific words, the op is bold/highlight/underline on THOSE words, not the whole paragraph.',
+      'If the circle is on a photo, book cover, or illustration, even a color request (red, warmer, recolor) MUST use generate-image to regenerate the picture. color/color-image is only for text color or flat UI fills, never for photographs.',
+      'Map the written words to ops. 删/叉/× → delete. 字改红/蓝/绿 → color. 封面/配图改色或换成… → generate-image. 缩小 → scale-down. 放大 → scale-up. 阴影 → shadow. 倒影 → reflect. 加框 → frame. 加粗 → bold. 下划线 → underline. 高亮 → highlight. 加/插入 on blank with no drawing → insert-text. Drawn pattern / sunburst around an object → stamp. Arrow or source-circle plus dest-circle → move-layout. Other words: interpret them, do not default to delete or insert.',
+      'If there is NO handwriting, judge the drawing itself from the image. Do not treat a leftover empty blue box as the main intent when black strokes decorate an object.',
+      'Give 3 or 4 guesses, most likely first. The first guess MUST match the handwritten meaning, or the drawing you see if there is no writing. label is a short spoken Chinese sentence.',
+      'id is one of: insert-text, insert-image, generate-image, generate-text, stamp, deco, delete, delete-image, delete-text, delete-deco, clear-deco, color, color-bg, color-text, color-image, name, polish, custom, frame, circle, shadow, reflect, scale-down, scale-up, indent, move-layout, nudge-left, nudge-right, nudge-up, nudge-down, strike, longer, shorter, highlight, underline, bold, wavy, soften.',
       'command is a concrete value if any (雾蓝, 海盐杯). If asked for more, do not repeat already offered labels.',
     ].join(' ')
   }
@@ -295,7 +339,7 @@ async function plan(env, payload) {
   const defaults = {
     guess: '根据选中笔迹猜测用户想把这块改成什么，输出一句简短中文。',
     ink: '只识别图中的手写汉字，按书写顺序原样输出。不要解释，不要把圈线认成字。没有手写就输出空。',
-    intent: '先确认手写批注；没有手写就根据画法（光芒、箭头、图案、两圈布局）给出操作。不要默认删除或插入。',
+    intent: '先看图里的批注：手写、五角星/三角形/叉等标记、以及圈落在网页哪一块。几何猜测可能把三角形和五角星弄混，以图为准。不要默认删除或插入。',
     'find-same': '找出图中与当前选中物体同类的其他物体，不要重复已圈的框。',
   }
   const instruction = String(payload.instruction || '').trim() || defaults[task] || ''

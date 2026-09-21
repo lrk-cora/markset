@@ -3,7 +3,7 @@ import { applyDemoPage, applyImportedPage, createEditor, refreshDecorations } fr
 import { bindChromeKeys, renderChrome, toast } from './chrome.js'
 import { fetchHealth, importPage } from './api.js'
 import { canSnap, consumePackagingHint, consumeSkipObjectSnap, peekPackagingHint, peekSkipObjectSnap, setSnapOn, snapImageHits } from './contour.js'
-import { aabb, classifyStrokeKind, looksLikeBoxStroke, looksLikeDrawnLine, looksLikeEnclosingStroke } from './geometry.js'
+import { aabb, classifyStrokeKind, markTargetPolygon, looksLikeBoxStroke, looksLikeDrawnLine, looksLikeEnclosingStroke } from './geometry.js'
 import {
   contentImageHits,
   findIndentTarget,
@@ -18,6 +18,7 @@ import {
 import { bindLasso, getPaintMarks, getStrokeColor, isAddMode, isColorMode, isLassoMode, isLayoutPen, isSubtractMode, LAYOUT_PENS, SELECT_COLOR, setAddMode, setLassoMode, setStrokeColor, setSubtractMode } from './overlay.js'
 import { applyScopeAfterSelect } from './scope.js'
 import { guessStrokePrompt } from './vision-tasks.js'
+import { strokeKindOptions } from './capture.js'
 import { ingestLayoutStroke } from './layout.js'
 import { exportWebDoc, hitWebDoc, isWebDocActive, looksLikeWebLayoutDest, pairWebLayoutDest, rememberPaintBox, unmountWebDoc } from './web-doc.js'
 import { clearLocalUndos, dismissCoach, getCard, idleCard, keepCardForAppend, openPageRecolor, applyWrittenNote, resetCardForNewSelection, resetPagePaper, setPaintGesture, shouldTreatStrokeAsInk, canUndoLocal } from './card-flow.js'
@@ -470,17 +471,7 @@ function indentSpanFromStroke(rawPoints, polygon) {
 }
 
 function symbolHitPoly(rawPoints, shape = '') {
-  const box = aabb(rawPoints)
-  const lineLike = shape === 'line' || shape === 'wavy'
-  const padX = lineLike ? 8 : 14
-  const padY = lineLike ? 8 : 14
-  const lift = lineLike ? Math.max(26, Math.min(52, box.w * 0.14)) : 0
-  return [
-    { x: box.x - padX, y: box.y - padY - lift },
-    { x: box.x + box.w + padX, y: box.y - padY - lift },
-    { x: box.x + box.w + padX, y: box.y + box.h + padY },
-    { x: box.x - padX, y: box.y + box.h + padY },
-  ]
+  return markTargetPolygon(rawPoints, shape)
 }
 
 bindLasso({
@@ -497,26 +488,35 @@ bindLasso({
       add = false
       shift = false
     }
+    const kindOpts = strokeKindOptions()
     const strokeKind =
       subtract || add || shift || color || isLayoutPen()
-        ? { kind: add || shift ? 'refine' : subtract ? 'refine' : 'select', shape: '', label: '' }
-        : classifyStrokeKind(rawPoints, { hasSelection: priorSel, refine: false })
+        ? { kind: add || shift ? 'refine' : subtract ? 'refine' : 'select', shape: '', label: '', fingerprint: '' }
+        : classifyStrokeKind(rawPoints, { ...kindOpts, refine: false })
+    const asMark = strokeKind.kind === 'symbol' || strokeKind.kind === 'symbol-target'
     let hitPoly = polygon
     if (strokeKind.kind === 'symbol-target') hitPoly = symbolHitPoly(rawPoints, strokeKind.shape)
     if (
-      strokeKind.kind !== 'symbol-target' &&
+      !asMark &&
       !shift &&
       !subtract &&
       !add &&
       !color &&
       !isLayoutPen() &&
       (shouldTreatStrokeAsInk(rawPoints) ||
-        (hasInk() && isLikelyInk(rawPoints, { hasSelection: true, hasNewContent: false })))
+        (hasInk() && isLikelyInk(rawPoints, { hasSelection: true, hasNewContent: false, ...kindOpts })))
     ) {
       addInkStroke(rawPoints)
       return false
     }
-    if (rawPoints?.length) setPaintGesture(rawPoints, { silent: true })
+    if (rawPoints?.length) setPaintGesture(rawPoints, { silent: true, kind: strokeKind })
+    if (strokeKind.kind === 'symbol') {
+      addInkStroke(rawPoints)
+      keepCardForAppend()
+      dismissCoach()
+      toast(`认出${strokeKind.label}，已留在圈上。请点「开始判断」确认后再执行`)
+      return { append: true, role: 'symbol', shape: strokeKind.shape, fingerprint: strokeKind.fingerprint }
+    }
     if (hitPoly?.length) rememberPaintBox(hitPoly, { union: add || shift, subtract })
     const webHits = isWebDocActive()
       ? hitWebDoc(hitPoly, { loose: strokeKind.kind === 'symbol-target' || looksLikeEnclosingStroke(rawPoints) })
@@ -534,7 +534,7 @@ bindLasso({
         !selected.some((c) => c.kind === 'image' && ((c.webId && s.webId && c.webId === s.webId) || c.block_id === s.block_id)),
     )
     if (
-      strokeKind.kind !== 'symbol-target' &&
+      !asMark &&
       !shift &&
       !subtract &&
       !add &&
@@ -543,6 +543,7 @@ bindLasso({
       isLikelyInk(rawPoints, {
         hasSelection: selected.length > 0,
         hasNewContent: newText.length + newImg.length > 0,
+        ...kindOpts,
       })
     ) {
       addInkStroke(rawPoints)
@@ -557,7 +558,7 @@ bindLasso({
       !subtract &&
       !add &&
       !color &&
-      strokeKind.kind !== 'symbol-target' &&
+      !asMark &&
       looksLikeWebLayoutDest(rawPoints, polygon)
     ) {
       clearInk()
@@ -587,7 +588,7 @@ bindLasso({
       }
       return
     }
-    if (!(shift || subtract || add || color)) clearInk()
+    if (!(shift || subtract || add || color || asMark)) clearInk()
     const apply = (images) =>
       applyHits(textHits, images, hitPoly, {
         append: (shift && !subtract && !add && !color) || (peekPackagingHint() && hasImage),
@@ -598,16 +599,19 @@ bindLasso({
       })
     const skipSnap = isWebDocActive() || (peekSkipObjectSnap() && hasImage)
     const hasBig = [...imageHits.found, ...imageHits.suggest].some((s) => !isTinyImageSpan(s))
+    const persistMark = asMark
+      ? { role: 'symbol', shape: strokeKind.shape, fingerprint: strokeKind.fingerprint }
+      : undefined
     if (subtract || add || color || skipSnap || !canSnap() || !hasBig) {
       if (skipSnap) consumeSkipObjectSnap()
       apply(imageHits)
       if (strokeKind.kind === 'symbol-target' && strokeKind.shape) {
         toast(`认出${strokeKind.label}，已点中这块。请点「开始判断」确认后再执行`)
       }
-      return strokeKind.kind === 'symbol-target' ? { role: 'symbol' } : undefined
+      return persistMark
     }
     snapImageHits(imageHits, { polygon: hitPoly }, toast).then(apply)
-    return strokeKind.kind === 'symbol-target' ? { role: 'symbol' } : undefined
+    return persistMark
   },
   onCancel({ drew } = {}) {
     ignoreClickUntil = drew ? performance.now() + 200 : 0

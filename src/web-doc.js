@@ -1,6 +1,6 @@
 import { rewriteText } from './api.js'
 import { colorFill, colorRgb, COLOR_SCHEMES } from './colors.js'
-import { aabb, boxHitsPolygon, dist, intersectBoxes, looksLikeEnclosingStroke, looksLikeRadialBurst, paintHitPolygon, pathLength, pointInPolygon, strokeToPolygon, unionBoxes } from './geometry.js'
+import { aabb, boxHitsPolygon, dist, intersectBoxes, isRegionStroke, looksLikeEnclosingStroke, looksLikeRadialBurst, paintHitPolygon, pathLength, pointInPolygon, strokeToPolygon, unionBoxes } from './geometry.js'
 import { collectLayoutPairs } from './layout.js'
 import { getInkStrokes } from './ink.js'
 import { getPaintMarks, SELECT_COLOR } from './overlay.js'
@@ -593,6 +593,109 @@ function pickVisualEls(els, box) {
   return unique.slice(0, 3)
 }
 
+function itemMetrics(el) {
+  const r = el.getBoundingClientRect()
+  return {
+    w: r.width,
+    h: r.height,
+    img: Boolean(el.querySelector?.('img, svg, picture, canvas, video')),
+    text: textOf(el).length,
+  }
+}
+
+function similarRepeatingSiblings(el) {
+  const parent = el?.parentElement
+  if (!parent || parent === el.ownerDocument?.body) return []
+  const mine = itemMetrics(el)
+  if (mine.w < 28 || mine.h < 24) return []
+  return significantChildren(parent).filter((sib) => {
+    if (sib === el) return false
+    const n = itemMetrics(sib)
+    const dw = Math.abs(mine.w - n.w) / Math.max(mine.w, n.w, 1)
+    const dh = Math.abs(mine.h - n.h) / Math.max(mine.h, n.h, 1)
+    if (dw > 0.58 && dh > 0.58) return false
+    if (mine.img && n.img) return true
+    if (!mine.img && !n.img) return dw < 0.42 && dh < 0.48
+    return dw < 0.4 && dh < 0.45
+  })
+}
+
+function itemTooBig(el) {
+  const r = el.getBoundingClientRect()
+  const iframe = frameEl()
+  const fw = iframe?.clientWidth || 1
+  const fh = iframe?.clientHeight || 1
+  if (r.width > fw * 0.72) return true
+  if (r.height > fh * 0.78) return true
+  if (r.width * r.height > 480 * 620) return true
+  return false
+}
+
+function isRepeatingItem(el) {
+  if (!el || el === el.ownerDocument?.body || el === el.ownerDocument?.documentElement) return false
+  if (itemTooBig(el) || containsStackedStrips(el) || isChromeStrip(el)) return false
+  return similarRepeatingSiblings(el).length >= 1
+}
+
+function isCoherentBundle(el) {
+  if (!el || itemTooBig(el) || containsStackedStrips(el) || isChromeStrip(el)) return false
+  const r = el.getBoundingClientRect()
+  if (r.width < 36 || r.height < 36) return false
+  const media = [...(el.querySelectorAll?.('img, svg, picture, canvas, video') || [])].filter((n) => areaOf(n) > 400)
+  if (media.length !== 1) return false
+  const t = textOf(el)
+  if (t.length < 1 || t.length > 280) return false
+  const imgA = areaOf(media[0])
+  const elA = areaOf(el)
+  if (imgA < elA * 0.16 || imgA > elA * 0.97) return false
+  if (significantChildren(el).length > 10) return false
+  return true
+}
+
+function itemUnitOf(el) {
+  let cur = el
+  let best = null
+  for (let i = 0; i < 8 && cur && cur !== cur.ownerDocument?.body; i += 1) {
+    if (isRepeatingItem(cur) || isCoherentBundle(cur)) best = cur
+    cur = cur.parentElement
+  }
+  return best
+}
+
+function isItemLevelOp(kind) {
+  const k = String(kind || '')
+  if (k === 'delete' || k === 'delete-image') return true
+  if (k === 'move-layout' || k.startsWith('nudge-')) return true
+  if (k === 'scale-up' || k === 'scale-down') return true
+  return false
+}
+
+function paintTouchesUnit(unit, box, seeds) {
+  if (!unit) return false
+  if (!box) return seeds.some((el) => el === unit || unit.contains(el))
+  const hit = overlapScore(unit, box)
+  if (centerInPaint(unit, box) || hit.coverEl >= 0.28 || hit.coverBox >= 0.16) return true
+  const vis = unit.querySelector?.('img, svg, picture, canvas, video')
+  if (vis) {
+    const vh = overlapScore(vis, box)
+    if (centerInPaint(vis, box) || vh.coverEl >= 0.16 || vh.coverBox >= 0.08) return true
+  }
+  return seeds.some((el) => el === unit || unit.contains(el))
+}
+
+function cohereItemTargets(els, box, kind) {
+  if (!isItemLevelOp(kind)) return els
+  const live = uniqueEls((els || []).filter((el) => el?.isConnected))
+  if (!live.length) return live
+  const units = []
+  for (const el of live) {
+    const unit = itemUnitOf(el)
+    const pick = unit && paintTouchesUnit(unit, box, live) ? unit : el
+    if (!units.includes(pick)) units.push(pick)
+  }
+  return uniqueEls(units)
+}
+
 function visualTargets() {
   const box = iframeUnionBox(drawingPolys())
   const raw = selectedWebEls().map((x) => x.el).filter(Boolean)
@@ -603,11 +706,13 @@ function visualTargets() {
 }
 
 function looksLikeLassoStroke(pts) {
-  return looksLikeEnclosingStroke(pts)
+  return isRegionStroke(pts)
 }
 
 function isHandwritingPaint(mark) {
   const pts = mark?.points
+  if (pts?.length >= 6 && isRegionStroke(pts)) return false
+  if (mark?.role === 'symbol') return true
   if (!pts || pts.length < 2) return true
   const hex = String(mark.color || '').toLowerCase()
   if (hex === '#1d1916' || hex === '#111111' || hex === '#000000') return true
@@ -679,7 +784,7 @@ function paintLassoMarks() {
   const paints = getPaintMarks().filter(
     (m) => m.points?.length >= 3 && m.role !== 'subtract' && !isHandwritingPaint(m),
   )
-  const lassos = paints.filter((m) => looksLikeLassoStroke(m.points) || m.role === 'symbol')
+  const lassos = paints.filter((m) => m.role !== 'symbol' && (looksLikeLassoStroke(m.points) || m.role === 'add'))
   return lassos.length ? lassos : paints
 }
 
@@ -1121,6 +1226,8 @@ function isGraphicEl(el) {
   if (el.getAttribute?.('role') === 'img') return true
   if (looksLikeLogo(el) && (hasPaintedBg(el) || el.querySelector?.('img, svg, canvas'))) return true
   if (el.querySelector?.(':scope > img, :scope > svg') && areaOf(el) < 420 * 220) return true
+  const nested = el.querySelector?.('img')
+  if (nested && looksLikeCoverGraphic(nested)) return true
   return false
 }
 
@@ -1148,6 +1255,20 @@ function hasPaintedBg(el) {
   }
 }
 
+function coverGraphicOf(el) {
+  if (!el?.isConnected) return null
+  if (el.tagName === 'IMG' || el.tagName === 'CANVAS' || el.tagName === 'VIDEO' || el.tagName === 'SVG') return el
+  if (el.tagName === 'PICTURE') return el.querySelector('img') || el
+  const img = el.querySelector?.('img, canvas, video, svg, picture')
+  if (img) return img.tagName === 'PICTURE' ? img.querySelector('img') || img : img
+  let cur = el
+  for (let i = 0; i < 6 && cur && cur !== cur.ownerDocument?.body; i += 1) {
+    if (hasPaintedBg(cur) && areaOf(cur) > 80 * 80 && areaOf(cur) < 520 * 720) return cur
+    cur = cur.parentElement
+  }
+  return hasPaintedBg(el) ? el : null
+}
+
 function isWidgetEl(el) {
   if (!el || SKIP.has(el.tagName)) return false
   if (isImageEl(el) || hasPaintedBg(el)) return true
@@ -1161,6 +1282,19 @@ function isWidgetEl(el) {
 function isTextEl(el) {
   if (!el || SKIP.has(el.tagName) || isImageEl(el)) return false
   return textOf(el).length > 0
+}
+
+function isTextBlock(el) {
+  if (!el || !isTextEl(el) || isGraphicEl(el)) return false
+  if (/^(P|LI|H1|H2|H3|H4|H5|H6|BLOCKQUOTE|TD|TH|FIGCAPTION|PRE|DT|DD|LABEL)$/.test(el.tagName)) return true
+  if (el.tagName === 'A' && textOf(el).length >= 8 && !el.querySelector?.('img, svg, picture, video')) return true
+  if (el.tagName === 'DIV' || el.tagName === 'SPAN' || el.tagName === 'SECTION') {
+    if (textOf(el).length < 8) return false
+    const blocks = [...(el.children || [])].filter((k) => /^(P|UL|OL|DIV|SECTION|ARTICLE|H1|H2|H3|H4)$/.test(k.tagName))
+    if (blocks.length >= 2) return false
+    return isPrimarilyText(el)
+  }
+  return false
 }
 
 function promoteTarget(el) {
@@ -1288,7 +1422,58 @@ function considerEl(el, frameArea, seen, poly, { minCover = 0.08 } = {}) {
 }
 
 function dropAncestors(items) {
-  return items.filter((h) => !items.some((o) => o.el !== h.el && h.el.contains(o.el)))
+  const leaves = items.filter((h) => !items.some((o) => o.el !== h.el && h.el.contains(o.el)))
+  const blocks = items.filter((h) => h?.el && isTextBlock(h.el) && (h.inPoly || h.cover >= 0.22))
+  if (!blocks.length) return leaves
+  return items.filter((h) => {
+    if (!h?.el) return false
+    if (blocks.some((b) => b.el === h.el)) return true
+    if (blocks.some((b) => b.el.contains(h.el))) return false
+    return leaves.includes(h)
+  })
+}
+
+function liftHitsToCoveredBlocks(items, poly, paintBox) {
+  const paintArea = Math.max(1, (paintBox?.w || 0) * (paintBox?.h || 0))
+  const region = paintArea >= 70 * 48 || Math.min(paintBox?.w || 0, paintBox?.h || 0) >= 36
+  if (!region || !items.length) return items
+  const out = []
+  const seen = new Set()
+  for (const h of items) {
+    let next = h
+    if (h.kind !== 'image' && h.el) {
+      let cur = h.el
+      let best = h
+      for (let i = 0; i < 6 && cur && cur !== cur.ownerDocument?.body; i += 1) {
+        if (containsOutsiders(cur, paintBox, [poly])) break
+        if (isTextBlock(cur)) {
+          const cover = polygonCover(cur, poly)
+          const inPoly = centerInPoly(cur, poly)
+          const area = areaOf(cur)
+          if (area > paintArea * 8) break
+          if (cover >= 0.26 || (inPoly && cover >= 0.12)) {
+            best = {
+              ...h,
+              el: cur,
+              area,
+              kind: 'text',
+              cover,
+              inPoly,
+              overlap: Math.max(h.overlap || 0, cover),
+              score: cover + (inPoly ? 0.35 : 0),
+            }
+          }
+        }
+        cur = cur.parentElement
+      }
+      next = best
+    }
+    const id = next.el?.getAttribute?.('data-markset-id') || next.el
+    if (seen.has(id)) continue
+    seen.add(id)
+    out.push(next)
+  }
+  return dropAncestors(out)
 }
 
 function tightenHits(items, poly, { loose = false } = {}) {
@@ -1342,7 +1527,8 @@ export function hitWebDoc(polygon, { loose = false } = {}) {
   const seen = new Map()
   const paintBox0 = aabb(poly)
   const compact = paintBox0.w * paintBox0.h < 90 * 90 || Math.max(paintBox0.w, paintBox0.h) < 72
-  const minCover = compact ? 0.03 : loose ? 0.08 : 0.1
+  const regionSelect = paintBox0.w * paintBox0.h >= 70 * 48 || Math.min(paintBox0.w, paintBox0.h) >= 36
+  const minCover = compact && !regionSelect ? 0.03 : loose ? 0.08 : 0.1
   for (const p of sampleHitPoints(poly)) {
     let stack = []
     try {
@@ -1371,12 +1557,13 @@ export function hitWebDoc(polygon, { loose = false } = {}) {
         cover: polygonCover(kid, poly),
       }))
   })
-  items = dropAncestors(items.filter((h) => {
+  items = liftHitsToCoveredBlocks(items, poly, paintBox)
+  items = items.filter((h) => {
     if (!h?.el || decoNode(h.el)) return false
     if (isGraphicEl(h.el)) return h.inPoly || h.cover >= 0.08 || h.overlap >= 0.12
-    if (compact) return h.inPoly || h.cover >= 0.04 || h.overlap >= 0.08 || h.area <= paintArea * 40
-    return h.area <= paintArea * 10 || h.cover >= 0.4 || h.inPoly
-  }))
+    if (compact && !regionSelect) return h.inPoly || h.cover >= 0.04 || h.overlap >= 0.08 || h.area <= paintArea * 40
+    return h.area <= paintArea * 14 || h.cover >= 0.22 || h.inPoly || isTextBlock(h.el)
+  })
   const logos = items.filter((h) => looksLikeLogo(h.el) || (isGraphicEl(h.el) && h.area < 220 * 90 && (h.inPoly || kidInPaint(h.el, paintBox))))
   if (logos.length) {
     const seed = logos.sort((a, b) => a.area - b.area)[0]
@@ -1387,9 +1574,9 @@ export function hitWebDoc(polygon, { loose = false } = {}) {
       return false
     })
   }
-  if (compact) items.sort((a, b) => a.area - b.area || b.score - a.score)
+  if (compact && !regionSelect) items.sort((a, b) => a.area - b.area || b.score - a.score)
   else items.sort((a, b) => (b.inPoly - a.inPoly) || b.cover - a.cover || a.area - b.area)
-  items = items.slice(0, loose || compact ? 3 : MAX_HITS)
+  items = items.slice(0, regionSelect ? 12 : compact || loose ? 4 : MAX_HITS)
   const images = []
   const texts = []
   for (const hit of items) {
@@ -2072,6 +2259,192 @@ function textNodesOf(el) {
   return nodes
 }
 
+function paintPolysForText(box) {
+  const polys = currentPaintPolys()
+  if (polys.length) return polys
+  if (!box) return []
+  return [
+    [
+      { x: box.x, y: box.y },
+      { x: box.x + box.w, y: box.y },
+      { x: box.x + box.w, y: box.y + box.h },
+      { x: box.x, y: box.y + box.h },
+    ],
+  ]
+}
+
+function tokenHitsPaint(rect, polys) {
+  if (!rect || rect.width < 1 || rect.height < 1 || !polys?.length) return false
+  const box = { x: rect.x, y: rect.y, w: rect.width, h: rect.height }
+  const cx = rect.x + rect.width / 2
+  const cy = rect.y + rect.height / 2
+  return polys.some((poly) => pointInPolygon(cx, cy, poly) || boxHitsPolygon(box, poly))
+}
+
+function inflateAabb(box, padX, padY = padX) {
+  if (!box) return box
+  return { x: box.x - padX, y: box.y - padY, w: box.w + padX * 2, h: box.h + padY * 2 }
+}
+
+function isCompactWordMark(mark, box) {
+  if (!mark || !box) return false
+  if (mark.role === 'symbol') return true
+  if (isRegionStroke(mark.points) && box.w >= 96 && box.h >= 52) return false
+  const aspect = box.w / Math.max(1, box.h)
+  if ((aspect > 3.2 && box.h < 36) || (aspect < 0.35 && box.w < 36)) return true
+  return box.w < 120 && box.h < 100
+}
+
+function compactMarkBoxes() {
+  const out = []
+  for (const mark of getPaintMarks()) {
+    if (!mark?.points || mark.points.length < 3 || mark.role === 'subtract') continue
+    const poly = toIframePoly(mark.points)
+    if (!poly?.length) continue
+    const box = aabb(poly)
+    if (!isCompactWordMark(mark, box)) continue
+    const aspect = box.w / Math.max(1, box.h)
+    const padX = aspect > 3 ? 10 : Math.max(16, Math.min(34, Math.max(box.w, box.h) * 0.4))
+    const padY = aspect > 3 ? 26 : Math.max(16, Math.min(34, Math.max(box.w, box.h) * 0.45))
+    out.push(inflateAabb(box, padX, padY))
+  }
+  return out
+}
+
+function tokenHitsBox(rect, box) {
+  if (!rect || !box) return false
+  const hit = intersectBoxes({ x: rect.x, y: rect.y, w: rect.width, h: rect.height }, box)
+  if (!hit) return false
+  const cx = rect.x + rect.width / 2
+  const cy = rect.y + rect.height / 2
+  return (
+    (cx >= box.x && cx <= box.x + box.w && cy >= box.y && cy <= box.y + box.h) ||
+    hit.w * hit.h >= rect.width * rect.height * 0.28
+  )
+}
+
+function phrasesFromCompactMarks(el) {
+  const boxes = compactMarkBoxes()
+  if (!el || !boxes.length) return []
+  const tokens = collectTextTokens(el)
+  const hit = tokens.map((t) => t.rects.some((r) => boxes.some((b) => tokenHitsBox(r, b))))
+  const out = []
+  for (let i = 0; i < tokens.length; ) {
+    if (!hit[i]) {
+      i += 1
+      continue
+    }
+    let j = i + 1
+    let text = tokens[i].text
+    while (j < tokens.length && hit[j] && tokens[j].node === tokens[i].node && tokens[j].start === tokens[j - 1].end) {
+      text += tokens[j].text
+      j += 1
+    }
+    if (text.trim()) out.push(text.trim())
+    i = j
+  }
+  return [...new Set(out)]
+}
+
+function collectTextTokens(el) {
+  const tokens = []
+  for (const node of textNodesOf(el)) {
+    const raw = node.nodeValue || ''
+    let i = 0
+    while (i < raw.length) {
+      while (i < raw.length && /\s/.test(raw[i])) i += 1
+      if (i >= raw.length) break
+      let j = i + 1
+      const ch = raw[i]
+      if (/[\u3400-\u9fff\uf900-\ufaff]/.test(ch)) j = i + 1
+      else if (/[A-Za-z0-9]/.test(ch)) {
+        while (j < raw.length && /[A-Za-z0-9'’.-]/.test(raw[j])) j += 1
+      }
+      const range = el.ownerDocument.createRange()
+      range.setStart(node, i)
+      range.setEnd(node, j)
+      tokens.push({ node, start: i, end: j, rects: [...range.getClientRects()], text: raw.slice(i, j) })
+      i = j
+    }
+  }
+  return tokens
+}
+
+function wrapPaintedWords(el, box) {
+  if (!el || el.getAttribute?.('data-markset-word')) return [el]
+  if (lassoIsRegionCovering(el, box)) return [el]
+  const polys = paintPolysForText(box)
+  if (!polys.length) return [el]
+  const tokens = collectTextTokens(el)
+  if (tokens.length < 2) return [el]
+  const hit = tokens.map((t) => t.rects.some((r) => tokenHitsPaint(r, polys)))
+  const hitN = hit.filter(Boolean).length
+  if (!hitN || hitN >= Math.max(2, tokens.length * 0.78)) return [el]
+  const runs = []
+  for (let i = 0; i < tokens.length; ) {
+    if (!hit[i]) {
+      i += 1
+      continue
+    }
+    let j = i + 1
+    while (
+      j < tokens.length &&
+      hit[j] &&
+      tokens[j].node === tokens[i].node &&
+      tokens[j].start === tokens[j - 1].end
+    ) {
+      j += 1
+    }
+    runs.push({ node: tokens[i].node, start: tokens[i].start, end: tokens[j - 1].end })
+    i = j
+  }
+  const spans = []
+  const doc = el.ownerDocument
+  for (let r = runs.length - 1; r >= 0; r -= 1) {
+    const run = runs[r]
+    if (!run.node?.parentNode) continue
+    const range = doc.createRange()
+    try {
+      range.setStart(run.node, run.start)
+      range.setEnd(run.node, run.end)
+      const span = doc.createElement('span')
+      span.setAttribute('data-markset-word', '1')
+      range.surroundContents(span)
+      spans.push(span)
+    } catch {
+      /* skip ranges that the DOM won't wrap */
+    }
+  }
+  if (spans.length) stampIds(doc)
+  return spans.length ? spans.reverse() : [el]
+}
+
+function lassoIsRegionCovering(el, box) {
+  const marks = getPaintMarks().filter((m) => m.role !== 'subtract' && m.points?.length >= 6)
+  const region = marks.some((m) => isRegionStroke(m.points))
+  if (!region) {
+    if (!box) return false
+    return box.w * box.h >= 90 * 56 && Math.min(box.w, box.h) >= 36
+  }
+  if (!el || !box) return true
+  const hit = overlapScore(el, box)
+  return hit.coverEl >= 0.18 || hit.coverBox >= 0.1 || centerInPaint(el, box)
+}
+
+function narrowToPaintedText(els, box) {
+  if (lassoIsRegionCovering(null, box)) return uniqueEls((els || []).filter((el) => el?.isConnected))
+  const out = []
+  for (const el of els || []) {
+    if (!el?.isConnected) continue
+    if (!(isTextEl(el) && !isGraphicEl(el))) {
+      out.push(el)
+      continue
+    }
+    out.push(...wrapPaintedWords(el, box))
+  }
+  return uniqueEls(out)
+}
+
 function replaceText(el, fromText, toText) {
   if (!el) return false
   const next = String(toText ?? '')
@@ -2270,12 +2643,45 @@ function keepPaintTargets(els, box) {
   }
   const drilled = uniqueEls(live.flatMap(drill)).filter((el) => !containsOutsiders(el, box, polys))
   const inInk = drilled.filter((el) => kidInPaint(el, box, polys))
-  if (inInk.length) return dropCoveringAncestors(inInk)
   const aimed = drilled.filter((el) => aimedLeaf(el, box))
-  if (aimed.length) return dropCoveringAncestors(aimed)
   const centered = drilled.filter((el) => centerInPaint(el, box) && overlapScore(el, box).coverEl >= 0.28)
-  if (centered.length) return dropCoveringAncestors(centered)
-  return dropCoveringAncestors(drilled)
+  const picked = inInk.length
+    ? inInk
+    : aimed.length
+      ? aimed
+      : centered.length
+        ? centered
+        : drilled
+  return liftToCoveredBlocks(dropCoveringAncestors(picked), box)
+}
+
+function liftToCoveredBlocks(els, box) {
+  const live = uniqueEls((els || []).filter((el) => el?.isConnected))
+  if (!live.length || !box) return live
+  const paintArea = box.w * box.h
+  if (paintArea < 70 * 48 && Math.min(box.w, box.h) < 36) return live
+  const polys = currentPaintPolys()
+  const out = []
+  for (const el of live) {
+    if (isGraphicEl(el) && !isPrimarilyText(el)) {
+      out.push(el)
+      continue
+    }
+    let cur = el
+    let best = el
+    for (let i = 0; i < 6 && cur && cur !== cur.ownerDocument?.body; i += 1) {
+      if (containsOutsiders(cur, box, polys)) break
+      if (isTextBlock(cur)) {
+        const cover = polys.length ? paintCover(cur, polys) : overlapScore(cur, box).coverEl
+        const area = areaOf(cur)
+        if (area > paintArea * 8) break
+        if (cover >= 0.26 || (centerInPaint(cur, box) && cover >= 0.12)) best = cur
+      }
+      cur = cur.parentElement
+    }
+    out.push(best)
+  }
+  return uniqueEls(dropCoveringAncestors(out))
 }
 
 function staysInPaint(el, box) {
@@ -2759,6 +3165,20 @@ function gatherEls(kind, title, box, hits, frameArea, large) {
       }
     } else if (kind.startsWith('nudge-') || kind === 'move-nudge') {
       els = pickContentEls(hits, box, frameArea, { large, kind: '' })
+    } else if (
+      kind === 'highlight' ||
+      kind === 'bold' ||
+      kind === 'underline' ||
+      kind === 'wavy' ||
+      kind === 'strike' ||
+      kind === 'frame' ||
+      kind === 'box' ||
+      kind === 'circle' ||
+      String(kind).startsWith('line')
+    ) {
+      const asRegion = large || lassoIsRegionCovering(null, box)
+      els = pickContentEls(hits, box, frameArea, { large: asRegion, kind: 'color-text' })
+      if (!els.length) els = leafEls(hits, box).filter((el) => isPrimarilyText(el))
     } else {
       els = pickDecorEls(hits, box, frameArea, large, false)
     }
@@ -3096,6 +3516,7 @@ function applyOpToEls(els, kind, { color, title, box, dx, dy, scheme, paint }) {
   } else {
     const anno = annoKind(kind)
     for (const el of els) {
+      if ((anno === 'highlight' || anno === 'bold') && textOf(el).replace(/\s+/g, '').length > 40) continue
       el.setAttribute('data-markset-anno', anno)
       count += 1
     }
@@ -3127,7 +3548,23 @@ export function executeCircledOp(op, { color = '', label = '', onBefore, dx = 0,
       const wrap = pickSchemeWrap(picked, box)
       return wrap ? uniqueEls([wrap, ...picked]) : picked
     })()
-    const els = keepPaintTargets(raw, box)
+    const els = (() => {
+      let picked = keepPaintTargets(raw, box)
+      if (isItemLevelOp(kind)) picked = cohereItemTargets(picked, box, kind)
+      else if (
+        kind === 'color' ||
+        kind === 'color-text' ||
+        kind === 'highlight' ||
+        kind === 'bold' ||
+        kind === 'underline' ||
+        kind === 'wavy' ||
+        kind === 'strike' ||
+        String(kind).startsWith('line')
+      ) {
+        picked = narrowToPaintedText(picked, box)
+      }
+      return picked
+    })()
     if (!els.length) continue
     const key = `${strategy}:${els.map((el) => el.getAttribute('data-markset-id') || el.tagName).join(',')}`
     if (seen.has(key)) continue
@@ -3210,33 +3647,144 @@ function dropCoveringAncestors(els) {
   return (els || []).filter((el) => el && !(els || []).some((o) => o && o !== el && el.contains(o)))
 }
 
+function rewriteHostOf(el) {
+  if (!el) return null
+  const climb = (start) => {
+    let p = start
+    for (let i = 0; i < 6 && p && p !== p.ownerDocument?.body; i += 1) {
+      if (/^(P|LI|H1|H2|H3|H4|H5|H6|BLOCKQUOTE|TD|TH|FIGCAPTION|ARTICLE|LABEL)$/.test(p.tagName) && textOf(p).length >= 2) {
+        return p
+      }
+      if (
+        p.tagName === 'DIV' &&
+        isPrimarilyText(p) &&
+        textOf(p).length >= 8 &&
+        textOf(p).length < 900 &&
+        significantChildren(p).length <= 4
+      ) {
+        return p
+      }
+      p = p.parentElement
+    }
+    return start
+  }
+  if (el.getAttribute?.('data-markset-word')) return climb(el.parentElement) || el
+  if (/^(SPAN|EM|STRONG|B|I|A|SMALL)$/.test(el.tagName) && textOf(el).length < 80) return climb(el) || el
+  return el
+}
+
 function collectRewriteEls() {
-  const box = iframeUnionBox(drawingPolys())
+  const box = editRegionBox() || iframeUnionBox(drawingPolys())
   const iframe = frameEl()
   const frameArea = Math.max(1, (iframe?.clientWidth || 1) * (iframe?.clientHeight || 1))
-  const hits = box ? scanOverlapEls(box) : []
+  const seen = new Set()
+  const hitList = []
+  for (const h of [...(box ? scanOverlapEls(box) : []), ...compactMarkBoxes().flatMap((b) => scanOverlapEls(b))]) {
+    if (!h?.el || seen.has(h.el)) continue
+    seen.add(h.el)
+    hitList.push(h)
+  }
   const usable = (el) => el && isTextEl(el) && !isImageEl(el) && textOf(el).length >= 2
   let els = []
-  if (box) {
-    els = leafEls(hits, box).filter(usable)
-    if (!els.length) els = hits.map((h) => h.el).filter(usable)
+  if (box || hitList.length) {
+    els = leafEls(hitList, box).filter(usable)
+    if (!els.length) els = hitList.map((h) => h.el).filter(usable)
     if (!els.length) {
-      els = pickContentEls(hits, box, frameArea, { large: false, kind: 'color-text' }).filter(usable)
+      els = pickContentEls(hitList, box, frameArea, { large: false, kind: 'color-text' }).filter(usable)
     }
-    els = els.filter((el) => aimedLeaf(el, box) || staysInPaint(el, box) || (centerInPaint(el, box) && overlapScore(el, box).coverEl >= 0.28))
+    if (box) {
+      els = els.filter(
+        (el) =>
+          aimedLeaf(el, box) ||
+          staysInPaint(el, box) ||
+          (centerInPaint(el, box) && overlapScore(el, box).coverEl >= 0.28) ||
+          phrasesFromCompactMarks(el).length,
+      )
+    }
   }
   if (!els.length) {
     els = circledEditSpans()
       .map((s) => findByWebId(s.webId))
       .filter(usable)
   }
-  if (!els.length && hits.length) {
-    els = hits.map((h) => h.el).filter((el) => usable(el) && (aimedLeaf(el, box) || centerInPaint(el, box)))
+  if (!els.length && hitList.length) {
+    els = hitList.map((h) => h.el).filter(
+      (el) =>
+        usable(el) &&
+        (phrasesFromCompactMarks(el).length || (box && (aimedLeaf(el, box) || centerInPaint(el, box)))),
+    )
   }
-  return keepPaintTargets(els, box).slice(0, 8)
+  const seeds = keepPaintTargets(els, box)
+  return dropCoveringAncestors(seeds.map(rewriteHostOf).filter(Boolean)).slice(0, 6)
 }
 
-export async function rewriteCircledText(commandText, { onBefore, kind = 'polish' } = {}) {
+function circledTextExcerpt(hosts, box) {
+  const bits = []
+  for (const el of hosts || []) {
+    if (!(isTextEl(el) && !isGraphicEl(el))) continue
+    for (const w of wrapPaintedWords(el, box)) {
+      if (w.getAttribute?.('data-markset-word')) bits.push(textOf(w))
+    }
+  }
+  return [...new Set(bits.filter(Boolean))].join(' ')
+}
+
+function applyRewriteResult(el, original, next, excerpt) {
+  const a = String(original || '').replace(/\s+/g, ' ').trim()
+  const b = String(next || '').replace(/\s+/g, ' ').trim()
+  if (!b || b === a) return false
+  if (b.length >= Math.max(12, a.length * 0.42)) return replaceText(el, original, next)
+  if (excerpt && a.includes(excerpt) && excerpt !== b) {
+    if (replaceText(el, excerpt, b)) return true
+    const patched = a.split(excerpt).join(b)
+    if (patched !== a) return replaceText(el, original, patched)
+  }
+  const words = [...(el.querySelectorAll?.('[data-markset-word]') || [])]
+  if (words.length === 1 && textOf(words[0]).length >= 1) return replaceText(words[0], textOf(words[0]), b)
+  return false
+}
+
+async function rewriteSceneExtras() {
+  let imageDataUrls = []
+  let pageContext = ''
+  try {
+    pageContext = insertAroundCopy()
+  } catch {
+    pageContext = ''
+  }
+  try {
+    const { captureInsertScene } = await import('./capture.js')
+    const scene = await captureInsertScene()
+    imageDataUrls = [scene.aroundImageDataUrl, scene.circledImageDataUrl, scene.pageImageDataUrl].filter(Boolean)
+    pageContext = [pageContext, scene.pageText].filter(Boolean).join('\n').slice(0, 1800)
+  } catch {
+    /* screenshots are optional; instruction still goes to the model */
+  }
+  return { imageDataUrls, pageContext }
+}
+
+async function annotateSceneExtras() {
+  const insert = await rewriteSceneExtras()
+  try {
+    const { captureAnnotationScene } = await import('./capture.js')
+    const scene = await captureAnnotationScene()
+    const imageDataUrls = [
+      scene.inkCloseupDataUrl,
+      scene.closeupDataUrl,
+      scene.combinedDataUrl,
+      ...(insert.imageDataUrls || []),
+    ].filter((url, i, arr) => url && arr.indexOf(url) === i)
+    return {
+      mode: 'annotate',
+      imageDataUrls: imageDataUrls.slice(0, 3),
+      pageContext: insert.pageContext || String(scene.pageText || '').slice(0, 1800),
+    }
+  } catch {
+    return { ...insert, mode: 'annotate' }
+  }
+}
+
+export async function rewriteCircledText(commandText, { onBefore, kind = 'polish', imageDataUrls = [], pageContext = '' } = {}) {
   if (!isWebDocActive()) return { ok: false, reason: '没有导入的网页' }
   const els = collectRewriteEls()
   if (!els.length) {
@@ -3249,6 +3797,17 @@ export async function rewriteCircledText(commandText, { onBefore, kind = 'polish
   let count = 0
   let usedModel = false
   const page = String(meta.title || '').trim()
+  const box = iframeUnionBox(drawingPolys())
+  const excerpt = circledTextExcerpt(els, box)
+  let extras = { imageDataUrls, pageContext, mode: 'rewrite' }
+  if (!local && (!extras.imageDataUrls?.length || !extras.pageContext)) {
+    const scene = await rewriteSceneExtras()
+    extras = {
+      mode: 'rewrite',
+      imageDataUrls: extras.imageDataUrls?.length ? extras.imageDataUrls : scene.imageDataUrls,
+      pageContext: extras.pageContext || scene.pageContext,
+    }
+  }
   for (const el of els) {
     const original = textOf(el)
     if (!original || original.length < 2) continue
@@ -3260,16 +3819,18 @@ export async function rewriteCircledText(commandText, { onBefore, kind = 'polish
         [
           instruction,
           page ? `这段文字出现在网页「${page}」上` : '',
-          '只改这一段可见文字，保持原语言，不要解释，不要把指令写进正文。',
+          excerpt ? `圈中/点名要改的片段：「${excerpt}」。只改这一部分，其余原文一字不动。` : '',
+          '若用户写明只改其中几个词或几句，或附图里蓝圈只罩住段落的一部分，则只改那些。返回改完后的整段可见文字，不要只返回被改的词，不要解释，不要把指令写进正文。',
         ]
           .filter(Boolean)
           .join('。'),
         original,
+        extras,
       )
       next = String(data?.text || '').trim()
     }
     if (!next || next === original || isRewriteInstruction(next)) continue
-    if (replaceText(el, original, next)) count += 1
+    if (applyRewriteResult(el, original, next, excerpt || local)) count += 1
   }
   if (!count) {
     return {
@@ -3291,8 +3852,199 @@ export async function rewriteCircledText(commandText, { onBefore, kind = 'polish
     ok: true,
     count,
     message: usedModel
-      ? `已调用模型改写圈中文字，共 ${count} 处。可还原这一处`
+      ? `已调用模型按圈选和要求改写文字，共 ${count} 处。可还原这一处`
       : `已换成指定文字，共 ${count} 处。可还原这一处`,
+  }
+}
+
+function wantsWholeAnno(ask, original) {
+  const t = String(ask || '')
+  if (/整段|整段话|这一段都|这段都|全部标|整段都|整句都/.test(t)) return true
+  const a = String(original || '').replace(/\s+/g, '')
+  return a.length > 0 && a.length <= 12 && t.length > 0
+}
+
+function phrasesFromAsk(ask, original) {
+  const src = String(original || '')
+  const out = []
+  const seen = new Set()
+  const add = (raw) => {
+    const t = String(raw || '').replace(/\s+/g, ' ').trim()
+    if (!t || t.length > src.length * 0.8) return
+    const hit = src.includes(t) ? t : src.match(new RegExp(t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i'))?.[0]
+    if (!hit || seen.has(hit)) return
+    seen.add(hit)
+    out.push(hit)
+  }
+  for (const m of String(ask || '').matchAll(/[「『“"'']([^」』”"']{1,80})[」』”"']/g)) add(m[1])
+  return out
+}
+
+function parseAnnotateMarks(raw, original) {
+  const src = String(original || '')
+  const text = String(raw || '').trim()
+  let marks = []
+  const json = text.match(/\{[\s\S]*\}/)
+  if (json) {
+    try {
+      const data = JSON.parse(json[0])
+      if (Array.isArray(data.marks)) marks = data.marks
+      else if (typeof data.marks === 'string') marks = [data.marks]
+    } catch {
+      /* fall through */
+    }
+  }
+  const out = []
+  const seen = new Set()
+  for (const item of marks) {
+    const t = String(item || '').replace(/\s+/g, ' ').trim()
+    if (!t) continue
+    const hit = src.includes(t) ? t : src.match(new RegExp(t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i'))?.[0]
+    if (!hit || seen.has(hit)) continue
+    seen.add(hit)
+    out.push(hit)
+  }
+  return out
+}
+
+function collectTextNodeMap(el) {
+  const map = []
+  const doc = el.ownerDocument
+  const walker = doc.createTreeWalker(el, NodeFilter.SHOW_TEXT)
+  let acc = ''
+  while (walker.nextNode()) {
+    const node = walker.currentNode
+    if (node.parentElement?.closest?.('[data-markset-anno]')) continue
+    const start = acc.length
+    acc += node.nodeValue || ''
+    map.push({ node, start, end: acc.length })
+  }
+  return { map, acc }
+}
+
+function wrapPhraseInEl(el, phrase, kind) {
+  const needle = String(phrase || '')
+  if (!needle || !el) return 0
+  const { map, acc } = collectTextNodeMap(el)
+  if (!map.length) return 0
+  let idx = acc.indexOf(needle)
+  if (idx < 0) idx = acc.toLowerCase().indexOf(needle.toLowerCase())
+  if (idx < 0) return 0
+  const end = idx + needle.length
+  const startHit = map.find((m) => idx >= m.start && idx < m.end)
+  const endHit = [...map].reverse().find((m) => end > m.start && end <= m.end) || map.find((m) => end > m.start && end <= m.end)
+  if (!startHit || !endHit) return 0
+  const range = el.ownerDocument.createRange()
+  try {
+    range.setStart(startHit.node, idx - startHit.start)
+    range.setEnd(endHit.node, end - endHit.start)
+    const span = el.ownerDocument.createElement('span')
+    span.setAttribute('data-markset-anno', kind)
+    try {
+      range.surroundContents(span)
+    } catch {
+      const frag = range.extractContents()
+      span.appendChild(frag)
+      range.insertNode(span)
+    }
+    stampIds(el.ownerDocument)
+    return 1
+  } catch {
+    return 0
+  }
+}
+
+function applyAnnoPhrases(el, phrases, kind, ask) {
+  const original = textOf(el)
+  const marked = phrasesFromCompactMarks(el)
+  const whole = !marked.length && wantsWholeAnno(ask, original)
+  const usable = (phrases || []).filter((p) => {
+    if (!p) return false
+    if (whole) return true
+    return p.replace(/\s+/g, '').length < original.replace(/\s+/g, '').length * 0.82
+  })
+  if (whole && (!usable.length || usable.some((p) => p.replace(/\s+/g, '').length >= original.replace(/\s+/g, '').length * 0.82))) {
+    el.setAttribute('data-markset-anno', kind)
+    return 1
+  }
+  let n = 0
+  for (const phrase of [...usable].sort((a, b) => b.length - a.length)) {
+    n += wrapPhraseInEl(el, phrase, kind)
+  }
+  return n
+}
+
+const ANNO_ACTION = {
+  highlight: '高亮',
+  bold: '加粗',
+  underline: '下划线',
+  wavy: '波浪线',
+  strike: '删除线',
+}
+
+export async function annotateCircledText(commandText, { onBefore, kind = 'highlight', markName = '' } = {}) {
+  if (!isWebDocActive()) return { ok: false, reason: '没有导入的网页' }
+  const anno = annoKind(kind) === kind ? kind : annoKind(kind)
+  const action = ANNO_ACTION[anno] || '标注'
+  const els = collectRewriteEls()
+  if (!els.length) return { ok: false, reason: '圈中没有可标的文字。请把圈贴在段落上，或把三角形/下划线画在要改的词上' }
+  const instruction =
+    String(commandText || '').trim() ||
+    (markName ? `把标了「${markName}」的单词加上${action}` : `根据附图里画在单词上的标记，只给那些词加上${action}`)
+  onBefore?.(`${action}词语`)
+  const before = els.map((el) => snapshotNode(el))
+  const extras = await annotateSceneExtras()
+  let count = 0
+  let usedModel = false
+  for (const el of els) {
+    const original = textOf(el)
+    if (!original || original.length < 2) continue
+    const asked = phrasesFromAsk(instruction, original)
+    const underMark = phrasesFromCompactMarks(el)
+    let marks = [...new Set([...asked, ...underMark])]
+    const whole = !underMark.length && wantsWholeAnno(instruction, original)
+    if (!whole) {
+      usedModel = true
+      const data = await rewriteText(
+        [
+          instruction,
+          `操作是给原文里的个别词加上${action}。`,
+          markName ? `附图里的标记是「${markName}」。只找出画了这个标记的单词。` : '附图里画在某些词上的三角形、五角星、下划线、小圈，表示只改这些词。',
+          '只返回 JSON：{"marks":["原文里已有的片段"]}。',
+          '不要把整段原文放进 marks，除非用户明确说标整段。',
+          asked.length ? `用户点名的片段：${asked.map((t) => `「${t}」`).join('、')}` : '',
+          underMark.length ? `画标记压到的词（几何提示，以图为准）：${underMark.map((t) => `「${t}」`).join('、')}` : '',
+        ]
+          .filter(Boolean)
+          .join('\n'),
+        original,
+        extras,
+      )
+      const parsed = parseAnnotateMarks(data?.text, original)
+      if (parsed.length) marks = parsed
+      else if (underMark.length) marks = underMark
+    }
+    count += applyAnnoPhrases(el, marks, anno, instruction)
+  }
+  if (!count) {
+    return {
+      ok: false,
+      reason: usedModel
+        ? `模型和截图已交给判断，但没有定位到要${action}的词。可把三角形/下划线画在单词上，或写明要改哪几个词`
+        : `请把标记画在要${action}的词上，或写明要改哪几个词`,
+    }
+  }
+  const after = before.map((shot) => {
+    const live = shot.webId ? findByWebId(shot.webId) : null
+    return live ? snapshotNode(live) : { ...shot, removed: true }
+  })
+  recordWebEdit(`${action}词语`, before, after)
+  ping()
+  fitHeight()
+  return {
+    ok: true,
+    count,
+    message: `已按要求和截图只给对应的词加上${action}，共 ${count} 处。可还原这一处`,
   }
 }
 
@@ -3605,9 +4357,33 @@ function clipScene(text, n = 72) {
     .slice(0, n)
 }
 
+function looksLikeCoverGraphic(el) {
+  if (!el) return false
+  const r = el.getBoundingClientRect?.() || { width: 0, height: 0 }
+  if (r.width < 56 || r.height < 72) return false
+  const blob = [
+    el.id,
+    el.className,
+    el.getAttribute?.('alt'),
+    el.parentElement?.className,
+    el.parentElement?.parentElement?.className,
+  ]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase()
+  if (/cover|book|volume|jacket/.test(blob)) return true
+  const ratio = r.height / Math.max(1, r.width)
+  if (ratio < 1.12 || ratio > 2.05 || r.width > 420) return false
+  const unit = el.closest?.('a, li, article, figure, [class*="card"], [class*="cover"]')
+  if (!unit) return false
+  const img = unit.querySelector?.('img')
+  return !img || img === el || el.contains?.(img)
+}
+
 function imageRole(el, r, frameW) {
   const blob = `${el?.id || ''} ${el?.className || ''} ${el?.getAttribute?.('alt') || ''} ${el?.getAttribute?.('aria-label') || ''}`.toLowerCase()
   if (looksLikeLogo(el) || /logo|brand|icon/.test(blob)) return '网站Logo或图标'
+  if (looksLikeCoverGraphic(el)) return '书籍或卡片封面，必须铺满封面框'
   if (r.width < 44 && r.height < 44) return '小图标'
   if (frameW && r.width > frameW * 0.55 && r.height > 72) return '页眉或主视觉大图'
   if (r.y < 130) return '页顶配图'
@@ -3661,78 +4437,165 @@ function imageScenePrompt(el) {
   const alt = clipScene(el.getAttribute?.('alt') || el.querySelector?.('img')?.getAttribute?.('alt'), 36)
   if (alt) bits.push(`原图说明「${alt}」`)
   bits.push(...nearbyCopy(el))
-  bits.push('请生成适合这个网页位置、能和周围内容放在一起的图，不要大段文字或水印')
+  if (looksLikeCoverGraphic(el)) {
+    bits.push(
+      '这是替换已有封面：生成铺满该位置的封面画面本身，竖版，不要生成一本小书、不要白边衬底、不要把新图叠在旧封面上',
+    )
+  } else {
+    bits.push('请生成适合这个网页位置、能和周围内容放在一起的图，不要大段文字或水印')
+  }
   return bits.join('。')
 }
 
 export function circledImageSeed() {
-  const el = resolveCircledEls('color-image').find((node) => isGraphicEl(node) || isImageEl(node) || hasPaintedBg(node))
+  const box = editRegionBox()
+  const raw = uniqueEls([
+    ...resolveCircledEls('color-image'),
+    ...(box ? scanOverlapEls(box).map((h) => h.el) : []),
+  ])
+  const el = raw.map((node) => coverGraphicOf(node) || node).find((node) => isImageEl(node) || isGraphicEl(node) || hasPaintedBg(node))
   if (!el) {
-    const box = insertHostBox()?.box
+    const host = insertHostBox()?.box
     return {
       imageDataUrl: '',
-      width: Math.round(box?.w || 0),
-      height: Math.round(box?.h || 0),
+      width: Math.round(host?.w || 0),
+      height: Math.round(host?.h || 0),
       scene: imageScenePrompt(null),
     }
   }
-  const r = el.getBoundingClientRect()
+  const graphic = coverGraphicOf(el) || el
+  const r = graphic.getBoundingClientRect()
   return {
-    imageDataUrl: rasterizeEl(el),
+    imageDataUrl: rasterizeEl(graphic),
     width: Math.round(r.width),
     height: Math.round(r.height),
-    scene: imageScenePrompt(el),
+    scene: imageScenePrompt(graphic),
   }
+}
+
+export function circledPaintIsPhoto() {
+  if (!isWebDocActive()) return false
+  const box = editRegionBox()
+  const scene = describePaintScene()
+  if (scene.kind === 'image') return true
+  const raw = uniqueEls([
+    ...resolveCircledEls('color-image'),
+    ...resolveCircledEls(''),
+    ...(box ? scanOverlapEls(box).map((h) => h.el) : []),
+  ])
+  const fromTree = raw.map((el) => coverGraphicOf(el)).filter((el) => el && (isImageEl(el) || hasPaintedBg(el)))
+  let graphic = fromTree.find((el) => looksLikeCoverGraphic(el)) || fromTree[0] || null
+  if (!graphic && box) {
+    const doc = getDoc()
+    for (const img of [...(doc?.querySelectorAll('img, canvas, video, picture') || [])]) {
+      const node = img.tagName === 'PICTURE' ? img.querySelector('img') || img : img
+      if (!node?.isConnected) continue
+      const hit = overlapScore(node, box)
+      if (hit.coverEl >= 0.16 || hit.coverBox >= 0.12 || centerInPaint(node, box)) {
+        graphic = node
+        if (looksLikeCoverGraphic(node)) break
+      }
+    }
+  }
+  if (!graphic) return false
+  if (looksLikeCoverGraphic(graphic) || graphic.tagName === 'IMG' || graphic.tagName === 'CANVAS' || graphic.tagName === 'VIDEO') {
+    if (scene.kind === 'text' && !looksLikeCoverGraphic(graphic)) return false
+    return true
+  }
+  return scene.kind !== 'text'
+}
+
+function fitCoverImage(img, slot) {
+  if (!img) return img
+  const host = slot && slot !== img ? slot : img.parentElement
+  img.removeAttribute('srcset')
+  img.style.width = '100%'
+  img.style.height = '100%'
+  img.style.maxWidth = '100%'
+  img.style.objectFit = 'cover'
+  img.style.display = 'block'
+  img.style.position = ''
+  img.style.left = ''
+  img.style.top = ''
+  img.style.zIndex = ''
+  if (host) {
+    const cs = host.ownerDocument?.defaultView?.getComputedStyle(host)
+    if (cs && (!cs.position || cs.position === 'static')) {
+      /* keep flow; cover_img already relative in Gutenberg */
+    }
+  }
+  return img
 }
 
 function putImageOnEl(el, src) {
   if (!el || !src) return null
-  if (el.tagName === 'IMG') {
-    el.removeAttribute('srcset')
-    el.src = src
-    return el
+  const graphic = coverGraphicOf(el) || el
+  if (graphic.tagName === 'IMG') {
+    graphic.src = src
+    return fitCoverImage(graphic, graphic.parentElement)
   }
-  if (el.tagName === 'SVG' || el.tagName === 'CANVAS' || el.tagName === 'PICTURE') {
-    const img = el.ownerDocument.createElement('img')
+  if (graphic.tagName === 'SVG' || graphic.tagName === 'CANVAS' || graphic.tagName === 'VIDEO' || graphic.tagName === 'PICTURE') {
+    const img = graphic.ownerDocument.createElement('img')
     img.src = src
-    img.alt = el.getAttribute('aria-label') || el.getAttribute('alt') || '生成的图'
-    const r = el.getBoundingClientRect()
+    img.alt = graphic.getAttribute('aria-label') || graphic.getAttribute('alt') || '生成的图'
+    const r = graphic.getBoundingClientRect()
     img.style.width = `${Math.max(12, Math.round(r.width))}px`
     img.style.height = `${Math.max(12, Math.round(r.height))}px`
     img.style.objectFit = 'cover'
-    el.replaceWith(img)
+    graphic.replaceWith(img)
     stampIds(el.ownerDocument)
-    return img
+    return fitCoverImage(img, img.parentElement)
   }
-  const inner = el.querySelector?.('img')
+  const inner = graphic.querySelector?.('img')
   if (inner) {
-    inner.removeAttribute('srcset')
     inner.src = src
-    return inner
+    return fitCoverImage(inner, graphic)
   }
-  el.style.backgroundImage = `url("${src}")`
-  if (!el.style.backgroundSize) el.style.backgroundSize = 'cover'
-  if (!el.style.backgroundRepeat) el.style.backgroundRepeat = 'no-repeat'
-  return el
+  graphic.style.backgroundImage = `url("${src}")`
+  if (!graphic.style.backgroundSize) graphic.style.backgroundSize = 'cover'
+  if (!graphic.style.backgroundRepeat) graphic.style.backgroundRepeat = 'no-repeat'
+  graphic.style.backgroundPosition = 'center'
+  return graphic
+}
+
+function overlappingInsertImages(box) {
+  const doc = getDoc()
+  if (!doc || !box) return []
+  return [...doc.querySelectorAll('[data-markset-insert="image"]')].filter((el) => {
+    if (!el.isConnected) return false
+    const r = el.getBoundingClientRect()
+    const hit = intersectBoxes(box, { x: r.left, y: r.top, w: r.width, h: r.height })
+    if (!hit) return false
+    return (hit.w * hit.h) / Math.max(1, r.width * r.height) > 0.18
+  })
 }
 
 export function applyGeneratedWebImage(src) {
   const url = String(src || '').trim()
   if (!url) return { ok: false, reason: '没有生成出图片' }
-  const scene = describePaintScene()
-  if (scene.blank || scene.kind === 'blank' || scene.fill < 0.18) return insertWebImage(url)
-  const els = uniqueEls(resolveCircledEls('color-image').filter((el) => isGraphicEl(el) || isImageEl(el) || hasPaintedBg(el)))
-  if (!els.length) return insertWebImage(url)
-  const before = els.map((el) => snapshotNode(el))
+  const box = editRegionBox()
+  const raw = uniqueEls([
+    ...resolveCircledEls('color-image'),
+    ...(box ? scanOverlapEls(box).map((h) => h.el) : []),
+  ])
+  let targets = uniqueEls(raw.map((el) => coverGraphicOf(el)).filter(Boolean))
+  if (!targets.length) {
+    targets = uniqueEls(raw.filter((el) => isImageEl(el) || isGraphicEl(el) || hasPaintedBg(el)))
+  }
+  if (!targets.length) return insertWebImage(url)
+  const overlays = overlappingInsertImages(box)
+  const before = uniqueEls([...overlays, ...targets]).map((el) => snapshotNode(el))
+  for (const el of overlays) el.remove()
   const after = []
-  for (const el of els) {
+  for (const el of targets) {
+    if (!el.isConnected) continue
     const node = putImageOnEl(el, url)
     if (node?.isConnected) after.push(snapshotNode(node))
   }
   if (!after.length) return insertWebImage(url)
   recordWebEdit('换成生成的图', before, after)
   fitHeight()
-  return { ok: true, message: '已用生成的图换上。可还原这一处' }
+  return { ok: true, message: '已用生成的图换上封面/配图。可还原这一处' }
 }
 
 function fileName() {

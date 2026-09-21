@@ -1,10 +1,10 @@
-import { aabb, classifyLassoSymbol, classifyMarkShape, dist, looksLikeArrowGesture, looksLikeEnclosingStroke, looksLikeRadialBurst, looksLikeUnderlineGesture, pathLength, SHAPE_LABELS } from './geometry.js'
+import { aabb, classifyLassoSymbol, classifyMarkShape, classifyStrokeKind, dist, looksLikeArrowGesture, looksLikeEnclosingStroke, looksLikeRadialBurst, looksLikeUnderlineGesture, pathLength, SHAPE_LABELS, unionBoxes } from './geometry.js'
 import { loadImageEl } from './mask.js'
 import { getSnapshot } from './store.js'
 import { getInkStrokes, inkToDataUrl } from './ink.js'
 import { getPaintMarks } from './overlay.js'
 import { describeCircledHits, insertHostScreenBox, isWebDocActive } from './web-doc.js'
-import { habitForShape, habitGuess, shapeTitle } from './symbol-habits.js'
+import { habitForShape, habitForStroke, habitGuess, listMarkFingerprints, shapeTitle } from './symbol-habits.js'
 
 function markLine(span) {
   const id = span.markId ? `#${String(span.markId).replace(/^#/, '')}` : '(no-id)'
@@ -134,9 +134,14 @@ function handwritingStrokes() {
   const inks = getInkStrokes().filter((s) => s?.length >= 2)
   if (inks.length) return inks
   return getPaintMarks()
-    .filter((m) => m.role !== 'subtract' && m.role !== 'add')
+    .filter(
+      (m) =>
+        m.points?.length >= 2 &&
+        m.role !== 'subtract' &&
+        m.role !== 'add' &&
+        (m.role === 'symbol' || !looksLikeLasso(m.points)),
+    )
     .map((m) => m.points)
-    .filter((s) => s?.length >= 2 && !looksLikeLasso(s))
 }
 
 function strokesToBoard(strokes, { color = '#111111', maxSide = 720 } = {}) {
@@ -193,18 +198,44 @@ export function looksLikeDrawnPattern() {
   return false
 }
 
+export function strokeKindOptions() {
+  const marks = getPaintMarks()
+  const hasSelection =
+    getSnapshot().spans.some((s) => s.layoutRole !== 'dest') ||
+    marks.some((m) => (m.role === 'select' || m.role === 'add') && m.points?.length >= 3)
+  const boxes = [
+    ...marks.filter((m) => m.role === 'select' || m.role === 'add').map((m) => aabb(m.points)),
+    ...getSnapshot()
+      .spans.filter((s) => s.layoutRole !== 'dest' && s.screenRect)
+      .map((s) => s.screenRect),
+  ]
+  const selBox = boxes.length ? boxes.reduce((a, b) => unionBoxes(a, b)) : null
+  return { hasSelection, selBox, knownFingerprints: listMarkFingerprints() }
+}
+
 export function currentSymbolShape() {
   const fromInk = classifyMarkShape(handwritingStrokes())
   if (fromInk.shape) return fromInk
   const marks = getPaintMarks().filter(
     (m) => m?.points?.length >= 4 && m.role !== 'subtract' && m.role !== 'add',
   )
+  const ctx = strokeKindOptions()
   for (const mark of [...marks].reverse()) {
+    const kind = classifyStrokeKind(mark.points, ctx)
+    if (mark.role === 'symbol' || kind.kind === 'symbol' || kind.kind === 'symbol-target') {
+      const shape = kind.shape || classifyLassoSymbol(mark.points)
+      if (shape) return { shape, label: kind.label || SHAPE_LABELS[shape] || shapeTitle(shape), fingerprint: kind.fingerprint }
+    }
     const shape = classifyLassoSymbol(mark.points)
     if (!shape) continue
     const box = aabb(mark.points)
     if (shape === 'circle' && (box.w > 140 || box.h > 140) && marks.length > 1) continue
     return { shape, label: SHAPE_LABELS[shape] || shape }
+  }
+  const last = marks[marks.length - 1]
+  if (last) {
+    const habit = habitForStroke(last.points)
+    if (habit) return { shape: habit.shape, label: shapeTitle(habit.shape, habit.ask), fingerprint: habit.fingerprint }
   }
   return { shape: '', label: '' }
 }
@@ -213,14 +244,14 @@ export function classifyDrawnGesture() {
   const strokes = handwritingStrokes().filter((s) => s?.length >= 2)
   const mark = currentSymbolShape()
   if (mark.shape) {
-    const habit = habitForShape(mark.shape)
+    const habit = habitForShape(mark.shape) || habitForStroke(strokes[strokes.length - 1])
     if (habit) {
       const guess = habitGuess(habit, mark.shape)
       return {
         kind: habit.intent,
         shape: mark.shape,
         label: guess.label,
-        hint: `用户习惯用${shapeTitle(mark.shape)}表示「${habit.label}」。直接按这个习惯执行。`,
+        hint: `用户习惯用${shapeTitle(mark.shape, mark.label)}表示「${habit.label}」。直接按这个习惯执行。`,
         habit: true,
       }
     }
@@ -250,12 +281,12 @@ export function classifyDrawnGesture() {
       hint: '横线画在文字下方，表示加下划线。',
     }
   }
-  if (mark.shape && ['star', 'triangle', 'circle', 'check', 'x', 'line', 'wavy'].includes(mark.shape)) {
+  if (mark.shape && (['star', 'triangle', 'circle', 'check', 'x', 'line', 'wavy'].includes(mark.shape) || String(mark.shape).startsWith('mark:'))) {
     return {
       kind: '',
       shape: mark.shape,
       label: '',
-      hint: `画出了${shapeTitle(mark.shape)}。还没有习惯，先输入它代表什么并执行一次，下次就能一键调用。`,
+      hint: `画出了${shapeTitle(mark.shape, mark.label)}。还没有习惯，先输入它代表什么并执行一次，下次就能一键调用。`,
       unknownHabit: true,
     }
   }

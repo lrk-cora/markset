@@ -76,6 +76,65 @@ export function isSelfIntersecting(pts) {
   return false
 }
 
+function hullCornerCount(pts) {
+  const hull = convexHull(pts)
+  if (hull.length < 3) return hull.length
+  let n = 0
+  for (let i = 0; i < hull.length; i += 1) {
+    const a = hull[(i + hull.length - 1) % hull.length]
+    const b = hull[i]
+    const c = hull[(i + 1) % hull.length]
+    const ang = Math.abs(Math.atan2(c.y - b.y, c.x - b.x) - Math.atan2(a.y - b.y, a.x - b.x))
+    const deg = (Math.min(ang, Math.PI * 2 - ang) * 180) / Math.PI
+    if (deg > 28 && deg < 158) n += 1
+  }
+  return n || hull.length
+}
+
+function countCrossings(pts) {
+  if (!pts || pts.length < 6) return 0
+  let n = 0
+  for (let i = 0; i < pts.length - 1; i += 1) {
+    for (let j = i + 2; j < pts.length - 1; j += 1) {
+      if (i === 0 && j === pts.length - 2) continue
+      if (segmentsIntersect(pts[i], pts[i + 1], pts[j], pts[j + 1])) n += 1
+    }
+  }
+  return n
+}
+
+/** Count outward spikes around the centroid. Stars have ~5; triangles have ~3. */
+function radialPeakCount(pts) {
+  if (!pts || pts.length < 8) return 0
+  const box = aabb(pts)
+  const cx = box.x + box.w / 2
+  const cy = box.y + box.h / 2
+  const bins = 36
+  const rad = new Array(bins).fill(0)
+  for (const p of pts) {
+    const ang = Math.atan2(p.y - cy, p.x - cx)
+    const i = Math.floor((((ang + Math.PI) / (Math.PI * 2)) * bins) % bins)
+    const r = Math.hypot(p.x - cx, p.y - cy)
+    if (r > rad[i]) rad[i] = r
+  }
+  const max = Math.max(...rad, 1)
+  const peaks = []
+  for (let i = 0; i < bins; i += 1) {
+    const a = rad[(i + bins - 1) % bins]
+    const b = rad[i]
+    const c = rad[(i + 1) % bins]
+    if (b >= a && b >= c && b > max * 0.42 && b > Math.max(a, c) * 0.92) peaks.push(i)
+  }
+  if (!peaks.length) return 0
+  if (peaks.length === 1) return 1
+  let merged = 1
+  for (let i = 1; i < peaks.length; i += 1) {
+    if (peaks[i] - peaks[i - 1] > 2) merged += 1
+  }
+  if (peaks[0] + bins - peaks[peaks.length - 1] <= 2) merged -= 1
+  return Math.max(1, merged)
+}
+
 export function looksLikeXStroke(pts) {
   if (!pts || pts.length < 8 || !isSelfIntersecting(pts)) return false
   if (looksLikeStarStroke(pts)) return false
@@ -89,17 +148,38 @@ export function looksLikeXStroke(pts) {
   return len > diag * 1.45 && corners <= 4
 }
 
-/** One-stroke pentagram: many turns and a long path, not a simple two-line X. */
+/** One-stroke pentagram: five spikes and crossing strokes, not a triangle. */
 export function looksLikeStarStroke(pts) {
   if (!pts || pts.length < 16) return false
   const box = aabb(pts)
   if (box.w < 18 || box.h < 18) return false
+  const crosses = countCrossings(pts)
+  const peaks = radialPeakCount(pts)
+  const hullN = hullCornerCount(pts)
+  const hull = convexHull(pts)
+  const hullLoop = hull.length >= 3 ? [...hull, hull[0]] : hull
+  const wiggly = pathLength(hullLoop) > 1 ? pathLength(pts) / pathLength(hullLoop) : 0
+  if (peaks >= 5 && (crosses >= 2 || wiggly > 1.42)) return true
+  if (crosses >= 4 && peaks >= 4) return true
+  if (peaks >= 5 && hullN >= 5 && wiggly > 1.35) return true
   const corners = turningCorners(pts, 32)
-  const len = pathLength(pts)
-  const diag = Math.hypot(box.w, box.h)
-  if (corners >= 8) return true
-  if (corners >= 5 && (isSelfIntersecting(pts) || len > diag * 2.5)) return true
-  return corners >= 4 && isSelfIntersecting(pts) && len > diag * 3.1
+  return corners >= 8 && crosses >= 2 && peaks >= 4
+}
+
+export function looksLikeTriangleStroke(pts) {
+  if (!pts || pts.length < 8) return false
+  if (looksLikeStarStroke(pts)) return false
+  const box = aabb(pts)
+  if (box.w < 18 || box.h < 18) return false
+  const crosses = countCrossings(pts)
+  if (crosses >= 3) return false
+  const peaks = radialPeakCount(pts)
+  const hullN = hullCornerCount(pts)
+  if (peaks >= 5 && (crosses >= 2 || hullN >= 5)) return false
+  if (peaks >= 3 && peaks <= 4 && hullN <= 4 && crosses <= 1) return true
+  const corners = turningCorners(pts)
+  const round = roundness(pts)
+  return corners >= 3 && corners <= 4 && round < 0.7 && hullN <= 4 && crosses <= 1
 }
 
 /** Several straight strokes fanning out from a hub, e.g. sunburst around a logo. */
@@ -249,32 +329,67 @@ function roundness(pts) {
   return Math.min(1, (area / Math.max(1, Math.PI * r * r)) * aspect)
 }
 
-/** Casual circle / C-shape / messy loop still counts as enclosing, not a neat rectangle. */
-export function looksLikeEnclosingStroke(pts) {
-  if (!pts || pts.length < 8) return false
+function strokeQuadrantCount(pts) {
   const box = aabb(pts)
-  if (box.w < 28 || box.h < 18) return false
+  const cx = box.x + box.w / 2
+  const cy = box.y + box.h / 2
+  let bits = 0
+  for (const p of pts) {
+    bits |= 1 << ((p.x >= cx ? 1 : 0) | (p.y >= cy ? 2 : 0))
+  }
+  let n = 0
+  for (let i = 0; i < 4; i += 1) if (bits & (1 << i)) n += 1
+  return n
+}
+
+function regionInflate(pts) {
+  const box = aabb(pts)
+  return Math.max(14, Math.min(40, Math.min(box.w, box.h) * 0.1))
+}
+
+/** Casual circle / C / incomplete box still counts as a filled region, not a neat rectangle. */
+export function looksLikeEnclosingStroke(pts) {
+  if (!pts || pts.length < 6) return false
+  const box = aabb(pts)
+  if (box.w < 22 || box.h < 16) return false
+  if (looksLikeDrawnLine(pts) && Math.min(box.w, box.h) < 36) return false
   const peri = 2 * (box.w + box.h)
   const len = pathLength(pts)
-  if (len < peri * 0.32) return false
-  if (looksLikeDrawnLine(pts) && Math.min(box.w, box.h) < 28) return false
+  if (len < peri * 0.24) return false
   const gap = dist(pts[0], pts[pts.length - 1])
   const span = Math.max(box.w, box.h)
   const minSpan = Math.min(box.w, box.h)
-  const closed = gap < span * 0.48 || (gap < Math.max(40, minSpan * 0.72) && gap < len * 0.38)
+  const closed = gap < span * 0.58 || (gap < Math.max(52, minSpan * 0.9) && gap < len * 0.5)
   if (closed) return true
-  return gap < len * 0.48 && len > peri * 0.5 && box.w > 36 && box.h > 24
+  const quads = strokeQuadrantCount(pts)
+  if (quads >= 3 && box.w > 26 && box.h > 18 && len > peri * 0.26) return true
+  if (quads >= 2 && minSpan > 32 && len > peri * 0.36) return true
+  return false
+}
+
+/** 2D lasso meant to surround content. Thin underlines stay line-like. */
+export function isRegionStroke(pts) {
+  if (looksLikeEnclosingStroke(pts)) return true
+  if (!pts || pts.length < 6) return false
+  if (looksLikeDrawnLine(pts)) return false
+  const box = aabb(pts)
+  const min = Math.min(box.w, box.h)
+  const peri = 2 * (box.w + box.h)
+  const len = pathLength(pts)
+  if (min > 22 && box.w * box.h > 36 * 24 && len > peri * 0.22) return true
+  return false
 }
 
 export function enclosingPolygon(pts) {
   const cleaned = simplify(pts, 3)
   if (cleaned.length < 3) return cleaned
+  const pad = regionInflate(cleaned)
   const loop = dist(cleaned[0], cleaned[cleaned.length - 1]) > 2 ? [...cleaned, cleaned[0]] : cleaned
   if (isSelfIntersecting(loop) || loop.length > 90) {
     const hull = convexHull(cleaned)
-    if (hull.length >= 3) return inflatePolygon(hull, 10)
+    if (hull.length >= 3) return inflatePolygon(hull, pad)
   }
-  return inflatePolygon(loop, 10)
+  return inflatePolygon(loop, pad)
 }
 
 export function inflatePolygon(pts, pad) {
@@ -311,6 +426,7 @@ export function classifyStrokeShape(pts) {
   const corners = turningCorners(pts)
   const round = roundness(pts)
   if (looksLikeStarStroke(pts)) return 'star'
+  if (looksLikeTriangleStroke(pts)) return 'triangle'
   if (looksLikeXStroke(pts)) return 'x'
   if (!enclosing && looksLikeDrawnLine(pts)) {
     if (len > chord * 1.55 && box.w > box.h * 2.1) return 'wavy'
@@ -318,12 +434,9 @@ export function classifyStrokeShape(pts) {
   }
   if (!enclosing && box.w > 22 && box.h > 22 && chord < Math.max(box.w, box.h) * 0.45) {
     if (corners >= 2 && corners <= 3 && box.h > box.w * 0.65) return 'check'
-    if (corners >= 3 && corners <= 4 && round < 0.66) return 'triangle'
   }
   if (enclosing) {
-    if (corners >= 8 || (corners >= 5 && round < 0.62)) return 'star'
     if (round > 0.7 && corners <= 4) return 'circle'
-    if (corners >= 3 && corners <= 4 && round < 0.66) return 'triangle'
     if (looksLikeBoxStroke(pts)) return 'box'
     if (round > 0.52) return 'circle'
   }
@@ -365,34 +478,142 @@ export function classifyLassoSymbol(pts) {
 
 const SYMBOL_SHAPES = new Set(['star', 'triangle', 'x', 'check', 'arrow', 'line', 'wavy'])
 
-/**
- * Decide whether a stroke is a selection region, a compact intent symbol, or handwriting.
- * Large irregular loops are always selection. Compact named shapes are symbols.
- * After a selection exists, symbols annotate; without a selection they also pick the object under the mark.
- */
-export function classifyStrokeKind(pts, { hasSelection = false, refine = false } = {}) {
-  if (!pts || pts.length < 4) return { kind: 'none', shape: '', label: '' }
-  if (refine) return { kind: hasSelection ? 'refine' : 'select', shape: '', label: '' }
+export function strokeFingerprint(pts) {
+  if (!pts || pts.length < 4) return ''
+  const box = aabb(pts)
+  const diag = Math.hypot(box.w, box.h) || 1
+  const corners = turningCorners(pts)
+  const round = roundness(pts)
+  const aspect = Math.max(box.w, box.h) / Math.max(1, Math.min(box.w, box.h))
+  const density = pathLength(pts) / diag
+  const gap = dist(pts[0], pts[pts.length - 1]) / diag
+  return [
+    looksLikeEnclosingStroke(pts) ? 'E' : 'O',
+    isSelfIntersecting(pts) ? 'X' : 'N',
+    corners >= 8 ? 'C3' : corners >= 5 ? 'C2' : corners >= 3 ? 'C1' : 'C0',
+    round > 0.62 ? 'R2' : round > 0.38 ? 'R1' : 'R0',
+    aspect > 2.8 ? 'A2' : aspect > 1.7 ? 'A1' : 'A0',
+    density > 3.2 ? 'D2' : density > 2 ? 'D1' : 'D0',
+    gap < 0.35 ? 'G1' : 'G0',
+  ].join('-')
+}
+
+export function fingerprintsMatch(a, b) {
+  if (!a || !b) return false
+  if (a === b) return true
+  const pa = String(a).split('-')
+  const pb = String(b).split('-')
+  if (pa.length !== pb.length) return false
+  let soft = 0
+  for (let i = 0; i < pa.length; i += 1) {
+    if (pa[i] === pb[i]) continue
+    if ((pa[i][0] === 'R' || pa[i][0] === 'D') && pa[i][0] === pb[i][0]) {
+      soft += 1
+      if (soft > 1) return false
+      continue
+    }
+    return false
+  }
+  return true
+}
+
+export function markTargetPolygon(pts, shape = '') {
+  const box = aabb(pts)
+  const lineLike = shape === 'line' || shape === 'wavy'
+  const padX = lineLike ? 8 : 14
+  const padY = lineLike ? 8 : 14
+  const lift = lineLike ? Math.max(26, Math.min(52, box.w * 0.14)) : 0
+  return [
+    { x: box.x - padX, y: box.y - padY - lift },
+    { x: box.x + box.w + padX, y: box.y - padY - lift },
+    { x: box.x + box.w + padX, y: box.y + box.h + padY },
+    { x: box.x - padX, y: box.y + box.h + padY },
+  ]
+}
+
+/** Compact / scribbly / named strokes are marks; large loops are region lassos even if messy. */
+export function looksLikeMarkStroke(pts, { hasSelection = false, selBox = null, knownFingerprints = [] } = {}) {
+  if (!pts || pts.length < 4) return false
   const box = aabb(pts)
   const long = Math.max(box.w, box.h)
-  const enclosing = looksLikeEnclosingStroke(pts)
-  const shape = classifyStrokeShape(pts)
-  const compact = long <= 220 && Math.min(box.w, box.h) <= 200
-  const named = (SYMBOL_SHAPES.has(shape) || (shape === 'circle' && compact)) && shape
-  const lineLike = shape === 'line' || shape === 'wavy'
-  if (named && long > 280 && !lineLike && (shape === 'circle' || shape === 'triangle')) {
-    return { kind: 'select', shape: '', label: '' }
+  const short = Math.min(box.w, box.h)
+  const enclosing = isRegionStroke(pts)
+  const named = classifyStrokeShape(pts)
+  const distinctive = named === 'star' || named === 'x' || named === 'check' || named === 'arrow'
+  if (enclosing && long > 120 && short > 34 && !distinctive) return false
+  if (enclosing && long > 160 && !distinctive) return false
+  const fp = strokeFingerprint(pts)
+  if (fp && knownFingerprints.some((k) => fingerprintsMatch(fp, k))) return true
+  if (named && named !== 'circle' && named !== 'box') return true
+  if (named === 'circle' && long <= 130) return true
+  if (named === 'box' && long <= 110) return true
+  if (looksLikeDrawnLine(pts)) return true
+  const corners = turningCorners(pts)
+  const diag = Math.hypot(box.w, box.h) || 1
+  const density = pathLength(pts) / diag
+  const scribbly = isSelfIntersecting(pts) || corners >= 5 || density > 3.6
+  if (scribbly && long <= 280) {
+    if (enclosing && long > 90 && short > 40) return false
+    return true
   }
-  if (named) {
+  if (hasSelection && selBox) {
+    const area = Math.max(1, box.w * box.h)
+    const selArea = Math.max(1, selBox.w * selBox.h)
+    const hit = intersectBoxes(box, {
+      x: selBox.x - 24,
+      y: selBox.y - 24,
+      w: selBox.w + 48,
+      h: selBox.h + 48,
+    })
+    if (hit && area < selArea * 0.92 && long < Math.max(selBox.w, selBox.h) * 1.2) return true
+  }
+  if (long <= 100 && short <= 100 && (corners >= 3 || density > 2.4)) {
+    if (enclosing && long > 72 && short > 44) return false
+    return true
+  }
+  return false
+}
+
+/**
+ * select = region lasso; symbol-target = mark that also picks the object under it;
+ * symbol = mark on an existing selection (keep the lasso).
+ */
+export function classifyStrokeKind(
+  pts,
+  { hasSelection = false, refine = false, selBox = null, knownFingerprints = [] } = {},
+) {
+  if (!pts || pts.length < 4) return { kind: 'none', shape: '', label: '', fingerprint: '' }
+  if (refine) return { kind: hasSelection ? 'refine' : 'select', shape: '', label: '', fingerprint: '' }
+  const fp = strokeFingerprint(pts)
+  const named = classifyStrokeShape(pts)
+  const shape = named || (fp ? `mark:${fp}` : '')
+  const label = SHAPE_LABELS[named] || (named ? named : '自定义标记')
+  const asMark = looksLikeMarkStroke(pts, { hasSelection, selBox, knownFingerprints })
+  if (asMark) {
+    const far = Boolean(
+      selBox &&
+        !intersectBoxes(aabb(pts), {
+          x: selBox.x - 80,
+          y: selBox.y - 80,
+          w: selBox.w + 160,
+          h: selBox.h + 160,
+        }),
+    )
     return {
-      kind: 'symbol-target',
-      shape: named,
-      label: SHAPE_LABELS[named] || named,
+      kind: hasSelection && !far ? 'symbol' : 'symbol-target',
+      shape,
+      label,
+      fingerprint: fp,
     }
   }
-  if (enclosing) return { kind: 'select', shape: '', label: '' }
-  if (hasSelection) return { kind: 'ink', shape: '', label: '' }
-  return { kind: 'select', shape: '', label: '' }
+  if (looksLikeEnclosingStroke(pts)) return { kind: 'select', shape: '', label: '', fingerprint: fp }
+  if (hasSelection) {
+    const box = aabb(pts)
+    const long = Math.max(box.w, box.h)
+    if (long <= 240) return { kind: 'symbol', shape, label, fingerprint: fp }
+    return { kind: 'ink', shape: '', label: '', fingerprint: fp }
+  }
+  return { kind: 'select', shape: '', label: '', fingerprint: fp }
 }
 
 export function convexHull(pts) {
@@ -460,9 +681,10 @@ export function strokeToPolygon(pts, radius = 18) {
   return left.concat(right.reverse())
 }
 
-/** Filled region for a casual loop; thick ribbon for a line-like stroke. */
+/** Filled region for a 2D lasso; thick ribbon only for line-like strokes. */
 export function paintHitPolygon(pts, radius = 8) {
-  if (looksLikeEnclosingStroke(pts)) return enclosingPolygon(pts)
+  if (looksLikeDrawnLine(pts) && !isRegionStroke(pts)) return strokeToPolygon(pts, Math.max(radius, 12))
+  if (isRegionStroke(pts)) return enclosingPolygon(pts)
   return strokeToPolygon(pts, radius)
 }
 
