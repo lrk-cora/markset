@@ -50,13 +50,15 @@ import {
   restoreWebEdit,
   rewriteCircledText,
   annotateCircledText,
+  inferHabitScope,
   peekShadowLabel,
+  setAnnoScopeHint,
 } from './web-doc.js'
-import { clearPaintMarks, getPaintMarks, lastPaintPoints, setAddMode, setLassoMode, setLastPaintRole, setSubtractMode } from './overlay.js'
+import { clearPaintMarks, getPaintMarks, lastPaintPoints, setLassoMode, setLastPaintRole, setSubtractMode } from './overlay.js'
 import { redoChange, restoreChange } from './changes.js'
 import { clearInk, readInkText } from './ink.js'
-import { captureInsertScene, classifyDrawnGesture, currentSymbolShape, drawnStampDataUrl, drawnStampScreenBox, looksLikeDrawnPattern, strokeKindOptions } from './capture.js'
-import { forgetSymbolHabit, habitForShape, habitForStroke, habitGuess, rememberSymbolHabit, shapeFromMarkName, shapeTitle } from './symbol-habits.js'
+import { captureInsertScene, classifyDrawnGesture, currentSymbolShape, drawnStampDataUrl, drawnStampScreenBox, looksLikeDrawnPattern, matchRecordedHabit, strokeKindOptions } from './capture.js'
+import { clearAllSymbolHabits, forgetSymbolHabit, HABIT_INTENT_OPTIONS, HABIT_SCOPE_OPTIONS, habitForShape, habitForStroke, habitGuess, habitIntentLabel, habitScopeLabel, listSymbolHabits, rememberSymbolHabit, shapeFromMarkName, shapeTitle, updateSymbolHabit } from './symbol-habits.js'
 import {
   applyPageScheme,
   assignSchemeToModules,
@@ -286,6 +288,7 @@ let ui = {
   seenGuessLabels: [],
   fromModel: false,
   markName: '',
+  habitPanel: false,
 }
 
 let guessToken = 0
@@ -339,6 +342,17 @@ function emit() {
 
 export function getCard() {
   return { ...ui }
+}
+
+export function openHabitPanel() {
+  ui.habitPanel = true
+  ui.hideCard = false
+  emit()
+}
+
+export function closeHabitPanel() {
+  ui.habitPanel = false
+  emit()
 }
 
 export function dismissCoach() {
@@ -645,11 +659,17 @@ function blankWantsInsert(ask, note, scene) {
     n === 'frame' ||
     n === 'circle' ||
     n === 'clear-deco' ||
-    n === 'soften'
+    n === 'soften' ||
+    n === 'underline' ||
+    n === 'highlight' ||
+    n === 'bold' ||
+    n === 'wavy' ||
+    n === 'strike'
   ) {
     return false
   }
   const t = String(ask || '')
+  if (/下划线|高亮|加粗|波浪线|删除线/.test(t)) return false
   if (t && /删|色|缩小|放大|阴影|风格|挪|移到/.test(t) && !/加|插|logo|图|字|文案/.test(t)) return false
   return true
 }
@@ -1153,11 +1173,37 @@ function looksLikeStampGuess(verb, written, list = []) {
   return true
 }
 
-function habitOption() {
+function resolvedHabit() {
+  const recorded = matchRecordedHabit()
+  if (recorded?.habit) {
+    const mark = { shape: recorded.shape, label: recorded.label, fingerprint: recorded.fingerprint }
+    return { mark, habit: recorded.habit, guess: habitGuess(recorded.habit, recorded.shape) }
+  }
   const mark = currentSymbolShape()
-  if (!mark.shape) return null
   const pts = lastPaintPoints() || ui.lastPaint
-  return habitGuess(habitForShape(mark.shape) || habitForStroke(pts), mark.shape)
+  let habit = habitForShape(mark.shape) || habitForStroke(pts) || habitForShape(ui.lastStrokeKind?.shape) || null
+  const shape = mark.shape || habit?.shape || ''
+  if (!habit && (shape === 'x' || ui.lastStrokeKind?.shape === 'x')) {
+    habit = { shape: 'x', intent: 'delete', label: '删除', note: 'delete', scope: 'selection' }
+  }
+  return {
+    mark: { ...mark, shape: shape || habit?.shape || '' },
+    habit,
+    guess: habit ? habitGuess(habit, shape || habit.shape) : null,
+  }
+}
+
+function habitOption() {
+  return resolvedHabit().guess
+}
+
+function typedOverridesHabit(typed, habit) {
+  const t = String(typed || '').trim()
+  if (!t || !habit) return false
+  if (/全部|所有|整段|整块|选区|几个词|个别词|画上标记/.test(t) && t.length <= 16) return false
+  const note = parseNote(t)
+  if (!note || note === 'custom' || note === 'add' || note === 'insert') return t.length >= 4
+  return note !== habit.intent
 }
 
 function rememberActiveSymbol(guess, id, label, command, written) {
@@ -1169,6 +1215,7 @@ function rememberActiveSymbol(guess, id, label, command, written) {
   const pts = lastPaintPoints() || ui.lastPaint
   const fp = mark.fingerprint || (String(shape).startsWith('mark:') ? shape.slice(5) : strokeFingerprint(pts))
   const prev = habitForShape(shape) || habitForShape(mark.shape) || habitForStroke(pts)
+  const scope = guess?.scope || inferHabitScope(written) || prev?.scope || ''
   const saved = rememberSymbolHabit({
     shape,
     fingerprint: fp,
@@ -1177,9 +1224,13 @@ function rememberActiveSymbol(guess, id, label, command, written) {
     note: guess?.note || id,
     command,
     ask: written,
+    scope,
   })
   if (!saved) return ''
-  if (!prev || prev.intent !== id || prev.shape !== shape) return `已记住：${shapeTitle(shape, mark.label || ui.markName)} = ${saved.label}`
+  const where = habitScopeLabel(saved.scope)
+  if (!prev || prev.intent !== id || prev.shape !== shape || prev.scope !== saved.scope) {
+    return `已记住：${shapeTitle(shape, mark.label || ui.markName)} = ${saved.label}${where ? `（${where}）` : ''}`
+  }
   return ''
 }
 
@@ -1205,12 +1256,34 @@ function reinterpretLastStroke(asMark, editor, deps) {
     fingerprint: strokeFingerprint(pts),
   }
   emit()
-  deps.toast(asMark ? '已按标记理解这笔，不用再画一遍。可点开始判断' : '已按框选理解这笔。可点开始判断')
+  deps.toast(asMark ? '已按标记理解这笔。有偏好可直接执行，没有就先判断' : '已按框选理解这笔。有偏好可直接执行，没有就先判断')
+}
+
+function annoGuessFromContext(verb, markName, gesture) {
+  const ask = `${ui.typedText || ''} ${ui.noteText || ''} ${markName || ''}`
+  const note = parseNote(ask) || String(verb || '')
+  const ids = new Set(['underline', 'highlight', 'bold', 'wavy', 'strike'])
+  if (ids.has(note)) {
+    return { id: note, label: note === 'underline' ? '加上下划线' : `加上${localLabel(note)}`, note }
+  }
+  if (gesture?.kind === 'underline' || /下划/.test(String(markName || ''))) {
+    return { id: 'underline', label: '加上下划线', note: 'underline' }
+  }
+  if (/高亮/.test(ask) || /高亮/.test(String(markName || ''))) {
+    return { id: 'highlight', label: '加上高亮', note: 'highlight' }
+  }
+  if (/加粗/.test(ask)) return { id: 'bold', label: '改成加粗', note: 'bold' }
+  return null
 }
 
 function reconcileGuesses(vl, local, verb, scene, { more = false } = {}) {
   const gesture = classifyDrawnGesture()
   const vlNorm = uniqueGuesses(vl || [])
+  const anno = annoGuessFromContext(verb, ui.markName, gesture)
+  if (!more && anno) {
+    const rest = (vlNorm.length ? vlNorm : local || []).filter((g) => g.id !== anno.id)
+    return uniqueGuesses([anno, ...rest]).slice(0, 4)
+  }
   const habit = habitOption()
   if (!more && habit) {
     const rest = (vlNorm.length ? vlNorm : local || []).filter((g) => g.id !== habit.id)
@@ -1273,7 +1346,7 @@ function localGuesses(spans, editor) {
   return out
 }
 
-export function requestIntentGuesses(editor, { more = false } = {}) {
+export function requestIntentGuesses(editor, { more = false, forceJudge = false } = {}) {
   const typedNow = String(ui.typedText || '').trim()
   if (!more) {
     if (typedNow) applyWrittenNote(typedNow, { confident: true, silent: true })
@@ -1285,6 +1358,7 @@ export function requestIntentGuesses(editor, { more = false } = {}) {
   }
   const noteNow = parseNote(typedNow)
   const depsNow = guessRuntime.deps
+  const ed = editor || guessRuntime.editor
   if (!more && depsNow && isWebDocActive()) {
     if ((noteNow === 'move-layout' || /移动|挪到|移到|换位置/.test(typedNow)) && inferWebLayoutPairs().length) {
       pickOption('move-layout', depsNow, editor)
@@ -1292,6 +1366,7 @@ export function requestIntentGuesses(editor, { more = false } = {}) {
     }
   }
   const token = ++guessToken
+  setAnnoScopeHint('')
   ui.step = 'propose'
   ui.intent = null
   ui.guessing = true
@@ -1310,14 +1385,21 @@ export function scheduleIntentGuesses(editor) {
   requestIntentGuesses(editor, { more: false })
 }
 
+function habitFromModelMark(markName) {
+  const named = shapeFromMarkName(markName)
+  if (!named) return null
+  return habitForShape(named) || null
+}
+
 async function runIntentGuesses(editor, token, { more = false } = {}) {
   const seen = new Set((ui.seenGuessLabels || []).map((s) => String(s).trim()))
   if (token !== guessToken) return
   let local = []
+  let autoHabit = null
+  const typed = String(ui.typedText || '').trim()
   try {
     const scene = isWebDocActive() ? describePaintScene() : { blank: sceneIsBlank(), text: '' }
     const gesture = classifyDrawnGesture()
-    const typed = String(ui.typedText || '').trim()
     const hit = await guessAnnotationIntent(editor, null, {
       silent: true,
       more,
@@ -1342,6 +1424,7 @@ async function runIntentGuesses(editor, token, { more = false } = {}) {
     const parsed = parseNote(written)
     const verb =
       (parsed && parsed !== 'custom' ? parsed : '') ||
+      parseNote(ui.markName) ||
       hit?.note ||
       hit?.intent ||
       (gesture.habit ? gesture.kind : '') ||
@@ -1361,15 +1444,34 @@ async function runIntentGuesses(editor, token, { more = false } = {}) {
     if (written) ui.noteText = written
     ui.noteConfident = Boolean(hit?.fromModel || written)
     ui.fromModel = Boolean(hit?.fromModel)
+    if (!more) {
+      const fromMark = habitFromModelMark(ui.markName || hit?.mark)
+      const fallback = hit?.fromModel ? null : resolvedHabit().habit
+      const habit = fromMark || fallback
+      if (habit && !typedOverridesHabit(typed, habit)) {
+        autoHabit = habitGuess(habit, habit.shape)
+      }
+    }
   } catch {
     if (token !== guessToken) return
     ui.guesses = local.slice(0, 4)
     ui.judged = true
     ui.seenGuessLabels = [...seen, ...ui.guesses.map((g) => g.label)]
+    if (!more) {
+      const { habit, guess } = resolvedHabit()
+      if (habit && guess && !typedOverridesHabit(typed, habit)) autoHabit = guess
+    }
   } finally {
     if (token === guessToken) {
       ui.guessing = false
       emit()
+      const ed = editor || guessRuntime.editor
+      const deps = guessRuntime.deps
+      if (!more && autoHabit && ed && deps) {
+        deps.toast?.(ui.markName ? `模型认出「${ui.markName}」，按偏好执行` : `按已记录的偏好执行：${autoHabit.label}`)
+        applyGuess(autoHabit, ed, deps)
+        return
+      }
       const msg = more
         ? ui.guesses.length
           ? '又给出几条。点一项执行，或再要几条'
@@ -1602,6 +1704,11 @@ export function applyGuess(guess, editor, deps) {
   ui.note = guess.note || parseNote(written) || parseNote(label) || ui.note
   ui.noteText = written || label || command || ui.noteText
   ui.noteConfident = true
+  const resolved = resolvedHabit()
+  const markNow = resolved.mark
+  const habitNow = resolved.habit
+  const scopeNow = guess.scope || habitNow?.scope || inferHabitScope(written)
+  setAnnoScopeHint(scopeNow)
   const parsed = parseCommand([written, command, label].filter(Boolean).join(' '))
   if (parsed.color) ui.color = parsed.color
   else if (colorFromWriting(written) || colorFromWriting(label) || colorFromWriting(command)) {
@@ -1690,13 +1797,13 @@ export function applyGuess(guess, editor, deps) {
       ui.intent = id
       applyCommandText()
       const instruction = String(getSnapshot().commandText || written || label || '').trim()
-      const markName = String(guess.shape || ui.markName || '').trim()
       const action = id === 'bold' ? '加粗' : id === 'underline' ? '下划线' : id === 'wavy' ? '波浪线' : id === 'strike' ? '删除线' : '高亮'
-      deps.toast(`正在把要求、标记和截图交给模型，只给对应的词加${action}…`)
+      deps.toast(`正在给圈中文字加${action}…`)
       annotateCircledText(instruction, {
         onBefore: (lab) => rememberLocal(editor, lab),
         kind: id,
-        markName,
+        markName: '',
+        scope: scopeNow,
       })
         .then((result) => {
           if (!result.ok) {
@@ -2018,6 +2125,13 @@ function proposeOptions(spans, editor) {
   }
 
   const ask = `${ui.typedText || ''} ${ui.noteText || ''}`
+  const anno = annoGuessFromContext(note, ui.markName, gesture)
+  if (anno) {
+    add(anno.id, anno.label)
+    if (anno.id !== 'highlight') add('highlight', '加上高亮')
+    add('clear-anno', '去掉下划线/框/高亮')
+    return bits
+  }
   if (blankWantsInsert(ask, note, scene) && !layoutReady) {
     for (const g of blankInsertGuesses(ask)) add(g.id, g.label)
     return bits
@@ -2164,6 +2278,13 @@ function proposeOptions(spans, editor) {
   if (note === 'change') {
     addChangeChoices(add, { texts, images })
     if (!bits.length) add('custom', '换成我写的 / 换成我描述的样子')
+    return bits
+  }
+
+  if (note === 'underline' || note === 'highlight' || note === 'bold' || note === 'wavy' || note === 'strike') {
+    add(note, note === 'underline' ? '加上下划线' : `加上${localLabel(note)}`)
+    if (texts.length) add('highlight', '加上高亮')
+    add('clear-anno', '去掉下划线/框/高亮')
     return bits
   }
 
@@ -3348,6 +3469,106 @@ function runIntent(editor, deps, scope) {
   } else deps.runCommand('unify', editor)
 }
 
+function habitIntentSelect(habit, onPick) {
+  const sel = document.createElement('select')
+  sel.className = 'card-habit-select'
+  sel.setAttribute('aria-label', '这个标记代表的操作')
+  const ids = HABIT_INTENT_OPTIONS.map((o) => o.id)
+  const extras = habit?.intent && !ids.includes(habit.intent) ? [{ id: habit.intent, label: habitIntentLabel(habit.intent) }] : []
+  for (const opt of [...extras, ...HABIT_INTENT_OPTIONS]) {
+    const item = document.createElement('option')
+    item.value = opt.id
+    item.textContent = opt.label
+    if (habit?.intent === opt.id) item.selected = true
+    sel.append(item)
+  }
+  sel.addEventListener('pointerdown', (e) => e.stopPropagation())
+  sel.addEventListener('click', (e) => e.stopPropagation())
+  sel.addEventListener('change', () => onPick(sel.value))
+  return sel
+}
+
+function habitScopeSelect(habit, onPick) {
+  const sel = document.createElement('select')
+  sel.className = 'card-habit-select'
+  sel.setAttribute('aria-label', '这个标记作用在哪')
+  const current = habit?.scope || inferHabitScope() || 'selection'
+  for (const opt of HABIT_SCOPE_OPTIONS) {
+    const item = document.createElement('option')
+    item.value = opt.id
+    item.textContent = opt.label
+    if (current === opt.id) item.selected = true
+    sel.append(item)
+  }
+  sel.addEventListener('pointerdown', (e) => e.stopPropagation())
+  sel.addEventListener('click', (e) => e.stopPropagation())
+  sel.addEventListener('change', () => onPick(sel.value))
+  return sel
+}
+
+function fillHabitPanel(bar, editor, deps) {
+  const title = document.createElement('div')
+  title.className = 'card-title'
+  title.textContent = '标记偏好'
+  bar.append(title)
+  const hint = document.createElement('p')
+  hint.className = 'card-note'
+  hint.textContent = '每个标记要同时记下两件事：做什么（高亮、加粗…），以及作用在整个选区还是只作用在画上这个标记的词。改完立刻生效。'
+  bar.append(hint)
+  const habits = listSymbolHabits()
+  if (!habits.length) {
+    const empty = document.createElement('p')
+    empty.className = 'card-note'
+    empty.textContent = '还没有记住的标记。画一个符号并执行一次操作后，会出现在这里。'
+    bar.append(empty)
+  } else {
+    const list = document.createElement('div')
+    list.className = 'card-habits'
+    for (const habit of habits) {
+      const row = document.createElement('div')
+      row.className = 'card-habit-row'
+      const name = document.createElement('span')
+      name.className = 'card-habit-name'
+      name.textContent = shapeTitle(habit.shape, habit.ask || habit.label)
+      const sel = habitIntentSelect(habit, (intent) => {
+        const next = updateSymbolHabit(habit.shape, { intent, label: habitIntentLabel(intent), note: intent })
+        if (next) deps.toast(`已改为：${shapeTitle(next.shape, next.ask)} = ${next.label}`)
+        emit()
+      })
+      const scopeSel = habitScopeSelect(habit, (scope) => {
+        const next = updateSymbolHabit(habit.shape, { scope })
+        if (next) deps.toast(`已改为：${shapeTitle(next.shape, next.ask)}作用于${habitScopeLabel(next.scope)}`)
+        emit()
+      })
+      const del = btn('删除', { pointer: true }, () => {
+        forgetSymbolHabit(habit.shape)
+        deps.toast(`已忘掉「${shapeTitle(habit.shape, habit.ask || habit.label)}」`)
+        emit()
+      })
+      row.append(name, sel, scopeSel, del)
+      list.append(row)
+    }
+    bar.append(list)
+  }
+  const tools = document.createElement('div')
+  tools.className = 'card-row'
+  if (habits.length) {
+    tools.append(
+      btn('清空全部偏好', { pointer: true }, () => {
+        clearAllSymbolHabits()
+        deps.toast('已清空全部标记偏好')
+        emit()
+      }),
+    )
+  }
+  tools.append(
+    btn('关闭', { primary: true, pointer: true }, () => {
+      closeHabitPanel()
+    }),
+  )
+  bar.append(tools)
+}
+
 function fillPropose(bar, spans, editor, deps) {
   const title = document.createElement('div')
   title.className = 'card-title'
@@ -3356,12 +3577,14 @@ function fillPropose(bar, spans, editor, deps) {
   const hint = document.createElement('p')
   hint.className = 'card-note'
   const typed = String(ui.typedText || '').trim()
-  const markNow = currentSymbolShape()
-  const habitNow = markNow.shape ? habitForShape(markNow.shape) : null
+  const { mark: markNow, habit: habitNow } = resolvedHabit()
   if (ui.guessing) hint.textContent = typed ? '正在根据圈画和输入的要求判断…' : '正在根据你画的和写下的判断意图…'
   else if (layoutSourceWaiting(spans) && !looksLikeLayout(spans) && !inferWebLayoutPairs().length) hint.textContent = '再圈它要放到的空白位置。后一圈会当成落点，不会当成新选区'
   else if (looksLikeLayout(spans) || inferWebLayoutPairs().length) hint.textContent = '已认出模块和落点。点「移到画出的位置」'
-  else if (habitNow) hint.textContent = `认出${shapeTitle(markNow.shape, markNow.label)}。可一键按习惯「${habitNow.label}」，或改输入后重新判断。`
+  else if (habitNow) {
+    const where = habitScopeLabel(habitNow.scope) || habitScopeLabel(inferHabitScope())
+    hint.textContent = `已有习惯：${shapeTitle(markNow.shape, markNow.label)} = ${habitNow.label}${where ? `（${where}）` : ''}。点开始判断会把你画的交给模型认，认对后按偏好执行。`
+  }
   else if (ui.judged && ui.markName) hint.textContent = `模型认出这是${ui.markName}。点一项执行；若标记叫错可再判断一次。`
   else if (markNow.shape && !ui.judged) hint.textContent = `画出了${shapeTitle(markNow.shape, markNow.label)}。输入它代表什么并执行一次，下次就会记住。`
   else if (ui.judged && isWebDocActive() && describePaintScene().blank && !inferWebLayoutPairs().length) {
@@ -3369,8 +3592,8 @@ function fillPropose(bar, spans, editor, deps) {
       ? `空白处已按「${typed}」判断。可选 AI 生成，或自己写 / 从本地插入。`
       : '圈的是空白。可选 AI 生成文字或图片，也可以自己写或从本地插入。'
   }
-  else if (ui.judged) hint.textContent = typed ? `已按「${typed}」判断。点一项执行，或改输入后重新判断。` : '点一项就执行。不满意可再要几条。'
-  else hint.textContent = '大圈是选区；星、叉、勾、横线或你自己的符号是标记。判错可点「按标记理解」或「按框选理解」，不用重画。'
+  else if (ui.judged) hint.textContent = typed ? `已按「${typed}」判断。点一项执行。` : '点一项就执行。'
+  else hint.textContent = '圈完后可输入要求，再点开始判断。开始判断会把圈画交给模型识别。'
   bar.append(hint)
 
   const input = document.createElement('input')
@@ -3399,60 +3622,18 @@ function fillPropose(bar, spans, editor, deps) {
 
   const tools = document.createElement('div')
   tools.className = 'card-row'
-  const layoutReadyNow = looksLikeLayout(spans) || inferWebLayoutPairs().length
-  if (layoutReadyNow) {
-    tools.append(
-      btn('移到画出的位置', { primary: true, pointer: true }, () => {
-        ui.guessing = false
-        pickOption('move-layout', deps, editor)
-      }),
-    )
-  }
-  if (!ui.guessing && !ui.judged) {
-    tools.append(
-      btn('加选', { pointer: true }, () => {
-        setAddMode(true)
-        deps.toast('再圈要加上的地方。按住 Shift 也可加选')
-      }),
-      btn('减选', { pointer: true }, () => {
-        setSubtractMode(true)
-        deps.toast('再圈不要的部分。按住 Alt 也可减选')
-      }),
-      btn('开始判断', { primary: !layoutReadyNow, pointer: true }, () => {
-        requestIntentGuesses(editor, { more: false })
-      }),
-    )
-    if (lastPaintPoints().length >= 4 || ui.lastPaint?.length >= 4) {
-      tools.append(
-        btn('按标记理解', { pointer: true }, () => reinterpretLastStroke(true, editor, deps)),
-        btn('按框选理解', { pointer: true }, () => reinterpretLastStroke(false, editor, deps)),
-      )
-    }
-  }
-  if (habitNow && !ui.guessing) {
-    tools.append(
-      btn(`一键：${shapeTitle(markNow.shape, markNow.label)} = ${habitNow.label}`, { pointer: true }, () => {
-        applyGuess(habitGuess(habitNow, markNow.shape), editor, deps)
-      }),
-      btn('忘掉这个习惯', { pointer: true }, () => {
-        forgetSymbolHabit(markNow.shape)
-        deps.toast(`已忘掉${markNow.label}的习惯`)
-        emit()
-      }),
-    )
-  }
-  if (!ui.guessing && ui.judged) {
-    tools.append(
-      btn('重新判断', { pointer: true }, () => {
-        requestIntentGuesses(editor, { more: false })
-      }),
-      btn('再给几条', { primary: true, pointer: true }, () => {
-        requestIntentGuesses(editor, { more: true })
-      }),
-    )
-  }
+  const manage = btn('管理偏好', { pointer: true }, () => {
+    openHabitPanel()
+  })
+  manage.disabled = ui.guessing
+  const judge = btn('开始判断', { primary: true, pointer: true }, () => {
+    if (!ui.guessing) requestIntentGuesses(editor, { more: false })
+  })
+  judge.disabled = ui.guessing
   tools.append(
-    btn('重新圈选', { pointer: true }, () => {
+    manage,
+    judge,
+    btn('重新框选', { pointer: true }, () => {
       cancelGuesses()
       clearInk()
       replaceSpans([])
@@ -3945,6 +4126,10 @@ function fillReview(bar, editor, deps) {
 export function fillNoviceCard(bar, editor, deps) {
   guessRuntime.editor = editor
   guessRuntime.deps = deps
+  if (ui.habitPanel) {
+    fillHabitPanel(bar, editor, deps)
+    return
+  }
   const snap = getSnapshot()
   const spans = snap.spans
   if (spans.length && (ui.step === 'idle' || ui.step === 'review' || ui.hideCard)) {

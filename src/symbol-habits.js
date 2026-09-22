@@ -70,11 +70,14 @@ export function shapeFromMarkName(name) {
   return ''
 }
 
-export function rememberSymbolHabit({ shape, intent, label, note, command, ask, fingerprint } = {}) {
+export function rememberSymbolHabit({ shape, intent, label, note, command, ask, fingerprint, scope } = {}) {
   const fp = String(fingerprint || '').trim()
   const id = String(shape || (fp ? `mark:${fp}` : '')).trim()
   const op = String(intent || '').trim()
   if (!id || !op || op === 'stamp' || (op === 'custom' && !label)) return null
+  const all = readAll()
+  const prev = habitForShape(id) || (fp ? all.find((h) => h.fingerprint && fingerprintsMatch(fp, h.fingerprint)) : null)
+  const list = all.filter((h) => h.shape !== id && !(fp && h.fingerprint && fingerprintsMatch(fp, h.fingerprint)))
   const next = {
     shape: id,
     fingerprint: fp,
@@ -83,13 +86,76 @@ export function rememberSymbolHabit({ shape, intent, label, note, command, ask, 
     note: String(note || op).trim(),
     command: String(command || '').trim(),
     ask: String(ask || '').trim().slice(0, 40),
+    scope: normalizeHabitScope(scope) || normalizeHabitScope(prev?.scope) || '',
     count: 1,
     at: Date.now(),
   }
-  const list = readAll().filter((h) => h.shape !== id && !(fp && h.fingerprint && fingerprintsMatch(fp, h.fingerprint)))
-  const prev = habitForShape(id) || (fp ? list.find((h) => fingerprintsMatch(fp, h.fingerprint)) : null)
   if (prev && prev.intent === op) next.count = (prev.count || 1) + 1
   writeAll([next, ...list.filter((h) => h !== prev)])
+  return next
+}
+
+export const HABIT_SCOPE_OPTIONS = [
+  { id: 'selection', label: '整个选区' },
+  { id: 'marked', label: '画上标记的词' },
+]
+
+export function normalizeHabitScope(scope) {
+  const id = String(scope || '').trim()
+  if (id === 'marked' || id === 'word' || id === 'words') return 'marked'
+  if (id === 'selection' || id === 'region' || id === 'all') return 'selection'
+  return ''
+}
+
+export function habitScopeLabel(scope) {
+  const id = normalizeHabitScope(scope)
+  return HABIT_SCOPE_OPTIONS.find((o) => o.id === id)?.label || ''
+}
+
+export const HABIT_INTENT_OPTIONS = [
+  { id: 'highlight', label: '高亮' },
+  { id: 'bold', label: '加粗' },
+  { id: 'underline', label: '下划线' },
+  { id: 'wavy', label: '波浪线' },
+  { id: 'strike', label: '删除线' },
+  { id: 'delete', label: '删除' },
+  { id: 'delete-image', label: '删图' },
+  { id: 'delete-text', label: '删字' },
+  { id: 'scale-down', label: '缩小' },
+  { id: 'scale-up', label: '放大' },
+  { id: 'color', label: '改颜色' },
+  { id: 'generate-image', label: '换图 / 生图' },
+  { id: 'shadow', label: '阴影' },
+  { id: 'reflect', label: '倒影' },
+  { id: 'frame', label: '加框' },
+  { id: 'polish', label: '润色' },
+  { id: 'move-layout', label: '挪位置' },
+]
+
+export function habitIntentLabel(intent) {
+  const id = String(intent || '').trim()
+  return HABIT_INTENT_OPTIONS.find((o) => o.id === id)?.label || id
+}
+
+export function updateSymbolHabit(shape, patch = {}) {
+  const id = String(shape || '').trim()
+  if (!id) return null
+  const list = readAll()
+  const prev = list.find((h) => h.shape === id)
+  if (!prev) return null
+  const intent = String(patch.intent || prev.intent || '').trim()
+  if (!intent) return null
+  const next = {
+    ...prev,
+    intent,
+    label: String(patch.label ?? habitIntentLabel(intent) ?? prev.label).trim() || intent,
+    note: String(patch.note ?? intent).trim(),
+    command: patch.command === undefined ? prev.command || '' : String(patch.command || ''),
+    ask: patch.ask === undefined ? prev.ask || '' : String(patch.ask || '').trim().slice(0, 40),
+    scope: patch.scope === undefined ? normalizeHabitScope(prev.scope) : normalizeHabitScope(patch.scope),
+    at: Date.now(),
+  }
+  writeAll([next, ...list.filter((h) => h.shape !== id)])
   return next
 }
 
@@ -97,15 +163,22 @@ export function forgetSymbolHabit(shape) {
   writeAll(readAll().filter((h) => h.shape !== shape))
 }
 
+export function clearAllSymbolHabits() {
+  writeAll([])
+}
+
 export function habitGuess(habit, shape) {
   if (!habit) return null
   const title = shapeTitle(shape || habit.shape, habit.ask)
+  const scope = normalizeHabitScope(habit.scope)
+  const where = habitScopeLabel(scope)
   return {
     id: habit.intent,
-    label: `按习惯：${title} = ${habit.label}`,
+    label: where ? `按习惯：${title} = ${habit.label}（${where}）` : `按习惯：${title} = ${habit.label}`,
     note: habit.note || habit.intent,
     command: habit.command || '',
     habit: true,
     shape: habit.shape,
+    scope,
   }
 }

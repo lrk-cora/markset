@@ -1,8 +1,8 @@
-import { aabb, classifyLassoSymbol, classifyMarkShape, classifyStrokeKind, dist, looksLikeArrowGesture, looksLikeEnclosingStroke, looksLikeRadialBurst, looksLikeUnderlineGesture, pathLength, SHAPE_LABELS, unionBoxes } from './geometry.js'
+import { aabb, classifyLassoSymbol, classifyMarkShape, classifyStrokeKind, classifyStrokeShape, dist, looksLikeArrowGesture, looksLikeEnclosingStroke, looksLikeRadialBurst, looksLikeTwoStrokeX, looksLikeUnderlineGesture, pathLength, SHAPE_LABELS, unionBoxes } from './geometry.js'
 import { loadImageEl } from './mask.js'
 import { getSnapshot } from './store.js'
 import { getInkStrokes, inkToDataUrl } from './ink.js'
-import { getPaintMarks } from './overlay.js'
+import { getPaintMarks, lastPaintPoints } from './overlay.js'
 import { describeCircledHits, insertHostScreenBox, isWebDocActive } from './web-doc.js'
 import { habitForShape, habitForStroke, habitGuess, listMarkFingerprints, shapeTitle } from './symbol-habits.js'
 
@@ -213,7 +213,63 @@ export function strokeKindOptions() {
   return { hasSelection, selBox, knownFingerprints: listMarkFingerprints() }
 }
 
+export function matchRecordedHabit() {
+  const ctx = strokeKindOptions()
+  const marks = getPaintMarks().filter((m) => m?.points?.length >= 3 && m.role !== 'subtract')
+  const last = lastPaintPoints()
+  const pool = [...marks]
+  if (last?.length >= 3) pool.push({ points: last, role: 'symbol' })
+  for (const stroke of handwritingStrokes()) {
+    if (stroke?.length >= 3) pool.push({ points: stroke, role: 'symbol' })
+  }
+  const xHabit = habitForShape('x') || { shape: 'x', intent: 'delete', label: '删除', note: 'delete', scope: 'selection' }
+  for (let i = 0; i < pool.length; i += 1) {
+    for (let j = i + 1; j < pool.length; j += 1) {
+      if (!looksLikeTwoStrokeX(pool[i].points, pool[j].points)) continue
+      return {
+        shape: 'x',
+        label: shapeTitle('x', xHabit.ask),
+        fingerprint: xHabit.fingerprint || '',
+        habit: xHabit,
+      }
+    }
+  }
+  let best = null
+  let bestScore = -1
+  for (const m of pool) {
+    const kind = classifyStrokeKind(m.points, ctx)
+    const named = (() => {
+      const raw = kind.shape && !String(kind.shape).startsWith('mark:') ? kind.shape : classifyStrokeShape(m.points)
+      const box = aabb(m.points)
+      const big = Math.max(box.w, box.h) > 140
+      if ((raw === 'circle' || raw === 'box') && big && m.role !== 'symbol' && kind.kind === 'select') return ''
+      return raw || ''
+    })()
+    const habit =
+      (named && habitForShape(named)) ||
+      habitForStroke(m.points) ||
+      (kind.shape ? habitForShape(kind.shape) : null)
+    if (!habit) continue
+    const distinctive =
+      ['star', 'triangle', 'x', 'check', 'arrow', 'line', 'wavy'].includes(String(habit.shape)) ||
+      String(habit.shape).startsWith('mark:')
+    const symbolish = m.role === 'symbol' || kind.kind === 'symbol' || kind.kind === 'symbol-target'
+    const score = (symbolish ? 8 : 0) + (distinctive ? 5 : 0) + (habit.fingerprint ? 1 : 0)
+    if (score <= bestScore) continue
+    bestScore = score
+    best = {
+      shape: habit.shape || named || kind.shape,
+      label: shapeTitle(habit.shape, habit.ask),
+      fingerprint: habit.fingerprint || kind.fingerprint,
+      habit,
+    }
+  }
+  return best
+}
+
 export function currentSymbolShape() {
+  const recorded = matchRecordedHabit()
+  if (recorded) return { shape: recorded.shape, label: recorded.label, fingerprint: recorded.fingerprint }
   const fromInk = classifyMarkShape(handwritingStrokes())
   if (fromInk.shape) return fromInk
   const marks = getPaintMarks().filter(
@@ -231,11 +287,6 @@ export function currentSymbolShape() {
     const box = aabb(mark.points)
     if (shape === 'circle' && (box.w > 140 || box.h > 140) && marks.length > 1) continue
     return { shape, label: SHAPE_LABELS[shape] || shape }
-  }
-  const last = marks[marks.length - 1]
-  if (last) {
-    const habit = habitForStroke(last.points)
-    if (habit) return { shape: habit.shape, label: shapeTitle(habit.shape, habit.ask), fingerprint: habit.fingerprint }
   }
   return { shape: '', label: '' }
 }

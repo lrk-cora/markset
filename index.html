@@ -21,15 +21,60 @@
             <button type="button" id="btn-lasso" class="mode-btn" aria-pressed="false">圈选</button>
             <button type="button" id="btn-add" class="mode-btn" aria-pressed="false">加选</button>
             <button type="button" id="btn-subtract" class="mode-btn" aria-pressed="false">减选</button>
+            <button type="button" id="btn-habits" class="mode-btn">标记偏好</button>
           </div>
         </div>
       </header>
 
       <div class="workspace">
         <main class="stage">
-          <article class="page" aria-label="混排实验页">
+          <article class="page is-guide" aria-label="用法说明">
             <p class="kicker" id="page-kicker" hidden></p>
-            <div id="editor"></div>
+            <section id="start-guide" class="start-guide">
+              <p class="start-kicker">导入网页前</p>
+              <h1>MarkSet 怎么用</h1>
+              <p class="start-lead">圈画批注，判断后改网页，导出去掉标记。</p>
+
+              <h2>基本流程</h2>
+              <ol class="start-steps">
+                <li><strong>导入 HTML</strong></li>
+                <li>画好后点 <strong>开始判断</strong></li>
+                <li>选择操作</li>
+                <li><strong>导出网页</strong></li>
+              </ol>
+
+              <h2>圈选和标记</h2>
+              <ul>
+                <li>偏好记错：<strong>管理偏好</strong> 或 <strong>标记偏好</strong></li>
+                <li><strong>重新框选</strong>：清笔迹再画</li>
+              </ul>
+
+              <h2>快捷键</h2>
+              <dl class="start-keys">
+                <div>
+                  <dt><kbd>Shift</kbd> + 圈</dt>
+                  <dd>加选</dd>
+                </div>
+                <div>
+                  <dt><kbd>Alt</kbd> + 圈</dt>
+                  <dd>减选</dd>
+                </div>
+                <div>
+                  <dt><kbd>Esc</kbd></dt>
+                  <dd>取消当前笔画；再按清空</dd>
+                </div>
+                <div>
+                  <dt><kbd>Backspace</kbd></dt>
+                  <dd>擦上一笔</dd>
+                </div>
+                <div>
+                  <dt><kbd>Ctrl</kbd> / <kbd>⌘</kbd> + <kbd>Z</kbd></dt>
+                  <dd>撤回修改</dd>
+                </div>
+              </dl>
+              <p class="start-note">顶栏「加选」「减选」同快捷键。</p>
+            </section>
+            <div id="editor" hidden></div>
             <div id="web-doc-host" class="web-doc-host" hidden>
               <iframe id="web-doc-frame" class="web-doc-frame" title="导入的网页" sandbox="allow-same-origin"></iframe>
             </div>

@@ -148,6 +148,19 @@ export function looksLikeXStroke(pts) {
   return len > diag * 1.45 && corners <= 4
 }
 
+export function looksLikeTwoStrokeX(a, b) {
+  if (!a?.length || !b?.length) return false
+  const chordA = dist(a[0], a[a.length - 1])
+  const chordB = dist(b[0], b[b.length - 1])
+  if (chordA < 16 || chordB < 16) return false
+  if (looksLikeStarStroke([...a, ...b])) return false
+  if (!segmentsIntersect(a[0], a[a.length - 1], b[0], b[b.length - 1])) return false
+  const ba = aabb(a)
+  const bb = aabb(b)
+  const aspect = (box) => Math.max(box.w, box.h) / Math.max(1, Math.min(box.w, box.h))
+  return aspect(ba) > 1.15 && aspect(bb) > 1.15
+}
+
 /** One-stroke pentagram: five spikes and crossing strokes, not a triangle. */
 export function looksLikeStarStroke(pts) {
   if (!pts || pts.length < 16) return false

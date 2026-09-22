@@ -897,6 +897,7 @@ export function renderChrome(editor) {
 
   const card = getCard()
   const annotating =
+    card.habitPanel ||
     snap.spans.length ||
     (!card.hideCard && (card.step === 'propose' || card.step === 'values' || card.guessing))
   if (annotating) {
@@ -923,6 +924,8 @@ export function renderChrome(editor) {
   renderList(editor)
   inspector.textContent = JSON.stringify(toSpec(), null, 2)
   syncUndoButton()
+  const habitsBtn = document.getElementById('btn-habits')
+  if (habitsBtn) habitsBtn.setAttribute('aria-pressed', card.habitPanel ? 'true' : 'false')
   if (typedCaret) {
     const next = layer.querySelector('[data-typed-req]')
     if (next) {

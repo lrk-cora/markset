@@ -1,5 +1,5 @@
 import './styles.css'
-import { applyDemoPage, applyImportedPage, createEditor, refreshDecorations } from './editor.js'
+import { applyDemoPage, applyImportedPage, createEditor, refreshDecorations, showStartGuide } from './editor.js'
 import { bindChromeKeys, renderChrome, toast } from './chrome.js'
 import { fetchHealth, importPage } from './api.js'
 import { canSnap, consumePackagingHint, consumeSkipObjectSnap, peekPackagingHint, peekSkipObjectSnap, setSnapOn, snapImageHits } from './contour.js'
@@ -21,7 +21,7 @@ import { guessStrokePrompt } from './vision-tasks.js'
 import { strokeKindOptions } from './capture.js'
 import { ingestLayoutStroke } from './layout.js'
 import { exportWebDoc, hitWebDoc, isWebDocActive, looksLikeWebLayoutDest, pairWebLayoutDest, rememberPaintBox, unmountWebDoc } from './web-doc.js'
-import { clearLocalUndos, dismissCoach, getCard, idleCard, keepCardForAppend, openPageRecolor, applyWrittenNote, resetCardForNewSelection, resetPagePaper, setPaintGesture, shouldTreatStrokeAsInk, canUndoLocal } from './card-flow.js'
+import { clearLocalUndos, closeHabitPanel, dismissCoach, getCard, idleCard, keepCardForAppend, openHabitPanel, openPageRecolor, applyWrittenNote, resetCardForNewSelection, resetPagePaper, setPaintGesture, shouldTreatStrokeAsInk, canUndoLocal } from './card-flow.js'
 import { addInkStroke, clearInk, hasInk, isLikelyInk, onInkRecognized } from './ink.js'
 import {
   appendSpans,
@@ -43,7 +43,7 @@ import {
 } from './store.js'
 
 const editor = createEditor(document.getElementById('editor'))
-applyDemoPage(editor, 'a')
+showStartGuide()
 
 subscribe(() => {
   refreshDecorations(editor)
@@ -188,6 +188,12 @@ document.getElementById('btn-add')?.addEventListener('click', () => {
     )
   }
 })
+document.getElementById('btn-habits')?.addEventListener('click', () => {
+  const card = getCard()
+  if (card.habitPanel) closeHabitPanel()
+  else openHabitPanel()
+})
+
 document.getElementById('btn-subtract')?.addEventListener('click', () => {
   const on = !isSubtractMode()
   setSubtractMode(on)

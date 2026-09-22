@@ -341,6 +341,7 @@ export function bindLasso({ onBegin, onMove, onFinish, onCancel }) {
 
   function onPointerDown(e) {
     if (e.button !== 0 || uiTarget(e)) return
+    if (document.querySelector('.page.is-guide')) return
     if (!e.altKey && !lassoMode && !subtractMode && !addMode && !colorMode) return
     e.preventDefault()
     e.stopPropagation()

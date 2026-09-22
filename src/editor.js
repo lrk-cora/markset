@@ -363,9 +363,34 @@ export const DEMO_KICKER = {
   b: '演示页 B · 杯身已是雾蓝、无印字；说明仍写红色 / 原木。圈杯子可把说明改成和杯子一致',
 }
 
+export function hideStartGuide() {
+  const page = document.querySelector('.page')
+  const guide = document.getElementById('start-guide')
+  const editorEl = document.getElementById('editor')
+  page?.classList.remove('is-guide')
+  if (guide) guide.hidden = true
+  if (editorEl) editorEl.hidden = false
+}
+
+export function showStartGuide() {
+  const page = document.querySelector('.page')
+  const guide = document.getElementById('start-guide')
+  const editorEl = document.getElementById('editor')
+  const kicker = document.getElementById('page-kicker')
+  page?.classList.add('is-guide')
+  page?.classList.remove('is-import', 'is-web-doc')
+  if (guide) guide.hidden = false
+  if (editorEl) editorEl.hidden = true
+  if (kicker) {
+    kicker.hidden = true
+    kicker.textContent = ''
+  }
+}
+
 export function applyDemoPage(editor, pageId = 'a') {
   currentDemoPage = pageId === 'b' ? 'b' : 'a'
   importedMeta = null
+  hideStartGuide()
   document.querySelector('.page')?.classList.remove('is-import', 'is-web-doc')
   const host = document.getElementById('web-doc-host')
   if (host) host.hidden = true
@@ -445,6 +470,7 @@ export function importedDoc(page) {
 
 export async function applyImportedPage(editor, page) {
   const { blocksToHtml, mountWebDoc, screenshotToHtml, unmountWebDoc } = await import('./web-doc.js')
+  hideStartGuide()
   currentDemoPage = 'import'
   importedMeta = {
     title: page?.title || '',

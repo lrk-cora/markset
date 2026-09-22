@@ -19,8 +19,8 @@ const BADGE_HOST = 'markset-badge-host'
 const SKIN = `
 html, body { margin: 0; width: 100%; min-width: 100%; max-width: none; }
 img, video { max-width: 100%; height: auto; }
-[data-markset-anno="underline"] { text-decoration: underline 2px; text-underline-offset: 3px; }
-[data-markset-anno="wavy"] { text-decoration: underline wavy 2px #3c6fd4; text-underline-offset: 3px; }
+[data-markset-anno="underline"] { text-decoration: underline 2px; text-decoration-skip-ink: none; text-underline-offset: 3px; }
+[data-markset-anno="wavy"] { text-decoration: underline wavy 2px #3c6fd4; text-decoration-skip-ink: none; text-underline-offset: 3px; }
 [data-markset-anno="strike"],
 [data-markset-anno="line-strike"] { text-decoration: line-through 2px; }
 [data-markset-anno="highlight"] { background: rgba(255, 226, 80, 0.55); }
@@ -206,7 +206,10 @@ export function mountWebDoc(html, nextMeta = {}) {
     title: nextMeta.title || '导入的网页',
     sourceUrl: nextMeta.sourceUrl || '',
   }
+  page.classList.remove('is-guide')
   page.classList.add('is-import', 'is-web-doc')
+  const guide = document.getElementById('start-guide')
+  if (guide) guide.hidden = true
   host.hidden = false
   if (editor) editor.setAttribute('aria-hidden', 'true')
   iframe.setAttribute('title', meta.title)
@@ -765,8 +768,11 @@ function sceneFromIframeBox(box) {
   const fill = coreArea / paintArea
   const coreTexts = core.filter((h) => isPrimarilyText(h.el)).map((h) => textOf(h.el)).filter(Boolean)
   const coreImages = core.filter((h) => isGraphicEl(h.el) || isWidgetEl(h.el)).length
-  const blank = fill < 0.16 && !coreImages && !coreTexts.length
-  const kind = blank ? 'blank' : coreImages && coreTexts.length ? 'mixed' : coreImages ? 'image' : coreTexts.length ? 'text' : 'blank'
+  const anyText = hits.some(
+    (h) => isTextEl(h.el) && textOf(h.el).length >= 2 && (h.coverEl >= 0.08 || centerInPaint(h.el, box) || h.coverBox >= 0.04),
+  )
+  const blank = fill < 0.16 && !coreImages && !coreTexts.length && !anyText
+  const kind = blank ? 'blank' : coreImages && (coreTexts.length || anyText) ? 'mixed' : coreImages ? 'image' : coreTexts.length || anyText ? 'text' : 'blank'
   const bits = []
   if (blank) {
     bits.push('圈内大部分是空白。操作对象是这块空白区域，不要把边上蹭到的搜索框/按钮当主目标。')
@@ -2288,11 +2294,42 @@ function inflateAabb(box, padX, padY = padX) {
 
 function isCompactWordMark(mark, box) {
   if (!mark || !box) return false
-  if (mark.role === 'symbol') return true
-  if (isRegionStroke(mark.points) && box.w >= 96 && box.h >= 52) return false
+  if (isRegionStroke(mark.points) && box.w >= 72 && box.h >= 40) return false
+  if (mark.role === 'select' || mark.role === 'add') return box.w < 72 && box.h < 44
   const aspect = box.w / Math.max(1, box.h)
   if ((aspect > 3.2 && box.h < 36) || (aspect < 0.35 && box.w < 36)) return true
-  return box.w < 120 && box.h < 100
+  return box.w < 88 && box.h < 72
+}
+
+function userForcesWholeSelection(ask) {
+  return /全部|所有|整段|整块|整句|选区|圈里都|圈中都|选中的?(全部|所有|内容|目标)|作用于.{0,12}(全部|所有|选区|目标|内容)/.test(
+    String(ask || ''),
+  )
+}
+
+function userAsksWordLevel(ask) {
+  if (userForcesWholeSelection(ask)) return false
+  const t = String(ask || '')
+  if (/几个词|个别词|其中几个|只改这[个几]|只标这|只要这几个|某一个词|单词上/.test(t)) return true
+  if (/[「『“"'][^」』”"']{1,40}[」』”"']/.test(t)) return true
+  return false
+}
+
+function hasExtraWordMarks() {
+  const paints = getPaintMarks().filter((m) => m?.points?.length >= 3 && m.role !== 'subtract')
+  const lassos = paints.filter((m) => m.role === 'select' || m.role === 'add')
+  const symbols = paints.filter((m) => m.role === 'symbol')
+  const compact = (m) => {
+    const poly = toIframePoly(m.points)
+    const box = poly?.length ? aabb(poly) : null
+    return Boolean(box && isCompactWordMark(m, box))
+  }
+  if (lassos.length) return symbols.some(compact)
+  return symbols.some(compact) && !paints.some((m) => {
+    const poly = toIframePoly(m.points)
+    const box = poly?.length ? aabb(poly) : null
+    return box && isRegionStroke(m.points) && box.w >= 72 && box.h >= 40
+  })
 }
 
 function compactMarkBoxes() {
@@ -2304,8 +2341,9 @@ function compactMarkBoxes() {
     const box = aabb(poly)
     if (!isCompactWordMark(mark, box)) continue
     const aspect = box.w / Math.max(1, box.h)
-    const padX = aspect > 3 ? 10 : Math.max(16, Math.min(34, Math.max(box.w, box.h) * 0.4))
-    const padY = aspect > 3 ? 26 : Math.max(16, Math.min(34, Math.max(box.w, box.h) * 0.45))
+    const lineLike = aspect > 3.2 && box.h < 40
+    const padX = lineLike ? 4 : Math.max(4, Math.min(10, Math.max(box.w, box.h) * 0.16))
+    const padY = lineLike ? Math.max(12, Math.min(26, box.h + 18)) : Math.max(5, Math.min(12, Math.max(box.w, box.h) * 0.2))
     out.push(inflateAabb(box, padX, padY))
   }
   return out
@@ -2313,14 +2351,65 @@ function compactMarkBoxes() {
 
 function tokenHitsBox(rect, box) {
   if (!rect || !box) return false
-  const hit = intersectBoxes({ x: rect.x, y: rect.y, w: rect.width, h: rect.height }, box)
-  if (!hit) return false
   const cx = rect.x + rect.width / 2
   const cy = rect.y + rect.height / 2
-  return (
-    (cx >= box.x && cx <= box.x + box.w && cy >= box.y && cy <= box.y + box.h) ||
-    hit.w * hit.h >= rect.width * rect.height * 0.28
-  )
+  return cx >= box.x && cx <= box.x + box.w && cy >= box.y && cy <= box.y + box.h
+}
+
+function phrasesInPaintRegion(el) {
+  const box = editRegionBox()
+  const polys = paintPolysForText(box)
+  if (!el || !polys.length) return []
+  const tokens = collectTextTokens(el)
+  const hit = tokens.map((t) => t.rects.some((r) => tokenHitsPaint(r, polys)))
+  const out = []
+  for (let i = 0; i < tokens.length; ) {
+    if (!hit[i]) {
+      i += 1
+      continue
+    }
+    let j = i + 1
+    let text = tokens[i].text
+    while (j < tokens.length && hit[j] && tokens[j].node === tokens[i].node && tokens[j].start === tokens[j - 1].end) {
+      text += tokens[j].text
+      j += 1
+    }
+    if (text.trim()) out.push(text.trim())
+    i = j
+  }
+  return [...new Set(out)]
+}
+
+function wantsNamedWordsOnly(ask, _markName, scope = '') {
+  return resolveAnnoWordLevel(ask, scope)
+}
+
+let annoScopeHint = ''
+
+export function setAnnoScopeHint(scope) {
+  const id = String(scope || '').trim()
+  annoScopeHint = id === 'marked' || id === 'word' ? 'marked' : id === 'selection' || id === 'region' ? 'selection' : ''
+}
+
+export function inferHabitScope(ask = '') {
+  if (userForcesWholeSelection(ask)) return 'selection'
+  if (userAsksWordLevel(ask)) return 'marked'
+  const boxes = compactMarkBoxes()
+  if (!boxes.length) return 'selection'
+  const region = editRegionBox()
+  if (!region) return 'marked'
+  const regionArea = Math.max(1, region.w * region.h)
+  if (boxes.some((b) => b.w * b.h >= regionArea * 0.35)) return 'selection'
+  return 'marked'
+}
+
+export function resolveAnnoWordLevel(ask, habitScope = '') {
+  if (userForcesWholeSelection(ask)) return false
+  if (userAsksWordLevel(ask)) return true
+  const scope = String(habitScope || annoScopeHint || '').trim()
+  if (scope === 'selection' || scope === 'region') return false
+  if (scope === 'marked' || scope === 'word') return true
+  return hasExtraWordMarks()
 }
 
 function phrasesFromCompactMarks(el) {
@@ -2432,6 +2521,7 @@ function lassoIsRegionCovering(el, box) {
 }
 
 function narrowToPaintedText(els, box) {
+  if (!wantsNamedWordsOnly('', '')) return uniqueEls((els || []).filter((el) => el?.isConnected))
   if (lassoIsRegionCovering(null, box)) return uniqueEls((els || []).filter((el) => el?.isConnected))
   const out = []
   for (const el of els || []) {
@@ -3516,7 +3606,6 @@ function applyOpToEls(els, kind, { color, title, box, dx, dy, scheme, paint }) {
   } else {
     const anno = annoKind(kind)
     for (const el of els) {
-      if ((anno === 'highlight' || anno === 'bold') && textOf(el).replace(/\s+/g, '').length > 40) continue
       el.setAttribute('data-markset-anno', anno)
       count += 1
     }
@@ -3528,21 +3617,35 @@ export function executeCircledOp(op, { color = '', label = '', onBefore, dx = 0,
   const doc = getDoc()
   const iframe = frameEl()
   if (!doc?.body || !iframe) return { ok: false, reason: '没有导入的网页' }
-  const box = editRegionBox()
+  let box = editRegionBox()
+  const kind = String(op || '')
+  if ((!box || box.w < 8 || box.h < 8) && kind.startsWith('delete')) {
+    const pts = getPaintMarks()
+      .filter((m) => m.points?.length >= 3 && m.role !== 'subtract')
+      .map((m) => m.points)
+    const union = iframeUnionBox(pts)
+    if (union) box = inflateAabb(union, 32, 32)
+  }
+  if (kind.startsWith('delete') && box && Math.max(box.w, box.h) < 140) box = inflateAabb(box, 40, 40)
   if (!box || box.w < 4 || box.h < 4) return { ok: false, reason: '没有可用的圈。请再圈一次要改的地方' }
   stampIds(doc)
   const frameArea = Math.max(1, iframe.clientWidth * iframe.clientHeight)
   const hits = scanOverlapEls(box)
   const paintArea = box.w * box.h
   const large = paintArea > frameArea * 0.07 || Math.max(box.w, box.h) > 200
-  const kind = String(op || '')
   const title = label || kind
   const html = snapshotWebHtml()
-  const strategies = ['circled', 'tight', 'graphics', 'texts', 'module', 'fallback']
+  const strategies = kind.startsWith('delete')
+    ? ['circled', 'tight', 'graphics', 'texts', 'module', 'near', 'fallback']
+    : ['circled', 'tight', 'graphics', 'texts', 'module', 'fallback']
   const seen = new Set()
   for (const strategy of strategies) {
     if (strategy !== 'circled') restoreWebHtml(html)
     const raw = (() => {
+      if (strategy === 'near' && kind.startsWith('delete')) {
+        const near = nearestToBox(box)
+        return near ? uniqueEls([rewriteHostOf(near) || near]) : []
+      }
       const picked = elsByStrategy(kind, title, box, scanOverlapEls(box), frameArea, large, strategy)
       if (kind !== 'scheme') return picked
       const wrap = pickSchemeWrap(picked, box)
@@ -3647,6 +3750,53 @@ function dropCoveringAncestors(els) {
   return (els || []).filter((el) => el && !(els || []).some((o) => o && o !== el && el.contains(o)))
 }
 
+function unwrapInnerAnno(el) {
+  const list = [...(el.querySelectorAll?.('[data-markset-anno], [data-markset-word]') || [])]
+  for (const n of list.reverse()) {
+    if (!n.parentNode || n === el) continue
+    const parent = n.parentNode
+    while (n.firstChild) parent.insertBefore(n.firstChild, n)
+    parent.removeChild(n)
+  }
+}
+
+function applyAnnoToSelection(els, kind) {
+  let n = 0
+  let doc = null
+  for (const el of els || []) {
+    if (!el?.isConnected) continue
+    unwrapInnerAnno(el)
+    el.setAttribute('data-markset-anno', kind)
+    doc = el.ownerDocument
+    n += 1
+  }
+  if (doc) stampIds(doc)
+  return n
+}
+
+function collectSelectionTextEls() {
+  const box = editRegionBox() || iframeUnionBox(drawingPolys())
+  const doc = getDoc()
+  const iframe = frameEl()
+  if (!doc?.body) return []
+  const frameArea = Math.max(1, (iframe?.clientWidth || 1) * (iframe?.clientHeight || 1))
+  const hits = box ? scanOverlapEls(box) : []
+  let els = []
+  if (box) {
+    els = gatherEls('highlight', '高亮', box, hits, frameArea, true)
+    if (!els.length) els = pickContentEls(hits, box, frameArea, { large: true, kind: 'color-text' })
+    if (!els.length) els = leafEls(hits, box)
+  }
+  const usable = (el) => el && isTextEl(el) && !isImageEl(el) && textOf(el).length >= 2
+  const hosts = dropCoveringAncestors(
+    uniqueEls(keepPaintTargets(els, box).map((el) => rewriteHostOf(el) || el)).filter(usable),
+  )
+  if (hosts.length) return hosts.slice(0, 8)
+  return dropCoveringAncestors(
+    hits.map((h) => rewriteHostOf(h.el) || h.el).filter(usable),
+  ).slice(0, 8)
+}
+
 function rewriteHostOf(el) {
   if (!el) return null
   const climb = (start) => {
@@ -3669,53 +3819,15 @@ function rewriteHostOf(el) {
     return start
   }
   if (el.getAttribute?.('data-markset-word')) return climb(el.parentElement) || el
+  if (el.getAttribute?.('data-markset-anno') && !/^(P|LI|H1|H2|H3|H4|H5|H6|BLOCKQUOTE|ARTICLE)$/.test(el.tagName)) {
+    return climb(el.parentElement) || climb(el) || el
+  }
   if (/^(SPAN|EM|STRONG|B|I|A|SMALL)$/.test(el.tagName) && textOf(el).length < 80) return climb(el) || el
   return el
 }
 
 function collectRewriteEls() {
-  const box = editRegionBox() || iframeUnionBox(drawingPolys())
-  const iframe = frameEl()
-  const frameArea = Math.max(1, (iframe?.clientWidth || 1) * (iframe?.clientHeight || 1))
-  const seen = new Set()
-  const hitList = []
-  for (const h of [...(box ? scanOverlapEls(box) : []), ...compactMarkBoxes().flatMap((b) => scanOverlapEls(b))]) {
-    if (!h?.el || seen.has(h.el)) continue
-    seen.add(h.el)
-    hitList.push(h)
-  }
-  const usable = (el) => el && isTextEl(el) && !isImageEl(el) && textOf(el).length >= 2
-  let els = []
-  if (box || hitList.length) {
-    els = leafEls(hitList, box).filter(usable)
-    if (!els.length) els = hitList.map((h) => h.el).filter(usable)
-    if (!els.length) {
-      els = pickContentEls(hitList, box, frameArea, { large: false, kind: 'color-text' }).filter(usable)
-    }
-    if (box) {
-      els = els.filter(
-        (el) =>
-          aimedLeaf(el, box) ||
-          staysInPaint(el, box) ||
-          (centerInPaint(el, box) && overlapScore(el, box).coverEl >= 0.28) ||
-          phrasesFromCompactMarks(el).length,
-      )
-    }
-  }
-  if (!els.length) {
-    els = circledEditSpans()
-      .map((s) => findByWebId(s.webId))
-      .filter(usable)
-  }
-  if (!els.length && hitList.length) {
-    els = hitList.map((h) => h.el).filter(
-      (el) =>
-        usable(el) &&
-        (phrasesFromCompactMarks(el).length || (box && (aimedLeaf(el, box) || centerInPaint(el, box)))),
-    )
-  }
-  const seeds = keepPaintTargets(els, box)
-  return dropCoveringAncestors(seeds.map(rewriteHostOf).filter(Boolean)).slice(0, 6)
+  return collectSelectionTextEls()
 }
 
 function circledTextExcerpt(hosts, box) {
@@ -3798,7 +3910,7 @@ export async function rewriteCircledText(commandText, { onBefore, kind = 'polish
   let usedModel = false
   const page = String(meta.title || '').trim()
   const box = iframeUnionBox(drawingPolys())
-  const excerpt = circledTextExcerpt(els, box)
+  const excerpt = wantsNamedWordsOnly(commandText, '') ? circledTextExcerpt(els, box) : ''
   let extras = { imageDataUrls, pageContext, mode: 'rewrite' }
   if (!local && (!extras.imageDataUrls?.length || !extras.pageContext)) {
     const scene = await rewriteSceneExtras()
@@ -3819,8 +3931,10 @@ export async function rewriteCircledText(commandText, { onBefore, kind = 'polish
         [
           instruction,
           page ? `这段文字出现在网页「${page}」上` : '',
-          excerpt ? `圈中/点名要改的片段：「${excerpt}」。只改这一部分，其余原文一字不动。` : '',
-          '若用户写明只改其中几个词或几句，或附图里蓝圈只罩住段落的一部分，则只改那些。返回改完后的整段可见文字，不要只返回被改的词，不要解释，不要把指令写进正文。',
+          excerpt ? `圈中/点名要改的片段：「${excerpt}」。只改这一部分，其余原文一字不动。` : '用户圈的是整块选区，请改写这段的全部可见文字。',
+          excerpt
+            ? '用户写明了只改其中几个词或几句。返回改完后的整段可见文字，不要只返回被改的词，不要解释，不要把指令写进正文。'
+            : '返回改完后的整段可见文字，不要只改个别词，不要解释，不要把指令写进正文。',
         ]
           .filter(Boolean)
           .join('。'),
@@ -3954,18 +4068,39 @@ function wrapPhraseInEl(el, phrase, kind) {
   }
 }
 
+function mergeLinePhrases(original, phrases) {
+  const src = String(original || '')
+  let start = Infinity
+  let end = -1
+  for (const p of phrases || []) {
+    const needle = String(p || '').trim()
+    if (!needle) continue
+    let i = src.indexOf(needle)
+    if (i < 0) i = src.toLowerCase().indexOf(needle.toLowerCase())
+    if (i < 0) continue
+    start = Math.min(start, i)
+    end = Math.max(end, i + needle.length)
+  }
+  if (!(start < end)) return (phrases || []).filter(Boolean)
+  return [src.slice(start, end)]
+}
+
 function applyAnnoPhrases(el, phrases, kind, ask) {
   const original = textOf(el)
-  const marked = phrasesFromCompactMarks(el)
-  const whole = !marked.length && wantsWholeAnno(ask, original)
-  const usable = (phrases || []).filter((p) => {
-    if (!p) return false
-    if (whole) return true
-    return p.replace(/\s+/g, '').length < original.replace(/\s+/g, '').length * 0.82
-  })
-  if (whole && (!usable.length || usable.some((p) => p.replace(/\s+/g, '').length >= original.replace(/\s+/g, '').length * 0.82))) {
+  const compact = phrasesFromCompactMarks(el)
+  const line = kind === 'underline' || kind === 'wavy' || kind === 'strike'
+  const usable = line ? mergeLinePhrases(original, phrases) : (phrases || []).filter((p) => Boolean(String(p || '').trim()))
+  const joined = usable.join('').replace(/\s+/g, '')
+  const body = original.replace(/\s+/g, '')
+  const coverMost = body.length > 0 && joined.length >= body.length * 0.72
+  if (coverMost || (!compact.length && wantsWholeAnno(ask, original))) {
+    unwrapInnerAnno(el)
     el.setAttribute('data-markset-anno', kind)
     return 1
+  }
+  if (line && usable.length === 1) {
+    unwrapInnerAnno(el)
+    return wrapPhraseInEl(el, usable[0], kind)
   }
   let n = 0
   for (const phrase of [...usable].sort((a, b) => b.length - a.length)) {
@@ -3982,29 +4117,32 @@ const ANNO_ACTION = {
   strike: '删除线',
 }
 
-export async function annotateCircledText(commandText, { onBefore, kind = 'highlight', markName = '' } = {}) {
+export async function annotateCircledText(commandText, { onBefore, kind = 'highlight', markName = '', scope = '' } = {}) {
   if (!isWebDocActive()) return { ok: false, reason: '没有导入的网页' }
+  if (scope) setAnnoScopeHint(scope)
   const anno = annoKind(kind) === kind ? kind : annoKind(kind)
   const action = ANNO_ACTION[anno] || '标注'
-  const els = collectRewriteEls()
-  if (!els.length) return { ok: false, reason: '圈中没有可标的文字。请把圈贴在段落上，或把三角形/下划线画在要改的词上' }
-  const instruction =
-    String(commandText || '').trim() ||
-    (markName ? `把标了「${markName}」的单词加上${action}` : `根据附图里画在单词上的标记，只给那些词加上${action}`)
-  onBefore?.(`${action}词语`)
+  const els = collectSelectionTextEls()
+  if (!els.length) return { ok: false, reason: '圈中没有可标的文字。请把圈贴在标题或段落上' }
+  const namedOnly = resolveAnnoWordLevel(commandText, scope)
+  const instruction = String(commandText || '').trim() || `给圈中选区的全部文字加上${action}`
+  onBefore?.(`${action}圈中文字`)
   const before = els.map((el) => snapshotNode(el))
-  const extras = await annotateSceneExtras()
+  let extras = null
   let count = 0
   let usedModel = false
-  for (const el of els) {
+  if (!namedOnly) {
+    count = applyAnnoToSelection(els, anno)
+  }
+  for (const el of namedOnly ? els : []) {
     const original = textOf(el)
     if (!original || original.length < 2) continue
     const asked = phrasesFromAsk(instruction, original)
     const underMark = phrasesFromCompactMarks(el)
     let marks = [...new Set([...asked, ...underMark])]
-    const whole = !underMark.length && wantsWholeAnno(instruction, original)
-    if (!whole) {
+    if (!marks.length) {
       usedModel = true
+      extras = extras || (await annotateSceneExtras())
       const data = await rewriteText(
         [
           instruction,
@@ -4030,21 +4168,23 @@ export async function annotateCircledText(commandText, { onBefore, kind = 'highl
     return {
       ok: false,
       reason: usedModel
-        ? `模型和截图已交给判断，但没有定位到要${action}的词。可把三角形/下划线画在单词上，或写明要改哪几个词`
-        : `请把标记画在要${action}的词上，或写明要改哪几个词`,
+        ? `模型和截图已交给判断，但没有定位到要${action}的文字。可把圈贴紧段落，或写明要改哪几个词`
+        : `圈中没有落到文字上。把圈贴紧要改的句子，或把标记画在要${action}的词上`,
     }
   }
   const after = before.map((shot) => {
     const live = shot.webId ? findByWebId(shot.webId) : null
     return live ? snapshotNode(live) : { ...shot, removed: true }
   })
-  recordWebEdit(`${action}词语`, before, after)
+  recordWebEdit(`${action}圈中文字`, before, after)
   ping()
   fitHeight()
   return {
     ok: true,
     count,
-    message: `已按要求和截图只给对应的词加上${action}，共 ${count} 处。可还原这一处`,
+    message: namedOnly
+      ? `已按要求和标记只给对应的词加上${action}，共 ${count} 处。可还原这一处`
+      : `已给圈中文字加上${action}，共 ${count} 处。可还原这一处`,
   }
 }
 
@@ -4610,8 +4750,8 @@ function cleanExportDoc(raw) {
   parsed.querySelectorAll('[data-markset-badge-host],[data-markset-edit-badge],[data-markset-tombstone]').forEach((el) => el.remove())
   const keepSkin = parsed.createElement('style')
   keepSkin.textContent = `
-[data-markset-anno="underline"] { text-decoration: underline 2px; text-underline-offset: 3px; }
-[data-markset-anno="wavy"] { text-decoration: underline wavy 2px #3c6fd4; text-underline-offset: 3px; }
+[data-markset-anno="underline"] { text-decoration: underline 2px; text-decoration-skip-ink: none; text-underline-offset: 3px; }
+[data-markset-anno="wavy"] { text-decoration: underline wavy 2px #3c6fd4; text-decoration-skip-ink: none; text-underline-offset: 3px; }
 [data-markset-anno="strike"], [data-markset-anno="line-strike"] { text-decoration: line-through 2px; }
 [data-markset-anno="highlight"] { background: rgba(255, 226, 80, 0.55); }
 [data-markset-anno="bold"] { font-weight: 700; }

@@ -3,6 +3,7 @@ import { captureAnnotationScene, captureMarkedPage, classifyDrawnGesture } from 
 import { intersectBoxes } from './geometry.js'
 import { imageSpanFromNaturalBox, normalizeVisionBox } from './hit-test.js'
 import { appendSpans, getSnapshot, replaceCommandText } from './store.js'
+import { habitScopeLabel, listSymbolHabits, shapeTitle } from './symbol-habits.js'
 
 let running = false
 
@@ -191,10 +192,17 @@ export async function guessAnnotationIntent(editor, notify, { silent = false, mo
     const written = typed || ocr || shortHandwriting(handwriting)
     const gesture = classifyDrawnGesture()
     const skip = (exclude || []).filter(Boolean).join('；')
+    const habits = listSymbolHabits()
+    const habitHint = habits.length
+      ? `用户已记录的标记偏好：${habits
+          .map((h) => `${shapeTitle(h.shape, h.ask)}=${h.label}${habitScopeLabel(h.scope) ? `（${habitScopeLabel(h.scope)}）` : ''}`)
+          .join('；')}。若图上画的就是其中一种，mark 写成该标记名，第一条猜测用对应操作。`
+      : ''
     const instruction = [
       '你是批注理解器。先看图里用户画了什么、写了什么，再看蓝线圈落在网页哪一块，合在一起给出操作。',
       '图1白底笔迹（蓝=圈选或标记，黑=手写或自画图案）。图2笔迹特写。图3圈选区域。图4整页。有键盘输入时以输入为准；否则认字以图1、图2为准。',
-      '标注也是批注：五角星、三角形、叉、勾、下划线、箭头、自定义涂鸦都请直接从图里认，不要被任何本地几何猜测带偏。把认出的标记中文名写入 JSON 字段 mark（如五角星、三角形、叉）。几何程序经常把三角形和五角星弄混，以你看见的为准。',
+      '用户画的每一种笔迹都要认：圈选、五角星、三角形、叉、勾、下划线、箭头、自定义涂鸦。以你看见的为准，不要被任何本地几何猜测带偏。把认出的标记中文名写入 JSON 字段 mark（如五角星、三角形、叉）。三角形经常被画得略圆或略歪，只要整体是三只角就写成三角形，不要写成圈或五角星。',
+      habitHint,
       written
         ? `${typed ? '用户输入的要求' : '手写已读出'}：「${written}」。第一条猜测必须对应该字的含义，不要改认成别的字。`
         : gesture.habit
@@ -202,8 +210,8 @@ export async function guessAnnotationIntent(editor, notify, { silent = false, mo
           : gesture.hint
             ? `本地几何仅供参考且可能不准：${gesture.hint} 必须看图判断标记是什么、代表什么操作。`
             : '没有手写时根据画面判断：叉/涂掉→delete；下划线→underline；箭头或一圈物体+一圈空白→move-layout；画出的图案/放射线→stamp。不要因为旁边有空白圈就默认插入文字。',
-      '圈落在哪一块就改哪一块：圈字改字，圈图改图。若用户写明只改其中几个词/几句，或圈只罩住段落里一部分，操作应只针对那一部分。',
-      '用户在某些单词上画了三角形、五角星、下划线或小圈时，操作是改这些词（加粗/高亮/下划线），不要改整段。guesses[].id 用 bold、highlight 或 underline。',
+      '圈落在哪一块就改哪一块：圈字改字，圈图改图。用户只圈选、没有写明只改里面某几个词时，操作针对圈中选区的全部内容，不要只挑个别词。',
+      '只有用户写明几个词/个别词，或在单词上画了三角形、五角星等词级标记时，才只改这些词。guesses[].id 用 bold、highlight 或 underline。',
       '若蓝线圈的是照片、封面、插画等位图，即使用户要求改颜色、改成红色、暖色、换封面，也要用 generate-image 重新生成这张图。color / color-image 只适用于文字颜色或纯色色块，不能给照片滤镜上色。',
       '按文字语义映射，例如：删/叉/×/不要→delete；字改红/蓝/绿→color；封面/配图改色或换成…→generate-image；缩小/变小→scale-down；放大→scale-up；润色/改写/通顺→polish；扩写→longer；写短→shorter；阴影→shadow；倒影→reflect；加框→frame；换图/生成图/换成一张…→generate-image，不要只给 insert-image；加粗→bold；下划线→underline；高亮→highlight；加/插入且圈在空白且没有自画图案→insert-text；往右→nudge-right。文字是别的词就按该词理解，不要默认成删除或插入。',
       sceneText ? `页面几何场景（不是标记形状）：${sceneText}` : '',
