@@ -1,10 +1,9 @@
 import { insertImageAt, insertParagraphAt, newBlockId, pageRelativeRect } from './editor.js'
-import { insertWebImage, insertWebText, isWebDocActive, liveScreenRect, listWebEdits, redoWebEdit, restoreWebEdit, webEditAnchor } from './web-doc.js'
+import { insertWebImage, insertWebText, isWebDocActive, liveScreenRect, listWebEdits, redoWebEdit, restoreWebEdit, runWebWriteback, webEditAnchor } from './web-doc.js'
 import { blockRange } from './hit-test.js'
 import { tintedMaskCanvas } from './mask.js'
 import { isLassoMode } from './overlay.js'
 import { applyScopeAfterSelect, visibleSuggests } from './scope.js'
-import { snapExistingMark } from './contour.js'
 import { redoChange, restoreChange } from './changes.js'
 import { colorFill, paperFill, parseHexColor, pickerSwatches } from './colors.js'
 import {
@@ -17,6 +16,7 @@ import {
   idleCard,
   peekLocalUndoAt,
   peekLocalUndoLabel,
+  rememberLocal,
   closeSchemeSlot,
   restoreSchemeModuleColor,
   setSchemeModuleColor,
@@ -341,8 +341,19 @@ function addHandles(layer, view, span) {
   }
 }
 
-function runCommand(kind, editor) {
-  runWriteback(kind, editor, toast)
+async function runCommand(kind, editor) {
+  if (!isWebDocActive()) {
+    toast('请先导入 HTML 再圈画修改')
+    return
+  }
+  try {
+    const ok = await runWebWriteback(kind, toast, {
+      onBefore: (label) => rememberLocal(editor, label),
+    })
+    if (ok) startReview()
+  } catch (err) {
+    toast(err.message || '改网页失败')
+  }
 }
 
 function slotTargets() {
@@ -471,19 +482,6 @@ function insertImage(editor) {
   input.click()
 }
 
-function addSnapButton(parent, markId, className = 'snap-one') {
-  const btn = document.createElement('button')
-  btn.type = 'button'
-  btn.className = className
-  btn.textContent = '贴物体'
-  btn.title = '云端贴物体已关掉。选区保持鼠标圈的范围。'
-  btn.addEventListener('click', (e) => {
-    e.stopPropagation()
-    snapExistingMark(markId, toast)
-  })
-  parent.append(btn)
-}
-
 function renderList(editor) {
   const list = document.getElementById('selection-list')
   if (!list) return
@@ -515,7 +513,6 @@ function renderList(editor) {
       else if (span.kind === 'slot') detail.textContent = '页上空白 · 插入文字或图'
       else detail.textContent = span.mode === 'background' ? '图 · 背景' : '图 · 一块像素'
       li.append(check, name, detail)
-      if (span.kind === 'image') addSnapButton(li, span.markId)
       list.append(li)
     }
   }
@@ -868,7 +865,6 @@ export function renderChrome(editor) {
     })
 
     badge.append(check, tag)
-    if (span.kind === 'image') addSnapButton(badge, span.markId, 'snap-one')
     badge.append(x)
     layer.append(badge)
   }

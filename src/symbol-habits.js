@@ -86,7 +86,7 @@ export function rememberSymbolHabit({ shape, intent, label, note, command, ask, 
     note: String(note || op).trim(),
     command: String(command || '').trim(),
     ask: String(ask || '').trim().slice(0, 40),
-    scope: normalizeHabitScope(scope) || normalizeHabitScope(prev?.scope) || '',
+    scope: normalizeHabitScope(scope) || normalizeHabitScope(prev?.scope) || 'selection',
     count: 1,
     at: Date.now(),
   }
@@ -170,7 +170,7 @@ export function clearAllSymbolHabits() {
 export function habitGuess(habit, shape) {
   if (!habit) return null
   const title = shapeTitle(shape || habit.shape, habit.ask)
-  const scope = normalizeHabitScope(habit.scope)
+  const scope = normalizeHabitScope(habit.scope) || 'selection'
   const where = habitScopeLabel(scope)
   return {
     id: habit.intent,

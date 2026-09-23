@@ -1,8 +1,7 @@
 import './styles.css'
-import { applyDemoPage, applyImportedPage, createEditor, refreshDecorations, showStartGuide } from './editor.js'
+import { applyImportedPage, createEditor, refreshDecorations, showStartGuide } from './editor.js'
 import { bindChromeKeys, renderChrome, toast } from './chrome.js'
 import { fetchHealth, importPage } from './api.js'
-import { canSnap, consumePackagingHint, consumeSkipObjectSnap, peekPackagingHint, peekSkipObjectSnap, setSnapOn, snapImageHits } from './contour.js'
 import { aabb, classifyStrokeKind, markTargetPolygon, looksLikeBoxStroke, looksLikeDrawnLine, looksLikeEnclosingStroke } from './geometry.js'
 import {
   contentImageHits,
@@ -23,6 +22,7 @@ import { ingestLayoutStroke } from './layout.js'
 import { exportWebDoc, hitWebDoc, isWebDocActive, looksLikeWebLayoutDest, pairWebLayoutDest, rememberPaintBox, unmountWebDoc } from './web-doc.js'
 import { clearLocalUndos, closeHabitPanel, dismissCoach, getCard, idleCard, keepCardForAppend, openHabitPanel, openPageRecolor, applyWrittenNote, resetCardForNewSelection, resetPagePaper, setPaintGesture, shouldTreatStrokeAsInk, canUndoLocal } from './card-flow.js'
 import { addInkStroke, clearInk, hasInk, isLikelyInk, onInkRecognized } from './ink.js'
+import { dismissChanges } from './changes.js'
 import {
   appendSpans,
   applyImageStroke,
@@ -53,40 +53,10 @@ subscribe(() => {
 
 bindChromeKeys(editor)
 setLassoMode(true)
-forceModelsOff()
 onInkRecognized(({ text, confident }) => {
   applyWrittenNote(text, { confident, silent: true })
 })
 renderChrome(editor)
-
-function forceModelsOff() {
-  setSnapOn(false)
-  const snap = document.getElementById('snap-contour')
-  if (snap) {
-    snap.checked = false
-    snap.closest('label')?.classList.remove('is-on')
-  }
-}
-
-let currentPage = 'a'
-document.querySelectorAll('[data-demo-page]').forEach((btn) => {
-  btn.addEventListener('click', () => {
-    const id = btn.getAttribute('data-demo-page')
-    if (!id || id === currentPage) return
-    currentPage = id
-    clearAll()
-    idleCard()
-    clearInk()
-    clearLocalUndos()
-    resetPagePaper()
-    applyDemoPage(editor, id)
-    unmountWebDoc()
-    document.querySelectorAll('[data-demo-page]').forEach((el) => {
-      el.classList.toggle('is-on', el.getAttribute('data-demo-page') === id)
-    })
-    toast(id === 'b' ? '已换到页 B：杯身已是雾蓝，说明还写着红色 / 原木' : '已换到页 A：标题、正文、规格都有「原木杯」')
-  })
-})
 
 function resetWorkspace() {
   clearAll()
@@ -102,8 +72,6 @@ async function loadImported(payload, waitText) {
   const page = await importPage(payload)
   resetWorkspace()
   const mode = await applyImportedPage(editor, page)
-  currentPage = 'import'
-  document.querySelectorAll('[data-demo-page]').forEach((el) => el.classList.remove('is-on'))
   const extra = (page.warnings || []).filter(Boolean).slice(0, 2).join('；')
   const head =
     mode === 'html'
@@ -143,13 +111,6 @@ document.getElementById('btn-import-html')?.addEventListener('click', () => {
 document.getElementById('btn-export-html')?.addEventListener('click', () => {
   if (exportWebDoc()) toast('已导出为网页文件，可用浏览器打开')
   else toast('先导入 HTML 文件，再导出')
-})
-
-document.getElementById('snap-contour')?.addEventListener('change', (e) => {
-  e.target.checked = false
-  setSnapOn(false)
-  e.target.closest('label')?.classList.remove('is-on')
-  toast('云端贴物体已关掉。选区就是鼠标圈的范围')
 })
 
 document.getElementById('btn-api')?.addEventListener('click', async () => {
@@ -378,14 +339,9 @@ function applyHits(textHits, imageHits, polygon, { append, subtract, add, color,
       keepCardForAppend()
       dismissCoach()
       const addedImg = extra.filter((s) => s.kind === 'image').length
-      if (consumePackagingHint() && addedImg) {
-        toast('已加上包装上的字（不贴物体）', 4200)
-        finishSelect(suggests)
-      } else {
-        toast(addedImg ? '已另作编号加上这块图（一张图两件货用 Shift 再圈）' : extra.some((s) => s.lineMark) ? emptyPaintToast(extra.find((s) => s.lineMark)) : extra.some((s) => s.paintMark) ? '已记下这笔。没涂到字或杯子' : '已加上')
-        finishSelect(suggests)
-        hintAfterSelect(extra)
-      }
+      toast(addedImg ? '已另作编号加上这块图（一张图两件货用 Shift 再圈）' : extra.some((s) => s.lineMark) ? emptyPaintToast(extra.find((s) => s.lineMark)) : extra.some((s) => s.paintMark) ? '已记下这笔。没涂到字或杯子' : '已加上')
+      finishSelect(suggests)
+      hintAfterSelect(extra)
     } else if (suggests.length) {
       finishSelect(suggests)
     } else toast('按住 Shift 再圈可加上；Alt 圈不要的可挖掉')
@@ -424,11 +380,6 @@ function applyHits(textHits, imageHits, polygon, { append, subtract, add, color,
   resetCardForNewSelection()
   replaceSpans(next)
   dismissCoach()
-  if (consumePackagingHint() && next.some((s) => s.kind === 'image')) {
-    toast('已加上包装上的字（不贴物体）', 4200)
-    finishSelect(suggests)
-    return
-  }
   finishSelect(suggests)
   hintAfterSelect(next)
 }
@@ -531,7 +482,6 @@ bindLasso({
     const rawImageHits = webHits ? webHits.images : hitImages(editor.view, hitPoly)
     const imageHits =
       subtract || add || color || isWebDocActive() ? rawImageHits : contentImageHits(rawImageHits)
-    const hasImage = imageHits.found.length + imageHits.suggest.length > 0
     const selected = getSnapshot().spans
     const newText = textHits.found.filter((s) => !selected.some((c) => sameTextHit(c, s)))
     const newImg = imageHits.found.filter(
@@ -595,28 +545,19 @@ bindLasso({
       return
     }
     if (!(shift || subtract || add || color || asMark)) clearInk()
-    const apply = (images) =>
-      applyHits(textHits, images, hitPoly, {
-        append: (shift && !subtract && !add && !color) || (peekPackagingHint() && hasImage),
-        subtract,
-        add,
-        color,
-        rawPoints,
-      })
-    const skipSnap = isWebDocActive() || (peekSkipObjectSnap() && hasImage)
-    const hasBig = [...imageHits.found, ...imageHits.suggest].some((s) => !isTinyImageSpan(s))
+    applyHits(textHits, imageHits, hitPoly, {
+      append: shift && !subtract && !add && !color,
+      subtract,
+      add,
+      color,
+      rawPoints,
+    })
     const persistMark = asMark
       ? { role: 'symbol', shape: strokeKind.shape, fingerprint: strokeKind.fingerprint }
       : undefined
-    if (subtract || add || color || skipSnap || !canSnap() || !hasBig) {
-      if (skipSnap) consumeSkipObjectSnap()
-      apply(imageHits)
-      if (strokeKind.kind === 'symbol-target' && strokeKind.shape) {
-        toast(`认出${strokeKind.label}，已点中这块。请点「开始判断」确认后再执行`)
-      }
-      return persistMark
+    if (strokeKind.kind === 'symbol-target' && strokeKind.shape) {
+      toast(`认出${strokeKind.label}，已点中这块。请点「开始判断」确认后再执行`)
     }
-    snapImageHits(imageHits, { polygon: hitPoly }, toast).then(apply)
     return persistMark
   },
   onCancel({ drew } = {}) {
@@ -656,18 +597,7 @@ window.addEventListener(
         dismissCoach()
         return
       }
-      if (changing) {
-        dismissChanges()
-        idleCard({ accept: true })
-        toast('已收下这次修改')
-        return
-      }
-      if (!hasSpans) {
-        idleCard({ accept: true })
-        toast('已收下这次修改')
-        return
-      }
-      exitToView()
+      if (changing) dismissChanges()
       idleCard({ accept: true })
       toast('已收下这次修改')
       return
@@ -677,27 +607,15 @@ window.addEventListener(
       e.preventDefault()
       if (changing) dismissChanges()
       const subtract = isSubtractMode() || e.altKey || e.ctrlKey
-      const finish = (span) => {
-        if (subtract) {
-          if (!eraseImageSpan(span, span.polygon)) toast('按住 Alt，圈不要的区域。不要点 ×')
-          return
-        }
-        appendSpans([span])
-        keepCardForAppend()
-        dismissCoach()
-        if (consumePackagingHint()) toast('已加上包装上的字（不贴物体）', 4200)
-        else toast('已另作编号加上这块图（一张图两件货用 Shift 再圈）')
-        finishSelect()
-      }
-      if (!subtract && canSnap() && !(peekSkipObjectSnap() && consumeSkipObjectSnap()) && !isTinyImageSpan(image)) {
-        snapImageHits(
-          { found: [image], suggest: [] },
-          { point: { x: e.clientX, y: e.clientY } },
-          toast,
-        ).then((hits) => finish(hits.found[0] || image))
+      if (subtract) {
+        if (!eraseImageSpan(image, image.polygon)) toast('按住 Alt，圈不要的区域。不要点 ×')
         return
       }
-      finish(image)
+      appendSpans([image])
+      keepCardForAppend()
+      dismissCoach()
+      toast('已另作编号加上这块图（一张图两件货用 Shift 再圈）')
+      finishSelect()
       return
     }
 

@@ -32,6 +32,7 @@ img, video { max-width: 100%; height: auto; }
 [data-markset-shifted="flow"] { position: relative; left: auto; top: auto; transform: none; z-index: auto; max-width: 100%; clear: both; }
 [data-markset-move-slot] { display: block; width: 100%; max-width: 100%; box-sizing: border-box; clear: both; }
 [data-markset-scaled] { transform-origin: center center; max-width: 100%; }
+[data-markset-word][data-markset-scaled] { display: inline; max-width: none; }
 [data-markset-flow] { overflow: visible; }
 [data-markset-tombstone] { display: inline-block; width: 0; overflow: hidden; margin: 0; padding: 0; border: 0; vertical-align: top; pointer-events: none; }
 [data-markset-shaped-shadow] { pointer-events: none; }
@@ -2215,7 +2216,9 @@ function verifyKind(kind, befores, afters) {
   if (kind === 'scale-up') {
     return afters.some((a, i) => {
       const ba = Math.max(1, (befores[i]?.rect.w || 0) * (befores[i]?.rect.h || 0))
-      return a.rect.w * a.rect.h > ba * 1.08 || parseFloat(a.fontSize) > (parseFloat(befores[i]?.fontSize) || 0) * 1.08
+      if (a.rect.w * a.rect.h > ba * 1.08) return true
+      if (parseFloat(a.fontSize) > (parseFloat(befores[i]?.fontSize) || 0) * 1.08) return true
+      return /data-markset-scaled/.test(a.html || '') && a.html !== befores[i]?.html
     })
   }
   if (kind === 'shadow') {
@@ -2294,11 +2297,19 @@ function inflateAabb(box, padX, padY = padX) {
 
 function isCompactWordMark(mark, box) {
   if (!mark || !box) return false
-  if (isRegionStroke(mark.points) && box.w >= 72 && box.h >= 40) return false
-  if (mark.role === 'select' || mark.role === 'add') return box.w < 72 && box.h < 44
+  const markArea = Math.max(1, box.w * box.h)
+  const region = editRegionBox()
+  if (region) {
+    const regionArea = Math.max(1, region.w * region.h)
+    if (markArea >= regionArea * 0.28) return false
+    if (box.w >= region.w * 0.72 && box.h >= region.h * 0.42) return false
+    if (markArea < regionArea * 0.22 && box.h < Math.max(56, region.h * 0.32)) return true
+  }
+  if (isRegionStroke(mark.points) && box.w >= 100 && box.h >= 48) return false
+  if (mark.role === 'select' || mark.role === 'add') return box.w < 130 && box.h < 56
   const aspect = box.w / Math.max(1, box.h)
   if ((aspect > 3.2 && box.h < 36) || (aspect < 0.35 && box.w < 36)) return true
-  return box.w < 88 && box.h < 72
+  return box.w < 140 && box.h < 80
 }
 
 function userForcesWholeSelection(ask) {
@@ -2310,41 +2321,49 @@ function userForcesWholeSelection(ask) {
 function userAsksWordLevel(ask) {
   if (userForcesWholeSelection(ask)) return false
   const t = String(ask || '')
-  if (/几个词|个别词|其中几个|只改这[个几]|只标这|只要这几个|某一个词|单词上/.test(t)) return true
+  if (/几个词|个别词|其中几个|只改这[个几]|只标这|只要这几个|某一个词|单个词|单个单词|单词上/.test(t)) return true
+  if (/画[上有着]?.{0,10}(圈|圆|标|记号|标记)|作用[在于].{0,12}(词|单词)|只(改|标|作用).{0,8}(词|单词)/.test(t)) return true
   if (/[「『“"'][^」』”"']{1,40}[」』”"']/.test(t)) return true
   return false
 }
 
+function compactStrokeBox(points) {
+  const poly = toIframePoly(points)
+  if (!poly?.length) return null
+  return aabb(poly)
+}
+
 function hasExtraWordMarks() {
-  const paints = getPaintMarks().filter((m) => m?.points?.length >= 3 && m.role !== 'subtract')
-  const lassos = paints.filter((m) => m.role === 'select' || m.role === 'add')
-  const symbols = paints.filter((m) => m.role === 'symbol')
-  const compact = (m) => {
-    const poly = toIframePoly(m.points)
-    const box = poly?.length ? aabb(poly) : null
-    return Boolean(box && isCompactWordMark(m, box))
-  }
-  if (lassos.length) return symbols.some(compact)
-  return symbols.some(compact) && !paints.some((m) => {
-    const poly = toIframePoly(m.points)
-    const box = poly?.length ? aabb(poly) : null
-    return box && isRegionStroke(m.points) && box.w >= 72 && box.h >= 40
-  })
+  return compactMarkBoxes().length > 0
 }
 
 function compactMarkBoxes() {
   const out = []
-  for (const mark of getPaintMarks()) {
-    if (!mark?.points || mark.points.length < 3 || mark.role === 'subtract') continue
-    const poly = toIframePoly(mark.points)
-    if (!poly?.length) continue
-    const box = aabb(poly)
-    if (!isCompactWordMark(mark, box)) continue
+  const seen = new Set()
+  const pushBox = (box, hint) => {
+    if (!box) return
     const aspect = box.w / Math.max(1, box.h)
     const lineLike = aspect > 3.2 && box.h < 40
     const padX = lineLike ? 4 : Math.max(4, Math.min(10, Math.max(box.w, box.h) * 0.16))
     const padY = lineLike ? Math.max(12, Math.min(26, box.h + 18)) : Math.max(5, Math.min(12, Math.max(box.w, box.h) * 0.2))
-    out.push(inflateAabb(box, padX, padY))
+    const next = inflateAabb(box, padX, padY)
+    const key = `${Math.round(next.x)}:${Math.round(next.y)}:${Math.round(next.w)}:${Math.round(next.h)}`
+    if (seen.has(key)) return
+    seen.add(key)
+    out.push(next)
+  }
+  for (const mark of getPaintMarks()) {
+    if (!mark?.points || mark.points.length < 3 || mark.role === 'subtract') continue
+    const box = compactStrokeBox(mark.points)
+    if (!isCompactWordMark(mark, box)) continue
+    pushBox(box, mark)
+  }
+  for (const stroke of getInkStrokes()) {
+    if (!stroke || stroke.length < 3) continue
+    const fake = { points: stroke, role: 'symbol' }
+    const box = compactStrokeBox(stroke)
+    if (!isCompactWordMark(fake, box)) continue
+    pushBox(box, fake)
   }
   return out
 }
@@ -2392,24 +2411,15 @@ export function setAnnoScopeHint(scope) {
 }
 
 export function inferHabitScope(ask = '') {
-  if (userForcesWholeSelection(ask)) return 'selection'
-  if (userAsksWordLevel(ask)) return 'marked'
-  const boxes = compactMarkBoxes()
-  if (!boxes.length) return 'selection'
-  const region = editRegionBox()
-  if (!region) return 'marked'
-  const regionArea = Math.max(1, region.w * region.h)
-  if (boxes.some((b) => b.w * b.h >= regionArea * 0.35)) return 'selection'
-  return 'marked'
+  return userAsksWordLevel(ask) ? 'marked' : 'selection'
 }
 
 export function resolveAnnoWordLevel(ask, habitScope = '') {
   if (userForcesWholeSelection(ask)) return false
   if (userAsksWordLevel(ask)) return true
   const scope = String(habitScope || annoScopeHint || '').trim()
-  if (scope === 'selection' || scope === 'region') return false
   if (scope === 'marked' || scope === 'word') return true
-  return hasExtraWordMarks()
+  return false
 }
 
 function phrasesFromCompactMarks(el) {
@@ -3501,6 +3511,8 @@ function inferCssShadow(pts, el) {
 }
 
 function applyOpToEls(els, kind, { color, title, box, dx, dy, scheme, paint }) {
+  const worded = applyWordScopedOp(els, kind, { title, color })
+  if (worded) return worded
   let count = 0
   const mode = colorModeOf(kind, title)
   if (kind === 'delete-deco' || kind === 'clear-deco' || kind === 'clear-anno' || kind === 'soften') {
@@ -3653,7 +3665,8 @@ export function executeCircledOp(op, { color = '', label = '', onBefore, dx = 0,
     })()
     const els = (() => {
       let picked = keepPaintTargets(raw, box)
-      if (isItemLevelOp(kind)) picked = cohereItemTargets(picked, box, kind)
+      const wordScoped = resolveAnnoWordLevel(title, annoScopeHint) && isWordScopedTextOp(kind)
+      if (isItemLevelOp(kind) && !wordScoped) picked = cohereItemTargets(picked, box, kind)
       else if (
         kind === 'color' ||
         kind === 'color-text' ||
@@ -3662,7 +3675,8 @@ export function executeCircledOp(op, { color = '', label = '', onBefore, dx = 0,
         kind === 'underline' ||
         kind === 'wavy' ||
         kind === 'strike' ||
-        String(kind).startsWith('line')
+        String(kind).startsWith('line') ||
+        wordScoped
       ) {
         picked = narrowToPaintedText(picked, box)
       }
@@ -3675,7 +3689,12 @@ export function executeCircledOp(op, { color = '', label = '', onBefore, dx = 0,
     const beforeEv = els.map((el) => evidenceOf(el))
     const before = els.map((el) => snapshotNode(el))
     const applied = applyOpToEls(els, kind, { color, title, box, dx, dy, scheme, paint })
-    if (applied.reason && !applied.count) continue
+    if (applied.reason && !applied.count) {
+      if (resolveAnnoWordLevel(title, annoScopeHint) && isWordScopedTextOp(kind)) {
+        return { ok: false, reason: applied.reason }
+      }
+      continue
+    }
     if (!applied.count) continue
     const afterEv = els.map((el) => evidenceOf(el))
     const accepted = verifyKind(kind, beforeEv, afterEv) || afterEv.some((a, i) => evidenceChanged(beforeEv[i], a))
@@ -4036,7 +4055,7 @@ function collectTextNodeMap(el) {
   return { map, acc }
 }
 
-function wrapPhraseInEl(el, phrase, kind) {
+function wrapPhraseInEl(el, phrase, kind, extra = {}) {
   const needle = String(phrase || '')
   if (!needle || !el) return 0
   const { map, acc } = collectTextNodeMap(el)
@@ -4052,8 +4071,25 @@ function wrapPhraseInEl(el, phrase, kind) {
   try {
     range.setStart(startHit.node, idx - startHit.start)
     range.setEnd(endHit.node, end - endHit.start)
+    if (extra.remove) {
+      range.deleteContents()
+      stampIds(el.ownerDocument)
+      return 1
+    }
     const span = el.ownerDocument.createElement('span')
-    span.setAttribute('data-markset-anno', kind)
+    if (extra.scale) {
+      span.setAttribute('data-markset-scaled', '1')
+      span.setAttribute('data-markset-word', '1')
+      span.setAttribute('data-markset-scale', String(extra.scale))
+      span.style.fontSize = `${Math.round(Number(extra.scale) * 100)}%`
+      span.style.display = 'inline'
+    } else if (extra.color) {
+      span.setAttribute('data-markset-word', '1')
+      span.style.color = extra.color
+      span.dataset.marksetTint = extra.color
+    } else {
+      span.setAttribute('data-markset-anno', kind)
+    }
     try {
       range.surroundContents(span)
     } catch {
@@ -4066,6 +4102,48 @@ function wrapPhraseInEl(el, phrase, kind) {
   } catch {
     return 0
   }
+}
+
+function wrapScalePhraseInEl(el, phrase, factor) {
+  return wrapPhraseInEl(el, phrase, '', { scale: factor })
+}
+
+function isWordScopedTextOp(kind) {
+  const k = String(kind || '')
+  if (k === 'scale-up' || k === 'scale-down') return true
+  if (k === 'color' || k === 'color-text') return true
+  if (k === 'delete' || k === 'delete-text') return true
+  if (k === 'highlight' || k === 'bold' || k === 'underline' || k === 'wavy' || k === 'strike') return true
+  if (k === 'frame' || k === 'circle' || k === 'box') return true
+  return false
+}
+
+function markedPhrasesForEl(el, ask = '') {
+  const asked = phrasesFromAsk(ask, textOf(el))
+  const underMark = phrasesFromCompactMarks(el)
+  return [...new Set([...asked, ...underMark])].filter(Boolean)
+}
+
+function applyWordScopedOp(els, kind, { title, color } = {}) {
+  if (!resolveAnnoWordLevel(title, annoScopeHint)) return null
+  if (!isWordScopedTextOp(kind)) return null
+  let count = 0
+  const factor = kind === 'scale-down' ? 0.72 : 1.28
+  const fill = colorFill(color) || color
+  for (const el of els) {
+    const marks = markedPhrasesForEl(el, title)
+    for (const phrase of marks.sort((a, b) => b.length - a.length)) {
+      if (kind === 'scale-up' || kind === 'scale-down') count += wrapScalePhraseInEl(el, phrase, factor)
+      else if (kind === 'color' || kind === 'color-text') count += wrapPhraseInEl(el, phrase, '', { color: fill || '#c45c26' })
+      else if (kind === 'delete' || kind === 'delete-text') count += wrapPhraseInEl(el, phrase, '', { remove: true })
+      else count += wrapPhraseInEl(el, phrase, annoKind(kind) || kind)
+    }
+  }
+  if (count) return { count }
+  if (compactMarkBoxes().length || userAsksWordLevel(title) || annoScopeHint === 'marked') {
+    return { count: 0, reason: '没对上画了标记的词。请把标记画在要改的词上' }
+  }
+  return null
 }
 
 function mergeLinePhrases(original, phrases) {
@@ -4758,6 +4836,7 @@ function cleanExportDoc(raw) {
 [data-markset-anno="box"], [data-markset-anno="frame"] { outline: 2px solid #3c6fd4; outline-offset: 3px; }
 [data-markset-anno="circle"] { outline: 2px solid #3c6fd4; border-radius: 999px; outline-offset: 4px; }
 [data-markset-scaled] { transform-origin: center center; }
+[data-markset-word][data-markset-scaled] { display: inline; max-width: none; }
 `
   parsed.head?.append(keepSkin)
   const dropAttrs = [

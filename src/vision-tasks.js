@@ -1,5 +1,5 @@
 import { planIntent, planOps } from './api.js'
-import { captureAnnotationScene, captureMarkedPage, classifyDrawnGesture } from './capture.js'
+import { captureAnnotationScene, captureMarkedPage } from './capture.js'
 import { intersectBoxes } from './geometry.js'
 import { imageSpanFromNaturalBox, normalizeVisionBox } from './hit-test.js'
 import { appendSpans, getSnapshot, replaceCommandText } from './store.js'
@@ -190,30 +190,25 @@ export async function guessAnnotationIntent(editor, notify, { silent = false, mo
     const typed = String(handwriting || '').replace(/\s+/g, ' ').trim().slice(0, 80)
     const ocr = typed ? '' : await readHandwritingVl(scene)
     const written = typed || ocr || shortHandwriting(handwriting)
-    const gesture = classifyDrawnGesture()
     const skip = (exclude || []).filter(Boolean).join('；')
     const habits = listSymbolHabits()
     const habitHint = habits.length
-      ? `用户已记录的标记偏好：${habits
+      ? `用户已记录的标记偏好（只作对照表，不要用它猜形状）：${habits
           .map((h) => `${shapeTitle(h.shape, h.ask)}=${h.label}${habitScopeLabel(h.scope) ? `（${habitScopeLabel(h.scope)}）` : ''}`)
-          .join('；')}。若图上画的就是其中一种，mark 写成该标记名，第一条猜测用对应操作。`
+          .join('；')}。先看图认定 mark，再查这张表。图上是圆/椭圆就写「圈」，即使画得不光滑、不闭合；五角星必须能看出尖角，三角形必须能看出三只角。不要把小圆圈认成五角星或三角形。mark 对上表里的名字后，第一条猜测用对应操作。`
       : ''
     const instruction = [
       '你是批注理解器。先看图里用户画了什么、写了什么，再看蓝线圈落在网页哪一块，合在一起给出操作。',
       '图1白底笔迹（蓝=圈选或标记，黑=手写或自画图案）。图2笔迹特写。图3圈选区域。图4整页。有键盘输入时以输入为准；否则认字以图1、图2为准。',
-      '用户画的每一种笔迹都要认：圈选、五角星、三角形、叉、勾、下划线、箭头、自定义涂鸦。以你看见的为准，不要被任何本地几何猜测带偏。把认出的标记中文名写入 JSON 字段 mark（如五角星、三角形、叉）。三角形经常被画得略圆或略歪，只要整体是三只角就写成三角形，不要写成圈或五角星。',
+      '用户画的每一种笔迹都要认：大圈套选、小圆圈、五角星、三角形、叉、勾、下划线、箭头、自定义涂鸦。以你看见的为准。把认出的标记中文名写入 JSON 字段 mark（如圈、五角星、三角形、叉）。封闭或近封闭的圆、椭圆、C 形都写成「圈」。',
       habitHint,
       written
         ? `${typed ? '用户输入的要求' : '手写已读出'}：「${written}」。第一条猜测必须对应该字的含义，不要改认成别的字。`
-        : gesture.habit
-          ? `用户已有习惯：${gesture.hint} 可作为候选，但若图上的标记明显不是这个形状，以图为准。`
-          : gesture.hint
-            ? `本地几何仅供参考且可能不准：${gesture.hint} 必须看图判断标记是什么、代表什么操作。`
-            : '没有手写时根据画面判断：叉/涂掉→delete；下划线→underline；箭头或一圈物体+一圈空白→move-layout；画出的图案/放射线→stamp。不要因为旁边有空白圈就默认插入文字。',
+        : '没有手写时根据画面判断标记和操作。不要使用任何本地几何分类。叉/涂掉→delete；下划线→underline；箭头或一圈物体+一圈空白→move-layout；画出的图案/放射线→stamp。不要因为旁边有空白圈就默认插入文字。不要因为词上有小圈就默认高亮。',
       '圈落在哪一块就改哪一块：圈字改字，圈图改图。用户只圈选、没有写明只改里面某几个词时，操作针对圈中选区的全部内容，不要只挑个别词。',
-      '只有用户写明几个词/个别词，或在单词上画了三角形、五角星等词级标记时，才只改这些词。guesses[].id 用 bold、highlight 或 underline。',
+      '只有用户写明几个词/个别词，或该标记的偏好是「画上标记的词」时，才只改这些词。不要把词级标记一律当成高亮。',
       '若蓝线圈的是照片、封面、插画等位图，即使用户要求改颜色、改成红色、暖色、换封面，也要用 generate-image 重新生成这张图。color / color-image 只适用于文字颜色或纯色色块，不能给照片滤镜上色。',
-      '按文字语义映射，例如：删/叉/×/不要→delete；字改红/蓝/绿→color；封面/配图改色或换成…→generate-image；缩小/变小→scale-down；放大→scale-up；润色/改写/通顺→polish；扩写→longer；写短→shorter；阴影→shadow；倒影→reflect；加框→frame；换图/生成图/换成一张…→generate-image，不要只给 insert-image；加粗→bold；下划线→underline；高亮→highlight；加/插入且圈在空白且没有自画图案→insert-text；往右→nudge-right。文字是别的词就按该词理解，不要默认成删除或插入。',
+      '按文字语义映射，例如：删/叉/×/不要→delete；字改红/蓝/绿→color；封面/配图改色或换成…→generate-image；缩小/变小→scale-down；放大→scale-up；润色/改写/通顺→polish；扩写→longer；写短→shorter；阴影→shadow；倒影→reflect；加框→frame；换图/生成图/换成一张…→generate-image，不要只给 insert-image；加粗→bold；下划线→underline；高亮→highlight；加/插入且圈在空白且没有自画图案→insert-text；往右→nudge-right。文字是别的词就按该词理解，不要默认成删除、插入或高亮。',
       sceneText ? `页面几何场景（不是标记形状）：${sceneText}` : '',
       more ? '再给出 3 到 4 条不同操作，不要重复已给过的。' : '给出 3 到 4 条最可能的操作，按可能性从高到低。有输入或手写时第一条必须对应文字；无文字时第一条必须对应你从图里看到的画法。',
       skip ? `不要再给出这些：${skip}` : '',

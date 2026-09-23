@@ -438,6 +438,7 @@ export function classifyStrokeShape(pts) {
   const enclosing = looksLikeEnclosingStroke(pts)
   const corners = turningCorners(pts)
   const round = roundness(pts)
+  if (enclosing && round > 0.55 && corners <= 6) return 'circle'
   if (looksLikeStarStroke(pts)) return 'star'
   if (looksLikeTriangleStroke(pts)) return 'triangle'
   if (looksLikeXStroke(pts)) return 'x'

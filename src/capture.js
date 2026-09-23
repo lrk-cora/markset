@@ -302,7 +302,7 @@ export function classifyDrawnGesture() {
         kind: habit.intent,
         shape: mark.shape,
         label: guess.label,
-        hint: `用户习惯用${shapeTitle(mark.shape, mark.label)}表示「${habit.label}」。直接按这个习惯执行。`,
+        hint: `用户习惯用${shapeTitle(mark.shape, mark.label)}表示「${habit.label}」。这是本地几何猜测，仅模型失败时采用。`,
         habit: true,
       }
     }

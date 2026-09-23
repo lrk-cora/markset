@@ -1215,7 +1215,8 @@ function rememberActiveSymbol(guess, id, label, command, written) {
   const pts = lastPaintPoints() || ui.lastPaint
   const fp = mark.fingerprint || (String(shape).startsWith('mark:') ? shape.slice(5) : strokeFingerprint(pts))
   const prev = habitForShape(shape) || habitForShape(mark.shape) || habitForStroke(pts)
-  const scope = guess?.scope || inferHabitScope(written) || prev?.scope || ''
+  const asked = inferHabitScope(written)
+  const scope = guess?.scope || (asked === 'marked' ? 'marked' : prev?.scope) || 'selection'
   const saved = rememberSymbolHabit({
     shape,
     fingerprint: fp,
@@ -1399,7 +1400,6 @@ async function runIntentGuesses(editor, token, { more = false } = {}) {
   const typed = String(ui.typedText || '').trim()
   try {
     const scene = isWebDocActive() ? describePaintScene() : { blank: sceneIsBlank(), text: '' }
-    const gesture = classifyDrawnGesture()
     const hit = await guessAnnotationIntent(editor, null, {
       silent: true,
       more,
@@ -1412,7 +1412,6 @@ async function runIntentGuesses(editor, token, { more = false } = {}) {
     let written = String(typed || hit?.text || (localInk.confident ? localInk.text : '') || '').trim()
     if (
       !typed &&
-      gesture.kind &&
       (!written ||
         written.length <= 2 ||
         /涂鸦|笔画/.test(written) ||
@@ -1427,8 +1426,7 @@ async function runIntentGuesses(editor, token, { more = false } = {}) {
       parseNote(ui.markName) ||
       hit?.note ||
       hit?.intent ||
-      (gesture.habit ? gesture.kind : '') ||
-      ui.note
+      (!hit?.fromModel ? resolvedHabit().habit?.intent || ui.note : ui.note)
     if (written) applyWrittenNote(written, { confident: Boolean(hit?.fromModel || localInk.confident), note: verb, silent: true })
     local = localGuesses(getSnapshot().spans, editor).filter((g) => !seen.has(g.label))
     let next = (hit?.guesses || []).map(normalizeGuessItem).filter(Boolean)
@@ -1445,7 +1443,7 @@ async function runIntentGuesses(editor, token, { more = false } = {}) {
     ui.noteConfident = Boolean(hit?.fromModel || written)
     ui.fromModel = Boolean(hit?.fromModel)
     if (!more) {
-      const fromMark = habitFromModelMark(ui.markName || hit?.mark)
+      const fromMark = hit?.fromModel ? habitFromModelMark(ui.markName || hit?.mark) : null
       const fallback = hit?.fromModel ? null : resolvedHabit().habit
       const habit = fromMark || fallback
       if (habit && !typedOverridesHabit(typed, habit)) {
@@ -1468,7 +1466,12 @@ async function runIntentGuesses(editor, token, { more = false } = {}) {
       const ed = editor || guessRuntime.editor
       const deps = guessRuntime.deps
       if (!more && autoHabit && ed && deps) {
-        deps.toast?.(ui.markName ? `模型认出「${ui.markName}」，按偏好执行` : `按已记录的偏好执行：${autoHabit.label}`)
+        const viaModel = Boolean(ui.fromModel && ui.markName)
+        deps.toast?.(
+          viaModel
+            ? `模型认出「${ui.markName}」，按偏好执行`
+            : `模型未能认出标记，按本地几何偏好执行：${autoHabit.label}`,
+        )
         applyGuess(autoHabit, ed, deps)
         return
       }
@@ -1707,7 +1710,7 @@ export function applyGuess(guess, editor, deps) {
   const resolved = resolvedHabit()
   const markNow = resolved.mark
   const habitNow = resolved.habit
-  const scopeNow = guess.scope || habitNow?.scope || inferHabitScope(written)
+  const scopeNow = guess.scope || habitNow?.scope || inferHabitScope(written) || 'selection'
   setAnnoScopeHint(scopeNow)
   const parsed = parseCommand([written, command, label].filter(Boolean).join(' '))
   if (parsed.color) ui.color = parsed.color
@@ -1844,7 +1847,7 @@ export function applyGuess(guess, editor, deps) {
       deps.toast(`正在执行：${label || localLabel(id)}`)
       const result = executeCircledOp(webOp, {
         color: paintColor,
-        label: label || localLabel(id),
+        label: [written, label, localLabel(id)].filter(Boolean).join(' '),
         onBefore: (lab) => rememberLocal(editor, lab),
         paint: ui.lastPaint,
       })
@@ -2694,15 +2697,19 @@ function pickOption(id, deps, editor) {
   if (id === 'scale-down' || id === 'scale-up') {
     const down = id === 'scale-down'
     const label = down ? '缩小' : '放大'
+    const ask = [ui.typedText, ui.noteText, label].filter(Boolean).join(' ')
+    let reason = ''
     if (!withLocalUndo(editor, label, () => {
       if (!isWebDocActive()) return false
-      return applyWebScale(down ? 0.82 : 1.22, label)
+      const result = executeCircledOp(down ? 'scale-down' : 'scale-up', { label: ask })
+      reason = result?.reason || ''
+      return Boolean(result?.ok)
     })) {
-      deps.toast('先圈要缩放的 Logo 或图片')
+      deps.toast(reason || '先圈要缩放的字或图片')
       return
     }
     clearPaintMarks()
-    deps.toast(down ? '已缩小 Logo。可点「还原这一处」' : '已放大 Logo。可点「还原这一处」')
+    deps.toast(down ? '已缩小。可点「还原这一处」' : '已放大。可点「还原这一处」')
     startReview()
     emit()
     return
@@ -3492,7 +3499,7 @@ function habitScopeSelect(habit, onPick) {
   const sel = document.createElement('select')
   sel.className = 'card-habit-select'
   sel.setAttribute('aria-label', '这个标记作用在哪')
-  const current = habit?.scope || inferHabitScope() || 'selection'
+  const current = habit?.scope || 'selection'
   for (const opt of HABIT_SCOPE_OPTIONS) {
     const item = document.createElement('option')
     item.value = opt.id
@@ -3513,7 +3520,7 @@ function fillHabitPanel(bar, editor, deps) {
   bar.append(title)
   const hint = document.createElement('p')
   hint.className = 'card-note'
-  hint.textContent = '每个标记要同时记下两件事：做什么（高亮、加粗…），以及作用在整个选区还是只作用在画上这个标记的词。改完立刻生效。'
+  hint.textContent = '记下这个标记做什么。只选操作时默认改整个选区；若只要改画了这个标记的词，把范围改成「画上标记的词」。'
   bar.append(hint)
   const habits = listSymbolHabits()
   if (!habits.length) {
@@ -3582,7 +3589,7 @@ function fillPropose(bar, spans, editor, deps) {
   else if (layoutSourceWaiting(spans) && !looksLikeLayout(spans) && !inferWebLayoutPairs().length) hint.textContent = '再圈它要放到的空白位置。后一圈会当成落点，不会当成新选区'
   else if (looksLikeLayout(spans) || inferWebLayoutPairs().length) hint.textContent = '已认出模块和落点。点「移到画出的位置」'
   else if (habitNow) {
-    const where = habitScopeLabel(habitNow.scope) || habitScopeLabel(inferHabitScope())
+    const where = habitScopeLabel(habitNow.scope || 'selection')
     hint.textContent = `已有习惯：${shapeTitle(markNow.shape, markNow.label)} = ${habitNow.label}${where ? `（${where}）` : ''}。点开始判断会把你画的交给模型认，认对后按偏好执行。`
   }
   else if (ui.judged && ui.markName) hint.textContent = `模型认出这是${ui.markName}。点一项执行；若标记叫错可再判断一次。`
