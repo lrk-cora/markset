@@ -39,6 +39,13 @@ npm run dev
 
 `samples/` 里有可直接导入的示例页。
 
+## 相关文献
+
+论文 related work 对照材料在 `related-papers/`（英文目录名便于 GitHub）：
+
+- 对照说明：`related-papers/RELATED_WORK.md`
+- PDF 按 `01`–`13` 编号；个别需机构下载的见同目录 `*_DOWNLOAD.txt`
+
 ## 功能
 
 - **圈选**：不规则套索即可；加选 / 减选修范围
