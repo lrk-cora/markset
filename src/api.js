@@ -99,7 +99,7 @@ export async function planBrushIntent(payload, { signal, onProgress } = {}) {
         if (terminal) return
         const value = JSON.parse(raw)
         if (event === 'progress') {
-          if (['planning','observe','repair','retry','draft'].includes(value.stage)) onProgress?.({
+          if (['planning','observe','retry','draft'].includes(value.stage)) onProgress?.({
             stage:value.stage, draftSummary:typeof value.draftSummary === 'string' ? value.draftSummary.slice(0,180) : '',
             retry:Math.min(2,Math.max(0,Number(value.retry) || 0)),
           })
@@ -121,6 +121,7 @@ export async function planBrushIntent(payload, { signal, onProgress } = {}) {
     err.retriesUsed = Number(data?.retriesUsed) || 0
     err.elapsedMs = Number(data?.elapsedMs) || 0
     err.reason = String(data?.reason || '')
+    err.proposalSummary = String(data?.proposalSummary || '').slice(0,500)
     err.repairsUsed = Number(data?.repairsUsed) || 0
     err.trace = Array.isArray(data?.trace) ? data.trace : []
     err.timings = data?.timings || null

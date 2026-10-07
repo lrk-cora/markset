@@ -33,7 +33,7 @@ test('first request carries real layout/anchor evidence; preferences do not rewr
       const result = await brushIntent(env, { targets: [target], observation, preferences, userInstruction: '模块内加图', imageDataUrls: ['screenshot'] })
       assert.equal(result.timings.modelRequests, 1); assert.equal(result.timings.modelAttempts, 1)
       assert.equal(result.timings.readToolCalls, 0); assert.equal(result.intent.insertion.anchorId, 'caption')
-      assert.equal(result.model, 'qwen3.8-max')
+      assert.equal(result.model, 'qwen3.8-flash')
     }
     assert.equal(seen[0].messages[0].content, seen[1].messages[0].content)
   } finally { globalThis.fetch = oldFetch }
@@ -58,11 +58,18 @@ test('official region is explicit; public config cannot contain the key or key f
   assert.equal(config.origin,'https://dashscope.aliyuncs.com')
   assert.doesNotMatch(JSON.stringify(publicBailianConfig(config)),/test-key|apiKey|KEY_FILE/)
 })
-test('observable complexity routes once; simple local edit does not double-call tiers',()=>{
-  assert.equal(routeAnalysis({userInstruction:'改成红色',targets:[target]},config).tier,'flash')
-  assert.equal(routeAnalysis({imageDataUrls:['screenshot'],targets:[target]},config).tier,'max')
-  assert.equal(routeAnalysis({userInstruction:'先重排卡片，然后在每个模块内插图',targets:[target]},config).tier,'max')
-  assert.equal(routeAnalysis({strokes:[{shape:'circle'},{shape:'line'},{shape:'arrow'},{shape:'cross'}]},config).tier,'max')
+test('user-selected Flash remains Flash for screenshots, image plans and complex marks without hidden Max escalation',()=>{
+  for (const payload of [
+    {userInstruction:'改成红色',targets:[target]},
+    {imageDataUrls:['screenshot'],targets:[target]},
+    {userInstruction:'先重排卡片，然后在每个模块内插图',targets:[target]},
+    {strokes:[{shape:'circle'},{shape:'line'},{shape:'arrow'},{shape:'cross'}]},
+    {userInstruction:'高质量复杂整体布局',targets:Array(8).fill(target)},
+  ]) {
+    const routing=routeAnalysis(payload,config)
+    assert.equal(routing.tier,'flash');assert.equal(routing.model,'qwen3.8-flash')
+    assert.match(routing.reason,/用户指定.*不自动升级/u)
+  }
   assert.equal(routeImage({prompt:'普通配图'},config).tier,'standard')
   assert.equal(routeImage({prompt:'精确文字海报'},config).tier,'pro')
 })
@@ -182,8 +189,8 @@ test('model geometry uses document coordinates after scrolling and labels resize
     const submit=body.tools.find(tool=>tool.function.name==='propose_edit')
     assert.equal(submit.function.parameters.type,'object')
     assert.ok(submit.function.parameters.properties.styles)
-    assert.equal(body.model,'qwen3.8-max')
-    assert.equal(body.max_tokens,4000)
+    assert.equal(body.model,'qwen3.8-flash')
+    assert.equal(body.max_tokens,2200)
     assert.equal(body.enable_thinking,false)
     return Response.json({choices:[{message:{content:JSON.stringify({...raw,intentType:'color',color:'red'})}}]})
   }

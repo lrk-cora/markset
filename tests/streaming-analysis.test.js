@@ -99,15 +99,15 @@ test('container text is omitted only when every child text is fully provided; mi
   }
 })
 
-test('progress uses measured elapsed time, marks drafts and never invents percent completion',()=>{
+test('progress uses measured elapsed time but never displays partial drafts or invented percent completion',()=>{
   const view=analysisProgressView({stage:'draft',startedAt:1000,draftSummary:'保留文字，添加配图'},4500)
-  assert.equal(view.kind,'AI 草拟建议 · 3 秒');assert.equal(view.headline,'保留文字，添加配图')
-  assert.match(view.detail,/草案.*检查/u);assert.doesNotMatch(JSON.stringify(view),/%/)
+  assert.equal(view.kind,'AI 设计方案 · 3 秒');assert.equal(view.headline,'正在生成完整修改建议…')
+  assert.match(view.detail,/完整方案.*一次显示/u);assert.doesNotMatch(JSON.stringify(view),/%|保留文字，添加配图/)
   assert.equal(analysisProgressView(null,3000).stage,'preparing')
   assert.equal(analysisProgressView({startedAt:0},3000).kind,'准备证据 · 3 秒')
 })
 
-test('one format repair is reported honestly and cannot overwrite first-feedback timing or silently apply a draft',async(t)=>{
+test('malformed streamed output stops after its first draft without a hidden repair or automatic application',async(t)=>{
   const nativeFetch=globalThis.fetch,events=[]
   let clock=0,calls=0
   t.mock.method(Date,'now',()=>clock)
@@ -117,12 +117,14 @@ test('one format repair is reported honestly and cannot overwrite first-feedback
     return response(packet(toolDelta(++calls===1?'{"suggestion":"首次公开建议", invalid}':JSON.stringify(plan),true))+ending)
   }
   try {
-    const result=await brushIntent({MARKSET_MODEL_BASE_URL:'https://stream.test/v1',MARKSET_MODEL_API_KEY:'private-key',MARKSET_BRUSH_MODEL:'test'},
-      {targets:[{webId:'h',kind:'text',text:'标题'}],userInstruction:'颜色调整'}, {onProgress:value=>events.push(value)})
-    assert.equal(calls,2);assert.equal(result.repaired,true)
-    assert.equal(result.timings.firstSummaryMs,50)
-    assert.equal(result.intent.requiresConfirmation,true)
-    assert.ok(events.some(event=>event.stage==='repair'))
+    await assert.rejects(brushIntent({MARKSET_MODEL_BASE_URL:'https://stream.test/v1',MARKSET_MODEL_API_KEY:'private-key',MARKSET_BRUSH_MODEL:'test'},
+      {targets:[{webId:'h',kind:'text',text:'标题'}],userInstruction:'颜色调整'}, {onProgress:value=>events.push(value)}),error=>{
+      assert.equal(error.reason,'invalid-plan-json');assert.equal(error.repairsUsed,0)
+      assert.equal(error.timings.firstSummaryMs,undefined);return true
+    })
+    assert.equal(calls,1)
+    assert.ok(events.every(event=>event.stage!=='repair'))
+    assert.ok(events.every(event=>event.stage!=='draft' && !event.draftSummary))
     assert.equal(events.filter(event=>event.stage==='planning').length,1)
   }finally{globalThis.fetch=nativeFetch}
 })
@@ -144,7 +146,7 @@ test('browser API delivers safe progress before completion and retains error sta
   }finally{globalThis.fetch=nativeFetch}
 })
 
-test('actual backend streams sanitized suggestions before result; JSON callers remain compatible and disconnect aborts upstream',async()=>{
+test('actual backend returns one complete proposal without public drafts; JSON callers and disconnect cancellation still work',async()=>{
   const nativeFetch=globalThis.fetch,nativeWarn=console.warn
   const env={MARKSET_MODEL_BASE_URL:'https://stream.test/v1',MARKSET_MODEL_API_KEY:'private-key',MARKSET_BRUSH_MODEL:'test',MARKSET_ALLOW_MODEL_CALLS:'1'}
   let middleware,release,upstreamSignal,upstreamCalls=0
@@ -170,14 +172,17 @@ test('actual backend streams sanitized suggestions before result; JSON callers r
     const payload={targets:[{webId:'h',kind:'text',text:'标题'}],userInstruction:'蓝色'}
     const res=await nativeFetch(url,{method:'POST',headers:{'Content-Type':'application/json',Accept:'text/event-stream'},body:JSON.stringify(payload)})
     const events=[]
-    const read=readEventStream(res.body,event=>{
-      events.push(event)
-      if(event.event==='progress' && JSON.parse(event.data).draftSummary)release()
-    })
+    const read=readEventStream(res.body,event=>events.push(event))
+    for(let i=0;i<30 && !release;i++)await new Promise(resolve=>setTimeout(resolve,5))
+    assert.equal(typeof release,'function')
+    assert.ok(!events.some(event=>event.event==='result'))
+    release()
     await read
-    assert.ok(events.findIndex(event=>event.event==='progress' && JSON.parse(event.data).draftSummary)<events.findIndex(event=>event.event==='result'))
+    assert.ok(events.filter(event=>event.event==='progress').every(event=>!JSON.parse(event.data).draftSummary && JSON.parse(event.data).stage!=='draft'))
     const result=JSON.parse(events.find(event=>event.event==='result').data)
     assert.equal(result.intent.type,'color');assert.equal(result.timings.modelRequests,1)
+    assert.equal(result.timings.firstSummaryMs,undefined)
+    assert.equal(result.timings.completedPlanMs,result.timings.serverMs)
     assert.doesNotMatch(JSON.stringify(events),/private-key|tool_calls|function.arguments/)
     const json=await nativeFetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)})
     assert.equal((await json.json()).intent.type,'color')

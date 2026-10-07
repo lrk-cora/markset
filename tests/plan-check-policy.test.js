@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { planCheckReport, planIssueDescription, canRepairPlanReport, blockingPlanIssues, repairPlanEvidence, resultRepairCount } from '../src/plan-check-policy.js'
+import { MAX_PLAN_REPAIRS, planCheckReport, planIssueDescription, canRepairPlanReport, blockingPlanIssues, repairPlanEvidence, resultRepairCount } from '../src/plan-check-policy.js'
 import { analysisIssue } from '../src/analysis-errors.js'
 import { createAgentJournal } from '../src/agent-journal.js'
 
@@ -10,18 +10,18 @@ test('minor visible horizontal overhang and quality advisories do not block a re
   assert.equal(canRepairPlanReport(report),false,'cosmetic warnings do not spend paid repair calls')
 })
 
-test('real damage, clipping, overlap, missing effects and unknown errors fail closed even if labeled warning',()=>{
-  for(const code of ['page-horizontal-overflow','component-overflow','new-content-clipped','new-content-overlap','non-target-removed','non-target-text-changed','non-target-moved','non-target-attributes-changed','undo-mismatch','inactive-layout-style','unknown-check']) {
+test('real damage, clipping, overlap and unknown errors fail closed even if labeled warning',()=>{
+  for(const code of ['page-horizontal-overflow','component-overflow','new-content-clipped','new-content-overlap','non-target-removed','non-target-text-changed','non-target-moved','non-target-attributes-changed','undo-mismatch','unknown-check']) {
     const report=planCheckReport([{code,pixels:30,severity:'warning'}])
     assert.equal(report.ok,false,code);assert.equal(report.errors[0].severity,'error',code)
   }
 })
 
-test('wrong insertion positions are blocking, concretely explained and automatically repairable, not content advisories',()=>{
+test('wrong insertion positions stop safely and never trigger an automatic model repair',()=>{
   for(const code of ['insertion-position-mismatch','insertion-position-unverified']) {
     const report=planCheckReport([{code,severity:'warning'}])
     assert.equal(report.ok,false)
-    assert.equal(canRepairPlanReport(report),true)
+    assert.equal(canRepairPlanReport(report),false)
     assert.match(report.errors[0].message,/指定的区域|实际位置/)
   }
 })
@@ -31,10 +31,17 @@ test('existing overflow is compared by its measured increase; non-finite or miss
   for(const pixels of [undefined,NaN,Infinity,-1,0]) assert.equal(planCheckReport([{code:'component-overflow',pixels}]).ok,false)
 })
 
-test('many warnings cannot hide a later critical issue and only repairable checks invoke the model',()=>{
+test('many warnings cannot hide a critical issue and no validation result permits another paid design call',()=>{
   const report=planCheckReport([...Array.from({length:20},()=>({code:'design-advisory'})),{code:'non-target-removed'}])
-  assert.equal(report.ok,false);assert.equal(report.errors.length,1);assert.equal(canRepairPlanReport(report),true)
+  assert.equal(report.ok,false);assert.equal(report.errors.length,1);assert.equal(canRepairPlanReport(report),false)
+  assert.equal(MAX_PLAN_REPAIRS,0)
   for(const code of ['undo-mismatch','verification-timeout','verification-failed','page-not-loaded']) assert.equal(canRepairPlanReport(planCheckReport([{code}])),false)
+})
+
+test('ineffective styling is a content/design advisory, but an unexplained failed verifier is not',()=>{
+  const report=planCheckReport([{code:'inactive-layout-style',property:'flex-direction'}])
+  assert.equal(report.ok,true);assert.equal(report.warnings.length,1)
+  assert.equal(planCheckReport([],{ok:false}).ok,false)
 })
 
 test('failure message states a safe concrete cause and counts automatic repairs, not provider raw strings',()=>{

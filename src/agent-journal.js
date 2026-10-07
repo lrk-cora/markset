@@ -8,7 +8,7 @@ const kinds = { text: '文字', image: '图片', container: '容器', card: '卡
 export function sanitizeAnalysisTimings(value = {}) {
   const timings = {}
   for (const key of ['pauseMs','observationMs','captureMs','baseWaitMs','baseBuildMs','planMs','verifyMs','repairMs',
-    'modelRequests','modelAttempts','upstreamMs','serverMs','readToolCalls','imageCount','totalMs','firstSummaryMs','evidenceChars','originalEvidenceChars']) {
+    'modelRequests','modelAttempts','upstreamMs','serverMs','readToolCalls','imageCount','totalMs','firstSummaryMs','completedPlanMs','evidenceChars','originalEvidenceChars']) {
     if (typeof value?.[key] === 'number' && Number.isFinite(value[key]) && value[key] >= 0) timings[key] = Math.round(value[key])
   }
   for (const key of ['baseCacheHit','baseShared']) if (typeof value?.[key] === 'boolean') timings[key] = value[key]

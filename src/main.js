@@ -14,7 +14,7 @@ import { bindIntentSubmission, finishIntentSubmission } from './intent-submissio
 import { analysisRecoveryIntent, runAnalysisTask } from './analysis-task.js'
 import { analysisIssue } from './analysis-errors.js'
 import { sanitizeModelAttempts } from './model-diagnostics.js'
-import { MAX_PLAN_REPAIRS, planRepairCount, resultRepairCount, blockingPlanIssues, canRepairPlanReport, planCheckReport, planIssueDescription, repairPlanEvidence } from './plan-check-policy.js'
+import { blockingPlanIssues, planCheckReport, planIssueDescription } from './plan-check-policy.js'
 import { analysisProgressView } from './analysis-progress.js'
 import { proposalStatus, renderProposalStatus } from './proposal-status.js'
 import { MODEL_CLIENT_TIMEOUT_MS } from './request-policy.js'
@@ -226,7 +226,7 @@ function intentChoices(intent) {
   // handled by clicking away, never as a competing recommendation.
   return choices
     .filter((choice) => !isAnnotationChoice(choice))
-    .filter((choice) => !/移除|删除|去掉|删掉/u.test(choice) || hasDeleteEvidence(intent, getBrushState().group || {}))
+    .filter((choice) => intent?.source === 'model' || !/移除|删除|去掉|删掉/u.test(choice) || hasDeleteEvidence(intent, getBrushState().group || {}))
 }
 
 function recommendedChoice(intent, choices) {
@@ -375,7 +375,7 @@ function renderInlineProposal(group) {
   els.inlineRetry.textContent = group.imageError ? (group.imageTaskId ? '查询原图片任务' : '重试图片连接') : '重试 AI'
   els.inlineRetry.disabled = analyzing
   const pendingWithoutInput = pendingModel && !String(group.feedbackDraft || group.replacementText || '').trim()
-  els.inlinePrimary.disabled = analyzing || pendingModel
+  els.inlinePrimary.disabled = analyzing || pendingModel || issue?.code === 'agent_plan_invalid'
   const actionable = !modelError && !intent.needsClarification && ['reorder', 'delete', 'replace', 'replace-image', 'insert', 'color', 'style', 'move', 'batch'].includes(intent.type)
   const preferPreview = getEffectiveBehaviorProfile().clearIntentAction === 'preview' && actionable && !needsInput
   els.inlinePrimary.textContent = group.applying ? '正在准备修改…' : analyzing ? '正在理解…' : pendingWithoutInput ? '正在分析…' : pendingModel ? '提交要求' : previewing ? '确认应用' : preferPreview ? '预览' : '修改'
@@ -824,10 +824,10 @@ function modelIntentRejectionReason(intent, localIntent, userInstruction = '', a
   if (!intent) return 'missing-plan'
   const checked = validateIntentPlan(intent, availableTargets, userInstruction)
   if (!checked.ok) return checked.reason
-  // Retain the destructive-selection invariant, without making other actions
-  // depend on imperfect local shape labels. A model can infer layout or insert.
+  // Geometry alone never authorizes a local deletion. Model proposals use the
+  // actual vision evidence and still require the user's explicit Apply click.
   const deleteSteps = (intent.type === 'batch' ? intent.steps || [] : [intent]).filter((step) => step.type === 'delete')
-  if (deleteSteps.length && !String(userInstruction).trim()) {
+  if (intent.source !== 'model' && deleteSteps.length && !String(userInstruction).trim()) {
     if (!hasDeleteEvidence(localIntent || {}, { localIntent })) return 'selection-alone-does-not-authorize-deletion'
     // A character hit is evidence, not a command to delete only that range.
     // The visual planner may recognize whole-object crossing-out too. It
@@ -896,10 +896,10 @@ function localFallbackIntent(localIntent, group, reason = '') {
   }
 }
 
-async function askModelToInterpret(group, localIntent, userInstruction = '', { pauseMs = 0, repairFeedback = null, repairsUsed: priorRepairs = 0, retriesUsed: priorRetries = 0 } = {}) {
+async function askModelToInterpret(group, localIntent, userInstruction = '', { pauseMs = 0 } = {}) {
   const analysisStarted = performance.now()
   const timings = { pauseMs, observationMs: 0, captureMs: 0, planMs: 0, verifyMs: 0, repairMs: 0 }
-  let flowRepairsUsed = planRepairCount(priorRepairs), flowRetriesUsed = priorRetries
+  let flowRetriesUsed = 0
   const requestId = ++modelRequestSeq
   const explicitReplacement = hasBrushRegionReference(userInstruction) ? null : parseExplicitTextReplacement(userInstruction, group.targets || [])
   const explicitIntent = explicitReplacement ? {
@@ -937,7 +937,7 @@ async function askModelToInterpret(group, localIntent, userInstruction = '', { p
   const allowedIds = new Set(availableTargets.map((target)=>String(target.webId)))
   let safeObservation = observation ? { ...observation,nodes:observation.nodes.filter((node)=>allowedIds.has(String(node.webId))) } : null
   timings.observationMs = Math.round(performance.now() - observeStarted)
-  if (!repairFeedback && explicitIntent && modelIntentIsUsable(explicitIntent, localIntent, userInstruction)) {
+  if (explicitIntent && modelIntentIsUsable(explicitIntent, localIntent, userInstruction)) {
     // A unique, exact source → replacement is already a complete local plan;
     // do not make this deterministic edit depend on the vision-model gateway.
     patchGroupAnalysis(group, {
@@ -1009,7 +1009,6 @@ async function askModelToInterpret(group, localIntent, userInstruction = '', { p
         imageDataUrls: [scene.combinedDataUrl, scene.closeupDataUrl].filter(Boolean),
         localInterpretation: planningGroup.localIntent || localIntent,
         userInstruction,
-        ...(repairFeedback ? {repairFeedback,repairsUsed:planRepairCount(priorRepairs),retryBudget:Math.max(0,2-priorRetries)} : {}),
         evidence: localIntent?.evidence || null,
         observation:safeObservation,
         answeredClarifications:group.answeredClarifications || [],
@@ -1028,78 +1027,61 @@ async function askModelToInterpret(group, localIntent, userInstruction = '', { p
           })),
         ])
         for (const key of ['modelRequests', 'modelAttempts', 'upstreamMs', 'serverMs', 'readToolCalls']) timings[key] = (timings[key] || 0) + (Number(metrics[key]) || 0)
-        for (const key of ['evidenceChars','originalEvidenceChars']) if (Number.isFinite(metrics[key])) timings[key]=metrics[key]
+        for (const key of ['evidenceChars','originalEvidenceChars','completedPlanMs']) if (Number.isFinite(metrics[key])) timings[key]=metrics[key]
       }
       const requestPlan = async (body, stage) => {
         const started = performance.now()
-        updateProgress({stage:stage === 'repairMs' ? 'repair' : 'planning',draftSummary:''})
+        updateProgress({stage:'planning',draftSummary:''})
         try { const result = await planBrushIntent(body, { signal, onProgress:value=>{
-          if (value.draftSummary && timings.firstSummaryMs == null) timings.firstSummaryMs=Math.round(performance.now()-analysisStarted)
-          updateProgress(value)
+          // Ignore legacy partial drafts. Only publish a complete checked plan.
+          if (value.stage !== 'draft') updateProgress({...value,draftSummary:''})
         } }); addServerMetrics(result.timings); return result }
         catch (error) { addServerMetrics(error.timings); throw error }
         finally { timings[stage] += Math.round(performance.now() - started) }
       }
-      let result
-      if (repairFeedback) flowRepairsUsed++
-      try { result = await requestPlan(payload, repairFeedback ? 'repairMs' : 'planMs') }
-      catch (error) { error.retriesUsed=priorRetries+(Number(error.retriesUsed) || 0); throw error }
-      let retriesUsed=priorRetries+(Number(result.retriesUsed) || 0)
-      let repairsUsed = Math.max(resultRepairCount(result),planRepairCount(priorRepairs)+(repairFeedback ? 1 : 0))
-      flowRetriesUsed=retriesUsed; flowRepairsUsed=repairsUsed
-      let trace = result.trace || []
-      for (let attempt=0; attempt<=MAX_PLAN_REPAIRS; attempt++) {
-        signal.throwIfAborted()
-        updateProgress({stage:'verify',draftSummary:result.intent?.suggestion?.text || ''})
-        const verifyStarted = performance.now()
-        let report, verificationElapsed
-        let verified
-        try {
-          verified = await verifyReflowedBrushPlan(planningGroup,result.intent,{
-            resolveRect:resolveBrushLayoutRect,refreshTarget:refreshBrushTargetGeometry,signal,
-            verify:async(plan,strokes)=>{
-              const checked = validateIntentPlan(plan,availableTargets,userInstruction)
-              const rejection = modelIntentRejectionReason(plan,localIntent,userInstruction,availableTargets)
-                || (plan.needsClarification && wasClarificationAnswered(plan.clarifyingQuestion,group.answeredClarifications) ? 'already-answered-clarification' : '')
-              let report = rejection ? {ok:false,issues:[{code:rejection}]} : { ok:true,checks:['schema','scope'] }
-              if (report.ok && checked.actionable && !plan.needsInput && !plan.needsClarification) {
-                report = await runAnalysisTask((checkSignal)=>verifyBrushPlan(plan,strokes,{signal:checkSignal}),{signal,timeoutMs:4_000,timeoutPhase:'verify'})
-              }
-              if (report.ok && plan.candidatePlans?.length) {
-                const candidateWarnings = []
-                for (const [index,candidate] of plan.candidatePlans.entries()) {
-                  const candidateReport=await runAnalysisTask((checkSignal)=>verifyBrushPlan(candidate,strokes,{signal:checkSignal}),{signal,timeoutMs:4_000,timeoutPhase:'verify'})
-                  if (!candidateReport.ok) { report={...candidateReport,issues:candidateReport.issues.map(issue=>({...issue,candidateIndex:index}))}; break }
-                  candidateWarnings.push(...(candidateReport.warnings || []).map(issue=>({...issue,candidateIndex:index})))
-                }
-                if (report.ok) report=planCheckReport(candidateWarnings,{checks:['execution','scope','candidate-execution','undo']})
-              }
-              return report
+      const result = await requestPlan(payload, 'planMs')
+      const retriesUsed = Number(result.retriesUsed) || 0
+      flowRetriesUsed = retriesUsed
+      const trace = result.trace || []
+      signal.throwIfAborted()
+      updateProgress({stage:'verify',draftSummary:''})
+      const verifyStarted = performance.now()
+      let report, verificationElapsed
+      let verified
+      try {
+        verified = await verifyReflowedBrushPlan(planningGroup,result.intent,{
+          resolveRect:resolveBrushLayoutRect,refreshTarget:refreshBrushTargetGeometry,signal,
+          verify:async(plan,strokes)=>{
+            const checked = validateIntentPlan(plan,availableTargets,userInstruction)
+            const rejection = modelIntentRejectionReason(plan,localIntent,userInstruction,availableTargets)
+            let report = rejection ? planCheckReport([{code:rejection}]) : { ok:true,checks:['schema','scope'] }
+            if (report.ok && checked.actionable && !plan.needsInput && !plan.needsClarification) {
+              const trial = await runAnalysisTask((checkSignal)=>verifyBrushPlan(plan,strokes,{signal:checkSignal}),{signal,timeoutMs:4_000,timeoutPhase:'verify'})
+              report = planCheckReport(trial.issues || [],trial)
             }
-          })
-          report = verified.report
-        } finally {
-          verificationElapsed = Math.round(performance.now() - verifyStarted)
-          timings.verifyMs += verificationElapsed
-        }
-        if (report.ok) return { ...result,intent:verified.plan,retriesUsed,repairsUsed,observation:safeObservation,validation:report,trace:[...trace,{stage:'verify',elapsedMs:verificationElapsed,summary:report.checks?.includes('execution') ? `结构、影响范围与隔离执行检查通过${report.warnings?.length ? `；${report.warnings.length} 项轻微提醒，不阻断` : ''}` : '目标与引用检查通过；尚未执行验证'}] }
-        trace = [...trace,{stage:'verify',summary:'执行校验未通过',issues:report.issues}]
-        if (repairsUsed >= MAX_PLAN_REPAIRS || !canRepairPlanReport(report)) throw Object.assign(new Error('方案未通过隔离执行校验'),{code:'agent_plan_invalid',status:422,model:result.model,trace,validation:report,repairsUsed,retriesUsed})
-        // Repair receives the actual error, original evidence and original goal.
-        // The user's draft stays intact; never silently substitute a menu.
-        try {
-          flowRepairsUsed=repairsUsed+1
-          result = await requestPlan({...payload,repairsUsed,retryBudget:Math.max(0,2-retriesUsed),repairFeedback:{plan:repairPlanEvidence(result.intent),issues:blockingPlanIssues(report).slice(0,8)}}, 'repairMs')
-        } catch(error) {
-          error.retriesUsed=retriesUsed+(Number(error.retriesUsed) || 0)
-          error.repairsUsed=Math.max(repairsUsed+1,planRepairCount(error.repairsUsed))
-          error.trace=[...trace,{stage:'repair',summary:`自动局部修复 ${repairsUsed+1}/${MAX_PLAN_REPAIRS}`},...(error.trace || [])]
-          throw error
-        }
-        retriesUsed+=Number(result.retriesUsed) || 0
-        repairsUsed=Math.max(repairsUsed+1,resultRepairCount(result)); trace=[...trace,{stage:'repair',summary:`自动局部修复 ${repairsUsed}/${MAX_PLAN_REPAIRS}`},...(result.trace || [])]
-        flowRetriesUsed=retriesUsed; flowRepairsUsed=repairsUsed
+            if (report.ok && plan.candidatePlans?.length) {
+              const candidateWarnings = []
+              for (const [index,candidate] of plan.candidatePlans.entries()) {
+                const trial=await runAnalysisTask((checkSignal)=>verifyBrushPlan(candidate,strokes,{signal:checkSignal}),{signal,timeoutMs:4_000,timeoutPhase:'verify'})
+                const candidateReport=planCheckReport(trial.issues || [],trial)
+                if (!candidateReport.ok) { report={...candidateReport,issues:candidateReport.issues.map(issue=>({...issue,candidateIndex:index}))}; break }
+                candidateWarnings.push(...(candidateReport.warnings || []).map(issue=>({...issue,candidateIndex:index})))
+              }
+              if (report.ok) report=planCheckReport(candidateWarnings,{checks:['execution','scope','candidate-execution','undo']})
+            }
+            return report
+          }
+        })
+        report = verified.report
+      } finally {
+        verificationElapsed = Math.round(performance.now() - verifyStarted)
+        timings.verifyMs += verificationElapsed
       }
+      if (report.ok) return { ...result,intent:verified.plan,retriesUsed,repairsUsed:0,observation:safeObservation,validation:report,trace:[...trace,{stage:'verify',elapsedMs:verificationElapsed,summary:report.checks?.includes('execution') ? `结构、影响范围与隔离执行检查通过${report.warnings?.length ? `；${report.warnings.length} 项提醒，不阻断` : ''}` : '目标与引用检查通过；尚未执行验证'}] }
+      // Stop after the first proposal. Preserve it for display/diagnostics;
+      // do not send the trial failure back to the model or rewrite the goal.
+      throw Object.assign(new Error('方案未通过隔离执行校验'),{code:'agent_plan_invalid',status:422,model:result.model,routing:result.routing,
+        trace:[...trace,{stage:'verify',summary:'执行校验未通过；未自动修复',issues:report.issues}],validation:report,repairsUsed:0,retriesUsed,intent:result.intent})
     }, { signal: requestController.signal, timeoutMs: BRUSH_MODEL_TIMEOUT_MS })
     const current = getBrushState().group
     if (!current || current.id !== group.id || current.revision !== group.revision || strokeActive || requestId !== modelRequestSeq || current.intentLocked) return
@@ -1107,7 +1089,7 @@ async function askModelToInterpret(group, localIntent, userInstruction = '', { p
     // pending ResizeObserver notification cannot scale its coordinates twice.
     const currentGeometry = reflowBrushGroup(current,resolveBrushLayoutRect,refreshBrushTargetGeometry)
     if (currentGeometry !== current) patchGroup(currentGeometry)
-    let resolvedIntent = repairFeedback ? data.intent : explicitIntent || data.intent
+    let resolvedIntent = explicitIntent || data.intent
     if (!modelIntentIsUsable(resolvedIntent, localIntent, userInstruction,availableTargets)) {
       // Defensive final gate. Reject visibly; never silently turn an Agent
       // design into a local action or an unrelated correction question.
@@ -1148,7 +1130,7 @@ async function askModelToInterpret(group, localIntent, userInstruction = '', { p
       suggestion: resolvedIntent.suggestion,
       spatialRelations: resolvedIntent.relations || [],
       replacementText: resolvedIntent.type === 'replace' ? (resolvedIntent.replacementText || '') : getBrushState().group?.replacementText || '',
-      model: !repairFeedback && explicitIntent ? null : { name: data.model, confidence: resolvedIntent.confidence },
+      model: explicitIntent ? null : { name: data.model, confidence: resolvedIntent.confidence },
       modelPending: false,
       analysisIssue: null,
       status: 'suggested',
@@ -1157,7 +1139,7 @@ async function askModelToInterpret(group, localIntent, userInstruction = '', { p
     render()
   } catch (error) {
     if (error?.name === 'AbortError') return
-    error.repairsUsed=Math.max(flowRepairsUsed,planRepairCount(error.repairsUsed))
+    error.repairsUsed = 0
     error.retriesUsed=Math.max(flowRetriesUsed,Number(error.retriesUsed) || 0)
     // Keep deterministic geometry usable when the gateway is unavailable. The
     // model improves ranking and wording; it is not required for basic marks.
@@ -1165,11 +1147,11 @@ async function askModelToInterpret(group, localIntent, userInstruction = '', { p
     const current = getBrushState().group
     if (current?.id === group.id && requestId === modelRequestSeq) {
       const safeIntent = error.code === 'agent_plan_invalid' || error.code === 'agent_tool_limit'
-        ? {type:'note',operation:'note',goal:'方案未完成',source:'model',needsInput:false,needsClarification:false,suggestion:{text:'这次方案未通过检查，可修改要求或重试。',alternatives:[]}}
+        ? error.intent || {type:'note',operation:'note',goal:'方案未完成',source:'model',needsInput:false,needsClarification:false,suggestion:{text:error.proposalSummary || '这次方案格式或安全执行检查未通过；未自动修复。',alternatives:[]}}
         : explicitIntent || localFallbackIntent(localIntent, group, '模型暂时不可用，已使用本地识别出的修改方向。')
       const issue = analysisIssue(error)
       const published = patchGroupAnalysis(group, { inferredIntent: safeIntent, suggestion: safeIntent.suggestion, replacementText: explicitIntent?.replacementText || '', status: 'suggested', model: null, modelPending: false, modelError: '', analysisIssue: issue,planRepairsUsed:error.repairsUsed || 0,analysisRetriesUsed:error.retriesUsed || 0 })
-      if (published) recordResult({ intent: safeIntent, issue, source: safeIntent.source === 'model' ? 'ai' : 'fallback', model: error.model || '', routing: error.routing, retriesUsed: error.retriesUsed,repairsUsed:error.repairsUsed,trace:error.trace,validation:error.validation })
+      if (published) recordResult({ intent: safeIntent, modelIntent:error.intent,issue, source: safeIntent.source === 'model' ? 'ai' : 'fallback', model: error.model || '', routing: error.routing, retriesUsed: error.retriesUsed,repairsUsed:0,trace:error.trace,validation:error.validation })
       if (published) toast(`${issue.message}；网页未修改`)
       render()
     }
@@ -1324,10 +1306,10 @@ function validateCurrentPlan(group, intent = group?.inferredIntent) {
   if (!group || !intent) return { ok: false, reason: 'missing-plan' }
   const candidate = { ...intent, replacementText: group.replacementText || intent.replacementText || '' }
   const instruction = group.customInstruction || group.userInstruction || ''
-  // Keep destructive operations behind explicit evidence at the final gate.
-  // This protects direct execution paths from model/local-plan regressions.
+  // Local heuristics need explicit deletion evidence. A model proposal is not
+  // an edit until Apply; its selected targets, ranges and rollback still check.
   const hasDeletion = (candidate.type === 'batch' ? candidate.steps || [] : [candidate]).some((step) => step.type === 'delete')
-  if (hasDeletion && !String(instruction).trim()
+  if (candidate.source !== 'model' && hasDeletion && !String(instruction).trim()
     && !hasDeleteEvidence(candidate, group)) {
     return { ok: false, reason: 'delete-needs-explicit-mark' }
   }
@@ -1424,6 +1406,7 @@ function previewProposal() {
 async function applyProposal({ direct = false } = {}) {
   const group = getBrushState().group; const intent = group?.inferredIntent
   if (!group || !intent || group.applying || (!direct && !group.preview)) return
+  if (group.analysisIssue?.code === 'agent_plan_invalid') return toast(group.analysisIssue.message)
   let result
   const prepared = direct ? prepareProposal(group, intent) : { ok: true, intent }
   if (!prepared.ok) {
@@ -1483,30 +1466,17 @@ async function applyProposal({ direct = false } = {}) {
       resolveRect:resolveBrushLayoutRect,refreshTarget:refreshBrushTargetGeometry,signal,
       verify:(candidate,strokes)=>verifyBrushPlan(candidate,strokes,{signal}),
     }),{timeoutMs:4_000,timeoutPhase:'verify'})
-    report = verified.report; executionGroup = verified.group; executionPlan = verified.plan
+    report = planCheckReport(verified.report.issues || [],verified.report); executionGroup = verified.group; executionPlan = verified.plan
   } catch (error) {
     report = {ok:false,issues:[{code:'verification-timeout',detail:'执行检查未完成，原网页和输入已保留'}]}
   }
   const stillCurrent = getBrushState().group
   if (!stillCurrent || stillCurrent.id !== group.id || stillCurrent.revision !== group.revision) return
   if (!report.ok) {
-    const repairsUsed = planRepairCount(stillCurrent.planRepairsUsed)
-    const issue = analysisIssue({code:'agent_plan_invalid',validation:report,repairsUsed})
+    const issue = analysisIssue({code:'agent_plan_invalid',validation:report,repairsUsed:0})
     patchGroup({applying:false,validation:report,analysisIssue:issue})
     if (getBrushState().mode === 'brush') setLassoMode(true)
     agentJournal.execution(group.id,`修改未应用：${blockingPlanIssues(report).map(planIssueDescription).join('；')}`,{failed:true})
-    if (repairsUsed < MAX_PLAN_REPAIRS && canRepairPlanReport(report)) {
-      // The real generated image/layout may fail only at apply time. Repair
-      // the PLAN automatically, not the page. Keep the asset and ask for a new
-      // explicit confirmation; never charge another generation behind the UI.
-      patchGroup({status:'analyzing',modelPending:true,intentLocked:false,analysisIssue:null})
-      toast('发现执行问题，正在自动局部修复；网页未改变')
-      await askModelToInterpret({...getBrushState().group},stillCurrent.localIntent || analysisRecoveryIntent(stillCurrent),stillCurrent.customInstruction || stillCurrent.userInstruction || '',{
-        repairFeedback:{plan:repairPlanEvidence(executionPlan),issues:blockingPlanIssues(report).slice(0,8)},repairsUsed,retriesUsed:stillCurrent.analysisRetriesUsed || 0,
-      })
-      if (getBrushState().group?.id === group.id && !getBrushState().group.analysisIssue && !getBrushState().group.analysisPaused) toast('方案已修复，请确认后点击修改；网页尚未改变')
-      return
-    }
     render()
     return toast(issue.message)
   }

@@ -130,6 +130,7 @@ export function initDiagnosticsPanel({ journal, root = document }) {
         .map(([key,label]) => `${label} ${duration(timing[key])}`)
       if (stages.length) details.append(node('p','',`耗时：${stages.join(' · ')}`))
       if (timing.firstSummaryMs != null) details.append(node('p','',`首次建议反馈：${duration(timing.firstSummaryMs)}（草案，不是可执行方案）`))
+      if (timing.completedPlanMs != null) details.append(node('p','',`完整方案返回：${duration(timing.completedPlanMs)}（不展示逐步草案）`))
       if (timing.originalEvidenceChars > 0) details.append(node('p','',`结构证据：${timing.evidenceChars} 字符 · 去重前 ${timing.originalEvidenceChars} 字符（视觉证据与校验保留）`))
       if (timing.baseCacheHit != null) details.append(node('p','',`底图：${timing.baseCacheHit ? '缓存命中' : timing.baseShared ? '复用正在准备的截图' : '重新截图'} · 本次等待 ${duration(timing.baseWaitMs || 0)} · ${timing.imageCount || 0} 张视觉证据`))
       if (timing.modelRequests != null) details.append(node('p','',`模型规划 ${timing.modelRequests} 次 · 查证工具 ${timing.readToolCalls || 0} 次${timing.totalMs != null ? ` · 含停笔总耗时 ${duration(timing.totalMs)}` : ''}`))

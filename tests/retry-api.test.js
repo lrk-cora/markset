@@ -36,14 +36,16 @@ test('the actual brush endpoint enables recovery after two HTTP failures', async
   })
 })
 
-test('an execution repair cannot regain a transport retry budget that the original analysis consumed',async()=>{
+test('a legacy execution-repair request is rejected before any transport or paid model call',async()=>{
   let calls=0
   await fixture({MARKSET_MODEL_BASE_URL:'https://model.test/v1',MARKSET_MODEL_API_KEY:'fake-key'},async()=>{
     calls++;return new Response('',{status:503})
   },async({post})=>{
     const result=await post('/api/brush-intent',{targets:[],retryBudget:0,repairFeedback:{issues:[{code:'overflow'}]}})
-    assert.equal(result.status,502);assert.equal(calls,1)
-    assert.equal((await result.json()).retriesUsed,0)
+    assert.equal(result.status,422);assert.equal(calls,0)
+    const data=await result.json()
+    assert.equal(data.retriesUsed,0);assert.equal(data.repairsUsed,0)
+    assert.equal(data.reason,'automatic-repair-disabled')
   })
 })
 
@@ -60,16 +62,16 @@ test('actual endpoint reports provider 504 and each attempt, not a generic local
     })
 })
 
-test('actual endpoint automatically repairs malformed plans twice and returns the count and safe cause on exhaustion',async()=>{
+test('actual endpoint stops on malformed output after one call and exposes only a safe format error',async()=>{
   let calls=0
   await fixture({MARKSET_MODEL_BASE_URL:'https://model.test/v1',MARKSET_MODEL_API_KEY:'fake-key'},async()=>{
     calls++;return Response.json({choices:[{message:{role:'assistant',content:'invalid-private-output'}}]})
   },async({post})=>{
     const response=await post('/api/brush-intent',{targets:[]})
-    assert.equal(response.status,422);assert.equal(calls,3)
+    assert.equal(response.status,422);assert.equal(calls,1)
     const data=await response.json()
-    assert.equal(data.repairsUsed,2);assert.equal(data.reason,'invalid-plan-json')
-    assert.match(data.error,/格式不完整/);assert.doesNotMatch(JSON.stringify(data),/invalid-private-output|fake-key/)
+    assert.equal(data.repairsUsed,0);assert.equal(data.reason,'invalid-plan-json')
+    assert.match(data.error,/格式不完整/);assert.doesNotMatch(JSON.stringify(data),/invalid-private-output|fake-key|已自动修复/)
   })
 })
 
@@ -119,7 +121,7 @@ test('health publishes retry limits and the client outlives all model budgets', 
   await fixture({}, async () => { throw new Error('Unexpected provider call') }, async ({ nativeFetch, base }) => {
     const health = await nativeFetch(`${base}/api/health`).then((response) => response.json())
     assert.equal(health.retryPolicy.analysis.retries, 2)
-    assert.equal(health.retryPolicy.analysis.planRepairs, 2)
+    assert.equal(health.retryPolicy.analysis.planRepairs, 0)
     assert.equal(health.retryPolicy.analysis.firstOutputTimeoutMs,30_000)
     assert.equal(health.retryPolicy.analysis.idleTimeoutMs,15_000)
     assert.equal(health.retryPolicy.analysis.timeoutMs,60_000)

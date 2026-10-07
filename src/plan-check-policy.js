@@ -1,8 +1,9 @@
-// A single allowance shared by schema repair and browser trial repair. This is
-// different from transport retries, which remain capped at two independently.
-export const MAX_PLAN_REPAIRS = 2
+// Keep the first proposal. Validation never spends another model call, even
+// for malformed output. Transport retries remain a separate bounded policy.
+export const MAX_PLAN_REPAIRS = 0
 export const MINOR_HORIZONTAL_OVERFLOW_PX = 12
-export const planRepairCount = value => Math.min(MAX_PLAN_REPAIRS, Math.max(0, Math.floor(Number(value) || 0)))
+// Read-only compatibility for records produced before repairs were disabled.
+export const planRepairCount = value => Math.min(2, Math.max(0, Math.floor(Number(value) || 0)))
 export const resultRepairCount = result => planRepairCount(result?.repairsUsed ?? (result?.repaired ? 1 : 0))
 
 const descriptions = {
@@ -51,6 +52,7 @@ const descriptions = {
   'missing-concrete-plan-for-stated-goal': 'AI 未给出具体修改方案',
   'already-answered-clarification': 'AI 重复询问已回答的问题',
   'repair-limit-reached': '自动方案修复已达上限',
+  'automatic-repair-disabled': '自动方案修复已关闭，请自行重新分析',
   'content-quality-advisory': '文案质量仍有优化空间',
   'design-advisory': '视觉效果仍有优化空间',
 }
@@ -65,11 +67,12 @@ export function planIssueDescription(issue = {}) {
 export function planCheckReport(issues = [], extra = {}) {
   // Unknown issues fail closed. Only measured, minor geometry defects and
   // explicit quality advisories may be non-blocking; never lost text/scope.
-  const classified = issues.map(issue => {
+  const checkedIssues = !issues.length && extra.ok === false ? [{code:'verification-failed'}] : issues
+  const classified = checkedIssues.map(issue => {
     const delta = Number(issue.increasePixels ?? issue.pixels)
     const mildOverflow = ['page-horizontal-overflow', 'component-overflow'].includes(issue.code)
       && Number.isFinite(delta) && delta > 0 && delta <= MINOR_HORIZONTAL_OVERFLOW_PX
-    const advisory = ['content-quality-advisory', 'design-advisory'].includes(issue.code)
+    const advisory = ['content-quality-advisory', 'design-advisory', 'inactive-layout-style'].includes(issue.code)
     const severity = mildOverflow || advisory ? 'warning' : 'error'
     return { ...issue, severity, message: planIssueDescription(issue) }
   })
@@ -79,11 +82,7 @@ export function planCheckReport(issues = [], extra = {}) {
 }
 
 export const blockingPlanIssues = report => (report?.issues || []).filter(issue => issue.severity !== 'warning')
-export function canRepairPlanReport(report) {
-  // A broken verifier/undo engine is not something an LLM should bypass.
-  return blockingPlanIssues(report).length > 0 && !blockingPlanIssues(report).some(issue =>
-    ['undo-mismatch', 'page-not-loaded', 'verification-failed', 'verification-timeout', 'layout-changing'].includes(issue.code))
-}
+export function canRepairPlanReport() { return false }
 
 // Generated images are retained locally. Do not resend their bytes or silently
 // regenerate them during a plan repair; the next explicit apply can reuse them.

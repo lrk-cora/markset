@@ -42,13 +42,14 @@ test('journal phase timing and cache diagnostics are visible only in details and
   await fixture(({ document, journal, calls }) => {
     const id = journal.begin({ id: 'g', targets: [], strokes: [] })
     journal.finish(id, { intent: { goal: '新增配图' }, timings: { pauseMs: 1200, observationMs: 12, captureMs: 100, baseWaitMs: 0,
-      baseCacheHit: true, planMs: 3000, verifyMs: 100, repairMs: 0, modelRequests: 1, readToolCalls: 0, totalMs: 4412, imageCount: 2 } })
+      baseCacheHit: true, planMs: 3000, completedPlanMs:3000, verifyMs: 100, repairMs: 0, modelRequests: 1, readToolCalls: 0, totalMs: 4412, imageCount: 2 } })
     const details = document.querySelector('.agent-details')
     assert.equal(details.open, false)
     assert.match(details.textContent, /截图准备 0.1 秒/)
     assert.match(details.textContent, /缓存命中/)
     assert.match(details.textContent, /模型规划 1 次/)
     assert.match(details.textContent, /本地校验 0.1 秒/)
+    assert.match(details.textContent, /完整方案返回：3.0 秒/u)
     assert.equal(calls.length, 1, 'only initial configuration, not a model request')
   })
 })

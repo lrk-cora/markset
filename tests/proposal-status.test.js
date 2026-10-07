@@ -9,13 +9,14 @@ const html=readFileSync(new URL('../index.html',import.meta.url),'utf8')
 
 test('real progress phases have distinct visual identities without affecting authorization',()=>{
   const paths=[]
-  for(const state of ['preparing','planning','observe','draft','verify','repair','retry']) {
+  for(const state of ['preparing','planning','observe','verify','repair','retry']) {
     const group={modelPending:true,analysisProgress:{stage:state},inferredIntent:{type:'color'}}
     const before=structuredClone(group),status=proposalStatus(group,{pending:true})
     assert.equal(status.state,state);assert.equal(status.busy,true);paths.push(JSON.stringify(status.paths))
     assert.deepEqual(group,before,'display never mutates a plan or starts a call')
   }
   assert.equal(new Set(paths).size,paths.length)
+  assert.equal(proposalStatus({analysisProgress:{stage:'draft',draftSummary:'未完整方案'}},{pending:true}).state,'planning')
 })
 
 test('pending phase outranks stale errors; applying, failed, input, choice, manual and ready are explicit',()=>{

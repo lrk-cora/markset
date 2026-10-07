@@ -268,13 +268,13 @@ test('new structured nodes reject code attributes and unsupported style without 
   }
 })
 
-test('valid CSS on the wrong kind of container is not accepted as a successful layout change',()=>{
+test('valid but ineffective CSS is a nonblocking design warning, not a reason to regenerate the plan',()=>{
   const plan={type:'style',targets:[target('module','container')],styles:{'flex-direction':'column'}}
   const before=measurePlanDocument(doc())
   assert.equal(web.applyBrushPlan(plan).ok,true)
   const report=auditPlanResult(plan,before,measurePlanDocument(doc()))
-  assert.equal(report.ok,false)
-  assert.ok(report.issues.some(issue=>issue.code==='inactive-layout-style'))
+  assert.equal(report.ok,true)
+  assert.ok(report.warnings.some(issue=>issue.code==='inactive-layout-style'))
   web.undoWebEditsSince()
   const valid={...plan,styles:{display:'flex','flex-direction':'column'}}
   assert.equal(web.applyBrushPlan(valid).ok,true)

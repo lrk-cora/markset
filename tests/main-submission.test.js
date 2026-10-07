@@ -242,14 +242,22 @@ test('successful modification re-arms drawing for the next operation without aut
   assert.equal(drawingArmed, true)
 })
 
-test('a lasso containing marked characters is not delete evidence at the final apply gate or in alternatives', async () => {
-  const plan={type:'delete',source:'model',targets:[target],confidence:.99,goal:'移除标题',rationale:'模型建议',strategy:'移除标题',impact:{scope:'标题',riskLevel:'low'},targetRanges:[{targetId:'heading',start:0,end:3}]}
+test('a model deletion on a legal selected range is offered unchanged, but only an Apply click executes it', async () => {
+  const plan={type:'delete',source:'model',targets:[target],confidence:.99,goal:'移除标题',rationale:'模型建议',strategy:'移除标题',impact:{scope:'标题',riskLevel:'low'},targetRanges:[{targetId:'heading',start:0,end:3}],requiresConfirmation:true}
   store.patchGroup({localIntent:{parameters:{hasRegion:true,markedTextRange:true,hasCross:false,textStrike:false}},inferredIntent:plan})
+  assert.equal(calls.length,0)
   node('btn-inline-primary').dispatchEvent(new Event('click'))
   await tick()
-  assert.equal(calls.length,0)
+  assert.deepEqual(calls.map(call=>call.type),['delete-text'])
+  store.startGroup({id:'candidate-title',revision:1,strokes:[],targets:[target],status:'suggested',localIntent:{parameters:{hasRegion:true}}})
   store.patchGroup({inferredIntent:{type:'note',source:'model',needsClarification:true,clarifyingQuestion:'如何修改？',targetRanges:plan.targetRanges,suggestion:{alternatives:['删除标题','调整颜色']}}})
-  assert.ok(node('inline-proposal-alternatives').children.every(child=>!/删除标题/u.test(child.textContent || '')))
+  assert.ok(node('inline-proposal-alternatives').children.some(child=>/删除标题/u.test(child.textContent || '')))
+})
+
+test('the local fallback still cannot turn a bare selection into deletion permission',async()=>{
+  store.patchGroup({localIntent:{parameters:{hasRegion:true,markedTextRange:true}},inferredIntent:{type:'delete',source:'local-instruction',targets:[target],goal:'移除标题',rationale:'仅圈选',strategy:'移除标题',impact:{scope:'标题',riskLevel:'low'}}})
+  node('btn-inline-primary').dispatchEvent(new Event('click'));await tick()
+  assert.equal(calls.length,0)
 })
 
 test('a local confirmation journals the user input and actual execution without a model roundtrip', async () => {
@@ -295,7 +303,7 @@ test('model idle timeout retains source/attempt diagnostics, strokes and user dr
   assert.ok(calls.every(call=>!['replace','color','delete'].includes(call.type)))
 })
 
-test('wrapping a deletion in a batch cannot turn a bare circle into deletion permission', async () => {
+test('a batch cannot reuse a target after deleting it, even with model authorization', async () => {
   const deletion={type:'delete',source:'model',targets:[target],goal:'移除标题',rationale:'模型建议',strategy:'移除标题',impact:{scope:'标题',riskLevel:'low'}}
   const color={...deletion,type:'color',parameters:{color:'#ff0000'}}
   store.patchGroup({localIntent:{parameters:{hasRegion:true,markedTextRange:true}},inferredIntent:{...deletion,type:'batch',steps:[deletion,color]}})
@@ -589,7 +597,7 @@ test('a local correction can replace a pending visual request without leaving a 
   assert.ok(!calls.some(call=>call.type==='model'))
 })
 
-test('streamed drafts stay view-only through verification; cancel preserves ink/input and rejects late events',async()=>{
+test('legacy partial drafts are ignored; cancel preserves ink/input and rejects late events',async()=>{
   settings.setBrushSettings({autoAnalyze:false})
   let progress,release,signal
   modelTask=(_payload,options)=>{progress=options.onProgress;signal=options.signal;return new Promise(resolve=>{release=resolve})}
@@ -597,8 +605,8 @@ test('streamed drafts stay view-only through verification; cancel preserves ink/
   store.patchGroup({strokes:ink,status:'draft'})
   node('btn-analyze-strokes').dispatchEvent(new Event('click'));await tick();await tick()
   progress({stage:'draft',draftSummary:'保留原标题，调整为蓝色'})
-  assert.equal(node('inline-proposal-text').textContent,'保留原标题，调整为蓝色')
-  assert.equal(node('inline-analysis-progress').textContent,'草案 · 检查通过后可修改')
+  assert.equal(node('inline-proposal-text').textContent,'正在生成完整修改建议…')
+  assert.equal(node('inline-analysis-progress').textContent,'完整方案返回后一次显示，网页尚未修改')
   assert.equal(node('btn-inline-primary').disabled,true)
   typeInstruction('再增加一点间距')
   node('btn-analyze-strokes').dispatchEvent(new Event('click'))
@@ -612,7 +620,7 @@ test('streamed drafts stay view-only through verification; cancel preserves ink/
   assert.ok(!calls.some(call=>['delete','color','replace'].includes(call.type)))
 })
 
-test('a manual request with no prior intent still shows every streaming phase and editable input',async()=>{
+test('a manual request with no prior intent waits for the full proposal while keeping input editable',async()=>{
   settings.setBrushSettings({autoAnalyze:false})
   let progress,release
   modelTask=(_payload,options)=>{progress=options.onProgress;return new Promise(resolve=>{release=resolve})}
@@ -623,7 +631,7 @@ test('a manual request with no prior intent still shows every streaming phase an
   assert.equal(node('inline-custom-intent-input').disabled,false)
   progress({stage:'draft',draftSummary:'在右侧新增配图，保留原文'})
   assert.equal(node('inline-proposal').hidden,false)
-  assert.equal(node('inline-proposal-text').textContent,'在右侧新增配图，保留原文')
+  assert.equal(node('inline-proposal-text').textContent,'正在生成完整修改建议…')
   assert.equal(node('btn-inline-primary').disabled,true)
   node('btn-analyze-strokes').dispatchEvent(new Event('click'))
   release({model:'test',intent:concreteColor()});for(let i=0;i<6;i++)await tick()
@@ -958,87 +966,88 @@ test('choosing a concrete candidate applies exactly that plan instead of transla
   assert.equal(store.getBrushState().group,null)
 })
 
-test('a failed execution check sends specific evidence for one repair, preserves the goal, and never auto-applies',async(t)=>{
-  let clock = 0
-  t.mock.method(performance, 'now', () => clock)
-  const original=verificationTask
-  let checks=0
-  verificationTask=async()=>{ clock+=10; return ++checks===1?{ok:false,issues:[{code:'page-horizontal-overflow',pixels:200}]}:{ok:true,checks:['execution','undo']} }
-  let payloads=[]
-  modelTask=async(payload)=>{clock+=30; payloads.push(payload);return{model:'test',intent:concreteColor(),timings:{modelRequests:1,upstreamMs:25,serverMs:30}}}
-  try {
-    typeInstruction('标题看起来沉稳一点，保留文字');pressEnter();for(let i=0;i<8;i++) await tick()
-    assert.equal(payloads.length,2)
-    assert.deepEqual(payloads[1].repairFeedback.issues,[{code:'page-horizontal-overflow',pixels:200}])
-    assert.equal(payloads[1].userInstruction,payloads[0].userInstruction)
-    assert.equal(payloads[1].retryBudget,2)
-    assert.equal(store.getBrushState().group.inferredIntent.type,'color')
-    assert.equal(calls.filter(call=>call.type==='color').length,0)
-    const timing = globalThis.testJournal.getEntries().at(-1).timings
-    assert.equal(timing.planMs,30); assert.equal(timing.repairMs,30); assert.equal(timing.verifyMs,20)
-    assert.equal(timing.modelRequests,2); assert.equal(timing.upstreamMs,50)
-  } finally {verificationTask=original}
+test('a failed trial stops after one model proposal, preserves the result and reports one measured check',async(t)=>{
+  let clock=0
+  t.mock.method(performance,'now',()=>clock)
+  verificationTask=async()=>{clock+=10;return{ok:false,issues:[{code:'page-horizontal-overflow',pixels:200}]}}
+  const payloads=[]
+  modelTask=async(payload)=>{clock+=30;payloads.push(payload);return{model:'test',intent:concreteColor(),timings:{modelRequests:1,upstreamMs:25,serverMs:30}}}
+  typeInstruction('标题看起来沉稳一点，保留文字');pressEnter();for(let i=0;i<8;i++)await tick()
+  assert.equal(payloads.length,1);assert.equal(payloads[0].repairFeedback,undefined)
+  const group=store.getBrushState().group
+  assert.equal(group.inferredIntent.type,'color');assert.equal(group.inferredIntent.goal,concreteColor().goal)
+  assert.equal(group.planRepairsUsed,0);assert.equal(group.analysisIssue.code,'agent_plan_invalid')
+  assert.equal(node('btn-inline-primary').disabled,true)
+  assert.equal(calls.filter(call=>call.type==='color').length,0)
+  const timing=globalThis.testJournal.getEntries().at(-1).timings
+  assert.equal(timing.planMs,30);assert.equal(timing.repairMs,0);assert.equal(timing.verifyMs,10)
+  assert.equal(timing.modelRequests,1);assert.equal(timing.upstreamMs,25)
 })
 
-test('a repaired retry consumes the draft so clicking Modify cannot repeat the same analysis',async()=>{
+test('an explicit manual retry consumes the draft so Modify cannot repeat the same analysis',async()=>{
   store.patchGroup({analysisIssue:{message:'失败'},feedbackDraft:'保留文字，标题看起来沉稳一点'})
   modelTask=async()=>({model:'test',intent:concreteColor()})
-  node('btn-inline-retry').dispatchEvent(new Event('click'));for(let i=0;i<6;i++) await tick()
+  node('btn-inline-retry').dispatchEvent(new Event('click'));for(let i=0;i<6;i++)await tick()
   assert.equal(node('inline-custom-intent-input').value,'')
   node('btn-inline-primary').dispatchEvent(new Event('click'));await tick()
   assert.deepEqual(calls.map(call=>call.type),['model','color'])
 })
 
-test('a prior schema correction does not consume the remaining automatic layout repair',async()=>{
-  let checks=0;const payloads=[]
-  verificationTask=async()=>++checks===1 ? {ok:false,issues:[{code:'component-overflow',pixels:180}]} : {ok:true,checks:['execution','undo']}
-  modelTask=async(payload)=>{payloads.push(payload);return {model:'test',intent:concreteColor(),repaired:true,repairsUsed:payloads.length===1 ? 1 : 2,retriesUsed:payloads.length===1 ? 1 : 0}}
-  typeInstruction('标题看起来沉稳一点，保留文字');pressEnter();for(let i=0;i<12;i++)await tick()
-  assert.equal(payloads.length,2);assert.equal(payloads[1].repairsUsed,1);assert.equal(payloads[1].retryBudget,1)
-  assert.equal(store.getBrushState().group.planRepairsUsed,2);assert.equal(store.getBrushState().group.analysisIssue,null)
+test('legacy repair metadata cannot enable another generation or change transport retry counts',async()=>{
+  const payloads=[]
+  verificationTask=async()=>({ok:false,issues:[{code:'component-overflow',pixels:180}]})
+  modelTask=async(payload)=>{payloads.push(payload);return{model:'test',intent:concreteColor(),repaired:true,repairsUsed:1,retriesUsed:1}}
+  typeInstruction('标题看起来沉稳一点，保留文字');pressEnter();for(let i=0;i<10;i++)await tick()
+  assert.equal(payloads.length,1);assert.equal(store.getBrushState().group.planRepairsUsed,0)
+  assert.equal(store.getBrushState().group.analysisRetriesUsed,1)
   assert.equal(calls.filter(call=>call.type==='color').length,0)
 })
 
-test('trial failures automatically correct at most twice and keep the input, strokes and concrete error',async()=>{
+test('a failed proposal retains ink, input and its concrete error without an automatic follow-up',async()=>{
   const ink=[{id:'keep-ink',points:[{x:10,y:20},{x:30,y:20}]}]
   store.patchGroup({strokes:ink});const payloads=[]
   modelTask=async(payload)=>{payloads.push(payload);return{model:'test',intent:concreteColor()}}
   verificationTask=async()=>({ok:false,issues:[{code:'new-content-overlap'}]})
   typeInstruction('标题看起来沉稳一点，保留文字');pressEnter();for(let i=0;i<16;i++)await tick()
-  assert.equal(payloads.length,3);assert.deepEqual(payloads.slice(1).map(payload=>payload.repairsUsed),[0,1])
+  assert.equal(payloads.length,1)
   const group=store.getBrushState().group
-  assert.equal(group.planRepairsUsed,2);assert.deepEqual(group.strokes,ink);assert.match(group.feedbackDraft,/沉稳/)
-  assert.match(node('inline-error-message').textContent,/遮挡.*自动修复 2 次/)
+  assert.equal(group.planRepairsUsed,0);assert.deepEqual(group.strokes,ink);assert.match(group.feedbackDraft,/沉稳/)
+  assert.match(node('inline-error-message').textContent,/遮挡/);assert.doesNotMatch(node('inline-error-message').textContent,/已自动修复/)
+  assert.equal(node('inline-proposal-text').textContent,concreteColor().suggestion.text)
+  node('btn-inline-primary').dispatchEvent(new Event('click'));for(let i=0;i<4;i++)await tick()
   assert.equal(calls.filter(call=>call.type==='color').length,0)
+  assert.equal(payloads.length,1,'repeated Modify cannot bypass the failed safety check or trigger AI repair')
 })
 
-test('minor trial warnings enable Modify without extra planning and appear in the UI and journal',async()=>{
+for(const code of ['content-quality-advisory','design-advisory','inactive-layout-style']) test(code+' preserves the first proposal and enables Modify without extra planning',async()=>{
   modelTask=async()=>({model:'test',intent:concreteColor()})
-  verificationTask=async()=>planCheckReport([{code:'page-horizontal-overflow',pixels:9}],{checks:['execution','undo']})
+  verificationTask=async()=>({ok:false,issues:[{code}],checks:['execution','undo']})
   typeInstruction('标题看起来沉稳一点，保留文字');pressEnter();for(let i=0;i<8;i++)await tick()
   assert.equal(calls.filter(call=>call.type==='model').length,1)
+  assert.equal(store.getBrushState().group.analysisIssue,null)
   assert.equal(node('btn-inline-primary').disabled,false);assert.equal(node('inline-check-warning').hidden,false)
-  assert.match(globalThis.testJournal.getEntries().at(-1).verification,/轻微提醒/)
+  assert.match(globalThis.testJournal.getEntries().at(-1).verification,/提醒/)
   node('btn-inline-primary').dispatchEvent(new Event('click'));for(let i=0;i<3;i++)await tick()
   assert.equal(calls.filter(call=>call.type==='color').length,1)
+  assert.equal(calls.filter(call=>call.type==='model').length,1)
 })
 
-test('apply-time validation automatically repairs the plan but requires fresh confirmation before applying',async()=>{
-  store.patchGroup({inferredIntent:concreteColor(),customInstruction:'标题看起来沉稳一点，保留文字'})
-  let checks=0;const payloads=[]
-  verificationTask=async()=>++checks===1 ? {ok:false,issues:[{code:'component-overflow',pixels:200}]} : {ok:true,checks:['execution','undo']}
-  modelTask=async(payload)=>{payloads.push(payload);return{model:'test',intent:concreteColor(),repairsUsed:1}}
-  node('btn-inline-primary').dispatchEvent(new Event('click'));for(let i=0;i<14;i++)await tick()
-  assert.equal(payloads.length,1);assert.equal(payloads[0].repairFeedback.issues[0].code,'component-overflow')
-  assert.equal(calls.filter(call=>call.type==='color').length,0,'repair is not new apply authorization')
-  assert.equal(store.getBrushState().group.planRepairsUsed,1);assert.equal(node('btn-inline-primary').disabled,false)
-  node('btn-inline-primary').dispatchEvent(new Event('click'));for(let i=0;i<3;i++)await tick()
-  assert.equal(calls.filter(call=>call.type==='color').length,1)
+test('apply-time safety failure preserves the original proposal and never calls the planner',async()=>{
+  const plan=concreteColor()
+  store.patchGroup({inferredIntent:plan,customInstruction:'标题看起来沉稳一点，保留文字'})
+  verificationTask=async()=>({ok:false,issues:[{code:'component-overflow',pixels:200}]})
+  node('btn-inline-primary').dispatchEvent(new Event('click'));for(let i=0;i<6;i++)await tick()
+  assert.equal(calls.filter(call=>call.type==='model').length,0)
+  assert.equal(calls.filter(call=>call.type==='color').length,0)
+  assert.deepEqual(store.getBrushState().group.inferredIntent,plan)
+  assert.equal(store.getBrushState().group.applying,false)
+  assert.equal(node('btn-inline-primary').disabled,true)
+  assert.equal(node('btn-inline-retry').hidden,false)
 })
 
-test('a broken undo engine or exhausted allowance cannot trigger more paid repairs at application',async()=>{
+test('undo and execution failures never auto-repair, including groups left over from the old repair policy',async()=>{
   for(const [code,used] of [['undo-mismatch',0],['component-overflow',2]]) {
-    store.patchGroup({inferredIntent:concreteColor(),planRepairsUsed:used})
+    store.patchGroup({inferredIntent:concreteColor(),analysisIssue:null,planRepairsUsed:used})
     verificationTask=async()=>({ok:false,issues:[{code,pixels:200}]})
     node('btn-inline-primary').dispatchEvent(new Event('click'));for(let i=0;i<5;i++)await tick()
     assert.equal(calls.filter(call=>call.type==='model').length,0)
@@ -1048,37 +1057,32 @@ test('a broken undo engine or exhausted allowance cannot trigger more paid repai
   }
 })
 
-for(const issueCode of ['new-content-overlap','insertion-position-mismatch']) test(`apply-time ${issueCode} repair retains a generated image and never silently resubmits paid generation`,async()=>{
+for(const issueCode of ['new-content-overlap','insertion-position-mismatch']) test('apply-time '+issueCode+' keeps the generated image; only an explicit user request can replan',async()=>{
   const imagePlan={...concreteColor(),type:'insert',contentKind:'image',parameters:{},imagePrompt:'科研流程配图',insertion:{anchorId:'heading',placement:'after'},goal:'在标题下新增配图，保留原文',suggestion:{text:'在标题下新增配图，保留原文',alternatives:[]}}
   store.patchGroup({inferredIntent:imagePlan,customInstruction:'标题下加一张相关配图，保留文字'})
   let checks=0
   verificationTask=async()=>++checks===1 ? {ok:false,issues:[{code:issueCode}]} : {ok:true,checks:['execution','undo']}
   imageTask=async()=>({imageUrl:'data:image/png;base64,cached-fixture',model:'image-fixture',elapsedMs:20})
-  modelTask=async(payload)=>{
-    assert.equal(payload.repairFeedback.issues[0].code,issueCode)
-    assert.equal(payload.repairFeedback.plan.replacementText,undefined,'generated bytes stay local')
-    return{model:'test',intent:structuredClone(imagePlan),repairsUsed:1}
-  }
+  modelTask=async(payload)=>{assert.equal(payload.repairFeedback,undefined);return{model:'test',intent:structuredClone(imagePlan)}}
   node('btn-inline-primary').dispatchEvent(new Event('click'))
-  await until(()=>store.getBrushState().group?.status==='suggested' && !store.getBrushState().group?.modelPending && calls.some(call=>call.type==='model'))
+  await until(()=>store.getBrushState().group?.analysisIssue?.code==='agent_plan_invalid')
   assert.equal(store.getBrushState().group.imageAssets.length,1)
   assert.equal(calls.filter(call=>call.type==='generate-image').length,1)
+  assert.equal(calls.filter(call=>call.type==='model').length,0)
   assert.equal(calls.filter(call=>call.type==='insert').length,0)
+  typeInstruction('保留同一配图，只调整插入位置');node('btn-inline-retry').dispatchEvent(new Event('click'))
+  await until(()=>store.getBrushState().group?.status==='suggested' && !store.getBrushState().group?.modelPending && calls.some(call=>call.type==='model'))
   node('btn-inline-primary').dispatchEvent(new Event('click'));await until(()=>calls.some(call=>call.type==='insert'))
-  assert.equal(calls.filter(call=>call.type==='generate-image').length,1,'next explicit confirmation reuses the original asset')
+  assert.equal(calls.filter(call=>call.type==='model').length,1)
+  assert.equal(calls.filter(call=>call.type==='generate-image').length,1,'explicit replan reuses the original image instead of another paid generation')
   assert.equal(calls.find(call=>call.type==='insert').plan.replacementText,'data:image/png;base64,cached-fixture')
 })
 
-test('a failed apply-time repair preserves previously consumed connection retries and never retries auth errors',async()=>{
+test('an apply-time failure never spends another model request or resets already-consumed network retries',async()=>{
   store.patchGroup({inferredIntent:concreteColor(),planRepairsUsed:1,analysisRetriesUsed:2})
   verificationTask=async()=>({ok:false,issues:[{code:'component-overflow',pixels:200}]})
-  modelTask=async(payload)=>{
-    assert.equal(payload.repairsUsed,1);assert.equal(payload.retryBudget,0)
-    throw Object.assign(new Error('auth'),{code:'model_gateway_auth',status:401,retriesUsed:0})
-  }
   node('btn-inline-primary').dispatchEvent(new Event('click'));for(let i=0;i<10;i++)await tick()
-  assert.equal(calls.filter(call=>call.type==='model').length,1)
+  assert.equal(calls.filter(call=>call.type==='model').length,0)
   assert.equal(store.getBrushState().group.analysisRetriesUsed,2)
-  assert.equal(store.getBrushState().group.planRepairsUsed,2)
-  assert.equal(store.getBrushState().group.analysisIssue.code,'model_gateway_auth')
+  assert.equal(store.getBrushState().group.analysisIssue.code,'agent_plan_invalid')
 })

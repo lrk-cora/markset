@@ -1,7 +1,8 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { runPlanningAgent,readPlanningTool,repairScopeIssue } from '../server/planning-agent.js'
-import { normalizeBrushPlan } from '../server/brush-plan.js'
+import { runPlanningAgent,readPlanningTool } from '../server/planning-agent.js'
+import { normalizeBrushPlan,brushResponseFormat } from '../server/brush-plan.js'
+import { planningSystem } from '../server/planning-agent.js'
 import { planningTargets,checkNodeSpecs,checkStyleDeclarations } from '../src/edit-capabilities.js'
 import { validateIntentPlan } from '../src/intent-plan.js'
 import { clarificationChoices } from '../src/proposal-choices.js'
@@ -12,6 +13,27 @@ const selected=[{webId:'heading',kind:'text',text:'研究主题',selected:true}]
 const observation={modules:[{webId:'module',text:'科研内容'}],nodes:[{webId:'module',kind:'container',moduleId:'module'},{webId:'description',kind:'text',moduleId:'module',text:'保留这段说明'}]}
 const targets=planningTargets(selected,observation)
 const raw={intentType:'insert',confidence:.8,goal:'在说明下方补图并保留原文',suggestion:'在说明下添加科研配图，保留原内容',rationale:'补充直观表达',strategy:'在说明后插入图片',impact:{scope:'当前模块',riskLevel:'low'},targetIds:['heading'],contentKind:'image',imagePrompt:'克制的科研插画',insertion:{anchorId:'description',placement:'after'}}
+
+test('fast plan schema omits prebuilt candidate executions but keeps compound tools and safety fields',()=>{
+  const schema=brushResponseFormat.json_schema.schema
+  assert.equal(schema.properties.candidatePlans,undefined)
+  assert.deepEqual(schema.required,['intentType','suggestion','rationale','strategy','targetIds'])
+  for(const key of ['steps','nodes','styles','bounds','targetRanges','scopeExpansion','alternatives','imagePrompt','imageMode']) assert.ok(schema.properties[key])
+  assert.match(planningSystem,/不提前生成每个选项的执行参数/u)
+})
+
+test('compact actionable plans and lightweight clarification labels each complete in one model call',async()=>{
+  for(const proposal of [
+    {intentType:'color',suggestion:'标题改红，保留原文',rationale:'明确要求',strategy:'仅改颜色',targetIds:['heading'],color:'red'},
+    {intentType:'note',suggestion:'这段标题希望更精简还是更突出？',rationale:'仅圈选尚无具体要求',strategy:'由用户选择效果',targetIds:['heading'],needsClarification:true,clarifyingQuestion:'精简标题，还是强化层级？',alternatives:['精简为一句科研学习导语','保留原文并缩小字号突出重点']},
+  ]) {
+    let calls=0
+    const result=await runPlanningAgent({targets,observation,messages:[],chat:async()=>{calls++;return{role:'assistant',content:JSON.stringify(proposal)}}})
+    assert.equal(calls,1);assert.equal(result.repairsUsed,0);assert.equal(result.intent.candidatePlans,undefined)
+    assert.equal(result.intent.type,proposal.intentType)
+    if(proposal.intentType==='note')assert.equal(clarificationChoices(result.intent).length,2)
+  }
+})
 
 test('explicit image bounds are not silently converted into insertion after the selected module',()=>{
   const bounds={x:900,y:200,w:280,h:400}
@@ -48,31 +70,28 @@ test('native read tool returns real module data, not arbitrary filesystem/networ
   assert.deepEqual(readPlanningTool('shell',{command:'rm'},observation),{error:'unsupported-read-tool'})
 })
 
-test('invalid anchor is returned as concrete repair feedback once, never rewritten as text replacement',async()=>{
-  let calls=0
-  const result=await runPlanningAgent({targets,observation,instruction:'加配图',messages:[],chat:async(history)=>{
-    calls++; if(calls===2) assert.match(history.at(-1).content,/unknown-insertion-anchor/)
-    return {role:'assistant',content:JSON.stringify(calls===1 ? {...raw,insertion:{anchorId:'unknown',placement:'after'}} : raw)}
-  }})
-  assert.equal(calls,2); assert.equal(result.repaired,true); assert.equal(result.intent.type,'insert')
+test('invalid anchor stops after the first proposal with its concrete error and original summary',async()=>{
+  let calls=0;const progress=[]
+  await assert.rejects(runPlanningAgent({targets,observation,instruction:'加配图',messages:[],onProgress:value=>progress.push(...value),chat:async()=>{
+    calls++;return{role:'assistant',content:JSON.stringify({...raw,insertion:{anchorId:'unknown',placement:'after'}})}
+  }}),error=>error.code==='agent_plan_invalid' && error.reason==='unknown-insertion-anchor' && error.repairsUsed===0 && error.proposalSummary===raw.suggestion)
+  assert.equal(calls,1);assert.ok(progress.every(item=>item.stage!=='repair'))
 })
 
-test('two automatic repairs are shared by schema repair and client trial feedback; no fixed fallback',async()=>{
-  for(const [feedback,used,expectedCalls] of [[false,0,3],[true,0,2],[true,1,1],[true,2,0]]) {
+test('malformed output is checked once, never corrected by another model call',async()=>{
+  for(const output of ['invalid-private-output',JSON.stringify({...raw,intentType:'invented-tool'})]) {
     let calls=0
-    await assert.rejects(runPlanningAgent({targets,observation,messages:[],repairsUsed:used,repairFeedback:feedback?{issues:[{code:'overflow'}]}:null,chat:async()=>{calls++;return{role:'assistant',content:'invalid'}}}),error=>error.code==='agent_plan_invalid' && error.repairsUsed===2)
-    assert.equal(calls,expectedCalls)
+    await assert.rejects(runPlanningAgent({targets,observation,messages:[],chat:async()=>{calls++;return{role:'assistant',content:output}}}),{code:'agent_plan_invalid',reason:'invalid-plan-json',repairsUsed:0})
+    assert.equal(calls,1)
   }
 })
 
-test('a second format correction succeeds automatically and reports the exact repair count',async()=>{
-  let calls=0
-  const result=await runPlanningAgent({targets,observation,messages:[],chat:async(history)=>{
-    calls++
-    if(calls>1) assert.match(history.at(-1).content,/只修正这项具体错误/)
-    return {role:'assistant',content:calls<3 ? 'invalid' : JSON.stringify(raw)}
-  }})
-  assert.equal(calls,3);assert.equal(result.repairsUsed,2);assert.equal(result.intent.type,'insert')
+test('legacy repair feedback is rejected before any paid call regardless of its claimed budget',async()=>{
+  for(const used of [0,1,2,999]) {
+    let calls=0
+    await assert.rejects(runPlanningAgent({targets,observation,messages:[],repairsUsed:used,repairFeedback:{issues:[{code:'overflow'}]},chat:async()=>{calls++;return{role:'assistant',content:JSON.stringify(raw)}}}),{code:'agent_plan_invalid',reason:'automatic-repair-disabled',repairsUsed:0})
+    assert.equal(calls,0)
+  }
 })
 
 test('style and move can be composed; related writes must disclose expansion and insert nodes cannot run code',()=>{
@@ -86,10 +105,12 @@ test('style and move can be composed; related writes must disclose expansion and
   assert.equal(checkNodeSpecs([{tag:'figure',children:[{tag:'figcaption',text:'科研配图'}]}]),'')
 })
 
-test('answered clarification triggers one repair; UI does not fabricate generic text menus',async()=>{
+test('a repeated clarification remains the first result without silently requesting a different answer',async()=>{
   let calls=0
-  const answer=await runPlanningAgent({targets,messages:[],answered:['要加图还是改布局？'],chat:async()=>({role:'assistant',content:JSON.stringify(++calls===1 ? {...raw,intentType:'note',needsClarification:true,clarifyingQuestion:'要加图，还是改布局？'} : raw)})})
-  assert.equal(calls,2);assert.equal(answer.intent.type,'insert')
+  const answer=await runPlanningAgent({targets,messages:[],answered:['要加图还是改布局？'],chat:async()=>{
+    calls++;return{role:'assistant',content:JSON.stringify({...raw,intentType:'note',needsClarification:true,clarifyingQuestion:'要加图，还是改布局？'})}
+  }})
+  assert.equal(calls,1);assert.equal(answer.intent.type,'note');assert.equal(answer.repairsUsed,0)
   assert.deepEqual(clarificationChoices({source:'model',type:'note',needsClarification:true,clarifyingQuestion:'你具体想怎么改？',targets:selected,suggestion:{alternatives:[]}}),[])
 })
 
@@ -109,30 +130,33 @@ test('real candidate plans are concrete executable designs, not tool-category bu
   assert.equal(result.intent.candidatePlans[1].nodes[0].tag,'p')
 })
 
-test('repair cannot silently add related write targets or introduce destructive edits to bypass a layout error',()=>{
-  const previous=normalizeBrushPlan({...raw,intentType:'style',styles:[{property:'font-size',value:'48px'}]},targets)
-  const enlarged=normalizeBrushPlan({...raw,intentType:'style',targetIds:['description'],scopeExpansion:['description'],styles:[{property:'font-size',value:'48px'}]},targets)
-  assert.equal(repairScopeIssue(previous,enlarged,targets),'repair-expanded-write-scope')
-  assert.equal(repairScopeIssue(previous,normalizeBrushPlan({...raw,intentType:'delete'},targets),targets),'repair-introduces-destructive-operation')
-  assert.equal(repairScopeIssue(previous,{...previous,styles:{'font-size':'36px'}},targets),'')
+test('first-proposal unsafe code and undisclosed writes fail without replacement or repair',async()=>{
+  for(const [proposal,reason] of [
+    [{...raw,intentType:'style',targetIds:['description'],styles:[{property:'font-size',value:'48px'}]},'scope-expansion-not-disclosed'],
+    [{...raw,contentKind:'text',nodes:[{tag:'script',text:'alert(1)'}]},'invalid-node-tag-or-size'],
+    [{...raw,targetIds:['unseen']},'unknown-target'],
+  ]) {
+    let calls=0
+    await assert.rejects(runPlanningAgent({targets,observation,messages:[],chat:async()=>{calls++;return{role:'assistant',content:JSON.stringify(proposal)}}}),error=>error.reason===reason && error.repairsUsed===0)
+    assert.equal(calls,1)
+  }
 })
 
-test('repair may honor already-present strike-out evidence, not invent destructive permission from selection',async()=>{
-  const previous=normalizeBrushPlan({...raw,intentType:'note'},targets)
-  const deletion={...raw,intentType:'delete',contentKind:'text',targetIds:['heading'],suggestion:'移除划掉的标题，保留说明与按钮'}
-  const run=(parameters)=>runPlanningAgent({targets,observation,messages:[],fallback:{parameters},repairFeedback:{plan:previous,issues:[{code:'invalid-design'}]},chat:async()=>({role:'assistant',content:JSON.stringify(deletion)})})
-  assert.equal((await run({textStrike:true,hasRegion:false})).intent.type,'delete')
-  await assert.rejects(run({textStrike:false,hasRegion:true}),{reason:'repair-introduces-destructive-operation'})
-  assert.equal(repairScopeIssue(previous,normalizeBrushPlan({...raw,intentType:'replace',targetText:'研究主题',replacementText:'新内容'},targets),targets,{deleteEvidence:true}),'repair-introduces-destructive-operation')
-})
-
-test('a second repair cannot launder a destructive operation through the first rejected repair',async()=>{
-  const previous=normalizeBrushPlan({...raw,intentType:'style',styles:[{property:'font-size',value:'48px'}]},targets)
+test('a model deletion on legal selected targets is only a proposal and always requires user confirmation',async()=>{
   let calls=0
-  await assert.rejects(runPlanningAgent({targets,observation,messages:[],repairFeedback:{plan:previous,issues:[{code:'component-overflow'}]},chat:async()=>{
-    calls++;return{role:'assistant',content:JSON.stringify({...raw,intentType:'delete'})}
-  }}),error=>error.reason==='repair-introduces-destructive-operation' && error.repairsUsed===2)
-  assert.equal(calls,2)
+  const result=await runPlanningAgent({targets,observation,messages:[],fallback:{parameters:{hasRegion:true,textStrike:false}},chat:async()=>{
+    calls++;return{role:'assistant',content:JSON.stringify({...raw,intentType:'delete',targetIds:['heading'],suggestion:'移除这个标题，保留说明与按钮'})}
+  }})
+  assert.equal(calls,1);assert.equal(result.intent.type,'delete');assert.equal(result.intent.requiresConfirmation,true)
+  assert.equal(result.repairsUsed,0)
+})
+
+test('a complete but neutral first result is not regenerated for lack of a preferred action',async()=>{
+  let calls=0
+  const result=await runPlanningAgent({targets,observation,instruction:'更简洁一点',messages:[],chat:async()=>{
+    calls++;return{role:'assistant',content:JSON.stringify({...raw,intentType:'note',needsClarification:false,needsInput:false})}
+  }})
+  assert.equal(calls,1);assert.equal(result.intent.type,'note');assert.equal(result.repaired,false)
 })
 
 test('the native plan submission tool is a schema-bound plan, not an execution command',async()=>{
@@ -144,25 +168,16 @@ test('the native plan submission tool is a schema-bound plan, not an execution c
   assert.equal(calls,1);assert.equal(result.intent.type,'insert');assert.equal(result.intent.requiresConfirmation,true)
 })
 
-test('native proposal repair completes every tool call before making the next model request',async()=>{
-  for (const mixed of [false,true]) {
+test('invalid native submissions never open a follow-up repair turn',async()=>{
+  for(const mixed of [false,true]) {
     let calls=0
-    const result=await runPlanningAgent({targets,observation,messages:[],chat:async(history)=>{
-      if (++calls===2) {
-        const submitted=history.find(message=>message.role==='assistant')
-        const replies=history.filter(message=>message.role==='tool')
-        assert.deepEqual(replies.map(reply=>reply.tool_call_id),submitted.tool_calls.map(call=>call.id))
-        assert.ok(replies.every(reply=>JSON.parse(reply.content).executed===false))
-        assert.match(history.at(-1).content,mixed ? /mixed-read-and-submit/ : /unknown-insertion-anchor/)
-      }
-      const plan=calls===1 ? {...raw,insertion:{anchorId:'unknown',placement:'after'}} : raw
-      return {role:'assistant',content:null,tool_calls:[
-        ...(mixed && calls===1 ? [{id:'read-with-submit',type:'function',function:{name:'inspect_module',arguments:'{"moduleId":"module"}'}}] : []),
-        {id:`proposal-${calls}`,type:'function',function:{name:'propose_edit',arguments:JSON.stringify(plan)}},
+    await assert.rejects(runPlanningAgent({targets,observation,messages:[],chat:async()=>{
+      calls++;return{role:'assistant',content:null,tool_calls:[
+        ...(mixed ? [{id:'read-with-submit',type:'function',function:{name:'inspect_module',arguments:'{"moduleId":"module"}'}}] : []),
+        {id:'proposal',type:'function',function:{name:'propose_edit',arguments:JSON.stringify({...raw,insertion:{anchorId:'unknown',placement:'after'}})}},
       ]}
-    }})
-    assert.equal(calls,2);assert.equal(result.intent.type,'insert');assert.equal(result.repaired,true)
-    assert.equal(result.toolCalls,0)
+    }}),error=>error.reason===(mixed?'mixed-read-and-submit':'unknown-insertion-anchor') && error.repairsUsed===0)
+    assert.equal(calls,1)
   }
 })
 

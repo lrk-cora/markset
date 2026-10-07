@@ -6,7 +6,6 @@ import { brushResponseFormat } from './brush-plan.js'
 import { planningSystem, runPlanningAgent } from './planning-agent.js'
 import { planningTargets } from '../src/edit-capabilities.js'
 import { sampleStrokePoints, initialPlanningEvidence, compactPlanningContext } from '../src/planning-evidence.js'
-import { partialPlanSuggestion } from './model-stream.js'
 import { startAnalysisStream } from './analysis-stream.js'
 import { planningRegionEvidence } from '../src/brush-regions.js'
 import { randomUUID } from 'node:crypto'
@@ -304,34 +303,23 @@ export async function brushIntent(env, payload, { signal, onRawOutput, onProgres
   try {
     const result = await withDeadline((totalSignal) => runPlanningAgent({
       targets, observation:payload.observation, fallback:payload.localInterpretation, instruction:userInstruction,
-      answered:payload.answeredClarifications || [], signal:totalSignal, repairFeedback:payload.repairFeedback,repairsUsed:payload.repairsUsed,
+      signal:totalSignal, repairFeedback:payload.repairFeedback,
       onProgress:(trace)=>{
         progressTrace=trace
         const last = trace.at(-1)
         if (last?.stage === 'observe') notify({ stage:'observe', draftSummary:'' })
-        if (last?.stage === 'repair') notify({ stage:'repair', draftSummary:'' })
       },
       messages:[{role:'system',content:instruction},{role:'user',content}],
       chat:async (messages,{tools}) => {
         timings.modelRequests++
         const request = timings.modelRequests
-        let lastSummary = '', firstSummary = false, lastPublished = 0
         const message = await modelChat(env, { model:routing.model,structured:gateway.provider === 'bailian',returnMessage:true,tools,
           // Observe useful progress even for JSON clients; UI streaming is an
           // independent choice and never changes the upstream timeout semantics.
           stream:true,
-          onStart:()=>{ lastSummary=''; lastPublished=0; notify({stage:payload.repairFeedback || progressTrace.some(item=>item.stage==='repair') ? 'repair' : 'planning',draftSummary:''}) },
-          onDelta:({content,toolCalls})=>{
-            const proposal = toolCalls.find(call=>call.function.name === 'propose_edit')
-            // Mixed read/write turns are rejected; don't present their draft.
-            if (toolCalls.length > 1) return notify({stage:'observe',draftSummary:''})
-            const summary = partialPlanSuggestion(proposal?.function.arguments || (!toolCalls.length ? content : ''))
-            if (summary.length < 6 || summary === lastSummary) return
-            if (lastSummary && Date.now()-lastPublished < 100 && summary.length-lastSummary.length < 12) return
-            lastSummary=summary; lastPublished=Date.now()
-            if (!firstSummary) { firstSummary=true; timings.firstSummaryMs ??= Date.now()-startedAt }
-            notify({stage:'draft',draftSummary:summary})
-          },
+          // Streaming is transport/progress monitoring only. Never parse and
+          // publish unfinished proposals or repeatedly render partial text.
+          onStart:()=>notify({stage:'planning'}),
           retries:Math.max(0,retryBudget-retriesUsed),onRetry:()=>{retriesUsed++; notify({stage:'retry',retry:retriesUsed,draftSummary:''})},
           onAttempt:(attempt)=>{
             timings.modelAttempts++; timings.upstreamMs+=attempt.elapsedMs
@@ -343,11 +331,7 @@ export async function brushIntent(env, payload, { signal, onRawOutput, onProgres
               for (const key of Object.keys(usage)) usage[key]+=Number(value.usage[key]) || 0
             }
           },
-          temperature:0,maxTokens:routing.tier === 'max' ? 4000 : 2200,signal:totalSignal,messages })
-        if (!message.tool_calls?.some(call=>call.function.name !== 'propose_edit')) {
-          const summary=partialPlanSuggestion(message.tool_calls?.[0]?.function.arguments || message.content)
-          if (summary) { timings.firstSummaryMs ??= Date.now()-startedAt; notify({stage:'draft',draftSummary:summary}) }
-        }
+          temperature:0,maxTokens:2200,signal:totalSignal,messages })
         if (message.content) onRawOutput?.(message.content)
         return message
       },
@@ -355,6 +339,7 @@ export async function brushIntent(env, payload, { signal, onRawOutput, onProgres
       {timeoutSource:'local',timeoutStage:'total',timeoutMs:modelRequestPolicy(env).timeoutMs})})
     timings.readToolCalls = result.toolCalls || 0
     timings.serverMs = Date.now()-startedAt
+    timings.completedPlanMs = timings.serverMs
     return { ...result, model:routing.model,routing,elapsedMs:timings.serverMs,retriesUsed,usage,timings }
   } catch (error) {
     error.trace ||= progressTrace
@@ -1014,6 +999,7 @@ export function marksetApi(env, { imageJobs: suppliedJobs } = {}) {
               renderedImport: Boolean(env.BROWSERLESS_API_KEY || env.BROWSERLESS_TOKEN),
               ...models(env),
               brushModel: modelGateway(env).brushModel,
+              analysisRouting: official ? routeAnalysis({}, gateway) : null,
               retryPolicy: { analysis: {...modelRequestPolicy(env),planRepairs:MAX_PLAN_REPAIRS}, image: imageRequestPolicy(env) },
               hints: keyHints(env), ...publicBailianConfig(official), lastCalls,
             })
@@ -1173,7 +1159,7 @@ export function marksetApi(env, { imageJobs: suppliedJobs } = {}) {
             }))
             send(res, status, { error: issue.message, code: issue.code, requestId, model: err.model || '',
               routing: err.routing || null, retriesUsed: err.retriesUsed || 0, elapsedMs: err.elapsedMs || Date.now() - startedAt,
-              reason:err.reason || '',repairsUsed:err.repairsUsed || 0,trace:err.trace?.slice(-12) || [],timings:err.timings || null, ...timeout })
+              reason:err.reason || '',repairsUsed:0,proposalSummary:String(err.proposalSummary || '').slice(0,500),trace:err.trace?.slice(-12) || [],timings:err.timings || null, ...timeout })
             return
           }
           send(res, err.status || 500, { error: redact(err.message, env), code: err.code })

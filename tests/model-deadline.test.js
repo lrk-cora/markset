@@ -132,14 +132,14 @@ test('parent cancellation is not reclassified as timeout and prevents stream ret
   assert.equal(fixture.attempts[0].timeoutSource,undefined)
 })
 
-test('the real Max planning path accepts a slow healthy plan with one call and safe attempt diagnostics',async t => {
+test('the real Flash planning path accepts a slow healthy plan with one call and safe attempt diagnostics',async t => {
   t.mock.timers.enable({apis:['setTimeout','Date']})
   const nativeFetch=globalThis.fetch,events=[]
   let writer,calls=0
   globalThis.fetch=async(_url,init)=>{
     calls++
     const request=JSON.parse(init.body)
-    assert.equal(request.model,'qwen3.8-max');assert.equal(request.stream,true)
+    assert.equal(request.model,'qwen3.8-flash');assert.equal(request.stream,true)
     return new Response(new ReadableStream({start(controller){writer=controller}}),{headers:{'Content-Type':'text/event-stream'}})
   }
   try {
@@ -156,11 +156,11 @@ test('the real Max planning path accepts a slow healthy plan with one call and s
     writer.enqueue(new TextEncoder().encode(ending));writer.close()
     const {value,error}=await outcome
     assert.equal(error,undefined);assert.equal(value.intent.type,'color');assert.equal(value.intent.requiresConfirmation,true)
-    assert.equal(value.model,'qwen3.8-max');assert.equal(calls,1);assert.equal(value.retriesUsed,0)
+    assert.equal(value.model,'qwen3.8-flash');assert.equal(calls,1);assert.equal(value.retriesUsed,0)
     assert.equal(value.timings.attempts[0].request,1);assert.equal(value.timings.attempts[0].firstOutputMs,23_000)
     assert.equal(value.timings.attempts[0].elapsedMs,35_000)
     assert.doesNotMatch(JSON.stringify(value.timings),/PRIVATE_KEY|rationale|messages|tool_calls/)
-    assert.ok(events.some(event=>event.stage==='draft'))
+    assert.ok(events.every(event=>event.stage!=='draft' && !event.draftSummary))
   }finally{globalThis.fetch=nativeFetch}
 })
 
