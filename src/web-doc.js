@@ -5,7 +5,18 @@ import { collectLayoutPairs } from './layout.js'
 import { getInkStrokes } from './ink.js'
 import { getPaintMarks, SELECT_COLOR } from './overlay.js'
 import { inferCommandText, localNextText, parseCommand } from './plan-local.js'
-import { getSnapshot, ping, targets, upsertSpan } from './store.js'
+import { getSnapshot, ping as storePing, targets, upsertSpan } from './store.js'
+import { filterExcludedTargets } from './target-selection.js'
+import { stripExecutableMarkup } from './passive-document.js'
+import { anchorBrushStroke, validLayoutRect } from './brush-layout.js'
+import { readPageObservation } from './page-observation.js'
+import { checkNodeSpecs, checkStyleDeclarations } from './edit-capabilities.js'
+import { auditPlanResult, measurePlanDocument } from './plan-verification.js'
+import { planCheckReport } from './plan-check-policy.js'
+
+export function excludeBrushTargets(targets, excludedIds = []) {
+  return filterExcludedTargets(targets, excludedIds, findByWebId)
+}
 
 const SKIP = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'META', 'LINK', 'BR', 'HR', 'HEAD', 'HTML'])
 const SKIN_ID = 'markset-skin'
@@ -13,11 +24,14 @@ const MAX_HITS = 4
 
 let meta = { title: '', sourceUrl: '' }
 let viewportBound = false
+let layoutObserver = null
+let layoutFrame = 0
+let executionFrame = null
 const iframeScrollBound = new WeakSet()
 const BADGE_HOST = 'markset-badge-host'
 
 const SKIN = `
-html, body { margin: 0; width: 100%; min-width: 100%; max-width: none; }
+html, body { margin: 0 !important; width: 100% !important; min-width: 100% !important; max-width: none !important; height: auto !important; min-height: 100% !important; max-height: none !important; overflow: visible !important; }
 img, video { max-width: 100%; height: auto; }
 [data-markset-anno="underline"] { text-decoration: underline 2px; text-decoration-skip-ink: none; text-underline-offset: 3px; }
 [data-markset-anno="wavy"] { text-decoration: underline wavy 2px #3c6fd4; text-decoration-skip-ink: none; text-underline-offset: 3px; }
@@ -34,7 +48,7 @@ img, video { max-width: 100%; height: auto; }
 [data-markset-scaled] { transform-origin: center center; max-width: 100%; }
 [data-markset-word][data-markset-scaled] { display: inline; max-width: none; }
 [data-markset-flow] { overflow: visible; }
-[data-markset-tombstone] { display: inline-block; width: 0; overflow: hidden; margin: 0; padding: 0; border: 0; vertical-align: top; pointer-events: none; }
+[data-markset-tombstone] { display: none !important; }
 [data-markset-shaped-shadow] { pointer-events: none; }
 `
 
@@ -46,11 +60,14 @@ function esc(text) {
     .replace(/"/g, '&quot;')
 }
 
+function ping() { if (!executionFrame) storePing() }
+
 function hostEl() {
   return document.getElementById('web-doc-host')
 }
 
 function frameEl() {
+  if (executionFrame) return executionFrame
   return document.getElementById('web-doc-frame')
 }
 
@@ -92,6 +109,9 @@ function injectSkin(doc) {
 }
 
 function fitHeight() {
+  // Trial execution must expose overflow rather than shrink the whole clone
+  // to make an invalid layout appear to fit.
+  if (executionFrame) return
   const iframe = frameEl()
   const doc = getDoc()
   if (!iframe || !doc) return
@@ -116,9 +136,20 @@ function prepareDoc(doc) {
     a.setAttribute('rel', 'noopener')
   })
   fitHeight()
-  requestAnimationFrame(fitHeight)
+  requestAnimationFrame(refreshWebDocLayout)
   doc.body?.querySelectorAll('img').forEach((img) => {
-    if (!img.complete) img.addEventListener('load', fitHeight, { once: true })
+    const src = img.getAttribute('src') || ''
+    if (/^https?:\/\//i.test(src) && !src.includes('/api/asset?url=')) {
+      img.dataset.marksetOriginalSrc = src
+    }
+    img.addEventListener('error', () => {
+      const original = img.dataset.marksetOriginalSrc || img.getAttribute('src') || ''
+      if (!/^https?:\/\//i.test(original) || img.dataset.marksetProxyTried === '1') return
+      img.dataset.marksetProxyTried = '1'
+      img.src = `${window.location.origin}/api/asset?url=${encodeURIComponent(original)}`
+      refreshWebDocLayout()
+    }, { once: true })
+    if (!img.complete) img.addEventListener('load', refreshWebDocLayout, { once: true })
   })
 }
 
@@ -141,7 +172,30 @@ function bindViewport() {
   document.querySelector('.page')?.addEventListener('scroll', onMove, { passive: true })
   window.addEventListener('resize', () => {
     if (!isWebDocActive()) return
+    refreshWebDocLayout()
+  })
+  // CSS grid/sidebar changes do not emit window.resize. Watch the actual
+  // canvas width and notify ink only after the imported page has reflowed.
+  if (typeof ResizeObserver !== 'undefined') {
+    let width = frameEl()?.clientWidth
+    layoutObserver = new ResizeObserver(() => {
+      const nextWidth = frameEl()?.clientWidth
+      if (nextWidth === width) return
+      width = nextWidth
+      refreshWebDocLayout()
+    })
+    if (frameEl()) layoutObserver.observe(frameEl())
+  }
+}
+
+export function refreshWebDocLayout() {
+  if (!isWebDocActive()) return
+  fitHeight()
+  if (layoutFrame) return
+  layoutFrame = requestAnimationFrame(() => {
+    layoutFrame = 0
     fitHeight()
+    window.dispatchEvent(new Event('markset:page-layout'))
     ping()
   })
 }
@@ -152,6 +206,7 @@ function setHtml(html) {
   if (!iframe || !doc) return false
   const parsed = new DOMParser().parseFromString(html, 'text/html')
   if (!parsed.documentElement) return false
+  stripExecutableMarkup(parsed)
   doc.replaceChild(doc.importNode(parsed.documentElement, true), doc.documentElement)
   prepareDoc(doc)
   return true
@@ -282,13 +337,14 @@ function leaveTombstone(el) {
   if (!el?.isConnected) return null
   const doc = el.ownerDocument
   const id = el.getAttribute('data-markset-id') || ''
-  const r = el.getBoundingClientRect()
   const ph = doc.createElement('span')
   if (id) ph.setAttribute('data-markset-id', id)
   ph.setAttribute('data-markset-tombstone', '1')
   ph.setAttribute('aria-hidden', 'true')
-  const h = Math.max(12, Math.min(40, Math.round(r.height || 0)))
-  ph.style.cssText = `display:inline-block;width:0;height:${h}px;overflow:hidden;margin:0;padding:0;border:0;vertical-align:top;pointer-events:none;`
+  ph.hidden = true
+  // An undo anchor is not a layout item. A zero-width inline-block still
+  // occupies a row/gap in flex and grid layouts after removing a module.
+  ph.style.cssText = 'display:none !important;'
   el.replaceWith(ph)
   return ph
 }
@@ -322,6 +378,12 @@ function insertShot(shot) {
 
 function applyShot(shot) {
   if (!shot) return
+  if (shot.documentBody != null) {
+    const body = getDoc()?.body
+    if (body) body.innerHTML = shot.documentBody
+    return
+  }
+  if (shot.absent) { findByWebId(shot.webId)?.remove(); return }
   if (shot.relocated || shot.styleOnly) {
     const cur = shot.webId ? findByWebId(shot.webId) : null
     if (!cur) return
@@ -334,7 +396,8 @@ function applyShot(shot) {
         else parent.append(cur)
       }
     }
-    if (shot.cssText != null) cur.setAttribute('style', shot.cssText)
+    if (shot.hadStyle === false) cur.removeAttribute('style')
+    else if (shot.cssText != null) cur.setAttribute('style', shot.cssText)
     else cur.removeAttribute('style')
     if (shot.shifted) cur.setAttribute('data-markset-shifted', shot.shifted)
     else cur.removeAttribute('data-markset-shifted')
@@ -360,6 +423,7 @@ function snapshotStyle(el) {
     webId: el.getAttribute('data-markset-id') || '',
     html: '',
     cssText: el.getAttribute('style') || '',
+    hadStyle: el.hasAttribute('style'),
     shifted: el.getAttribute('data-markset-shifted') || '',
     styleOnly: true,
     relocated: true,
@@ -376,7 +440,7 @@ function snapshotPlace(el) {
 
 function tombstoneHtml(shot) {
   const id = shot?.webId ? ` data-markset-id="${esc(shot.webId)}"` : ''
-  return `<span${id} data-markset-tombstone="1" aria-hidden="true" style="display:inline-block;width:0;height:12px;overflow:hidden;margin:0;padding:0;border:0;vertical-align:top;pointer-events:none;"></span>`
+  return `<span${id} data-markset-tombstone="1" aria-hidden="true" hidden style="display:none !important;"></span>`
 }
 
 function recordWebEdit(label, before, after) {
@@ -446,6 +510,40 @@ export function tintWebEl(webId, name, kind = 'auto') {
   return true
 }
 
+export function applyBrushColor(targets, color) {
+  const name = String(color || '').trim()
+  if (!name) return { ok: false, reason: '没有指定颜色' }
+  const live = []
+  for (const target of targets || []) {
+    const el = target?.webId ? findByWebId(target.webId) : null
+    if (!el || !['text', 'image'].includes(target.kind) || el === getDoc()?.body || el === getDoc()?.documentElement) continue
+    if (live.some((parent) => parent === el || parent.contains(el))) continue
+    for (let i = live.length - 1; i >= 0; i -= 1) if (el.contains(live[i])) live.splice(i, 1)
+    live.push(el)
+  }
+  if (!live.length) return { ok: false, reason: '找不到仍在页面上的标记对象' }
+  const before = live.map((el) => snapshotNode(el))
+  try {
+    for (const root of live) {
+      const graphic = isGraphicEl(root)
+      applyColor(root, name, graphic ? 'image' : 'text')
+      for (const child of collectColorable(root)) {
+        if (child === root) continue
+        applyColor(child, name, isGraphicEl(child) ? 'image' : 'text')
+      }
+      root.setAttribute('data-markset-edited', '1')
+    }
+  } catch {
+    before.forEach(applyShot)
+    return { ok: false, reason: '着色失败，网页已恢复原样' }
+  }
+  const after = live.map((el) => snapshotNode(el))
+  recordWebEdit(`改为${name}`, before, after)
+  fitHeight()
+  ping()
+  return { ok: true, count: live.length, message: `已将 ${live.length} 个标记对象改为${name}` }
+}
+
 export function restoreWebEdit(id) {
   const item = webEdits.find((x) => x.id === id)
   if (!item || item.keep === false) return false
@@ -482,13 +580,15 @@ export function undoWebEditsSince(at) {
   const t = Number(at) || 0
   const recent = t
     ? webEdits.filter((item) => (item.at || 0) >= t)
-    : webEdits.slice(0, 1)
+    : webEdits.find((item) => item.keep !== false)
+      ? [webEdits.find((item) => item.keep !== false)]
+      : []
   for (const item of recent) {
     if (item.keep === false) continue
     for (const shot of item.before || []) applyShot(shot)
     item.keep = false
   }
-  webEdits = t ? webEdits.filter((item) => (item.at || 0) < t) : webEdits.slice(1)
+  if (t) webEdits = webEdits.filter((item) => (item.at || 0) < t)
   ping()
   fitHeight()
 }
@@ -1176,6 +1276,116 @@ export function liveScreenRect(span) {
   return span?.screenRect || span?.imageRect || null
 }
 
+// Brush strokes are stored in the imported document's coordinate space rather
+// than in the browser viewport. This keeps them attached to the page while it
+// scrolls and lets downstream interpreters compare them with DOM geometry.
+export function screenToWebDocumentPoint(point) {
+  const frame = iframeBox()
+  if (!frame || !point) return { x: point?.x || 0, y: point?.y || 0 }
+  const z = iframeZoom()
+  const scroll = iframeScroll()
+  return {
+    x: (point.x - frame.left) / z + scroll.x,
+    y: (point.y - frame.top) / z + scroll.y,
+  }
+}
+
+export function webDocumentToScreenPoint(point) {
+  const frame = iframeBox()
+  if (!frame || !point) return { x: point?.x || 0, y: point?.y || 0 }
+  const z = iframeZoom()
+  const scroll = iframeScroll()
+  return {
+    x: frame.left + (point.x - scroll.x) * z,
+    y: frame.top + (point.y - scroll.y) * z,
+  }
+}
+
+export function webDocumentRectToScreen(rect) {
+  if (!rect) return null
+  const a = webDocumentToScreenPoint({ x: rect.x, y: rect.y })
+  const b = webDocumentToScreenPoint({ x: rect.x + (rect.w || 0), y: rect.y + (rect.h || 0) })
+  return { x: a.x, y: a.y, w: Math.max(0, b.x - a.x), h: Math.max(0, b.y - a.y) }
+}
+
+export function screenToWebDocumentRect(rect) {
+  if (!rect) return null
+  const a = screenToWebDocumentPoint({ x: rect.x, y: rect.y })
+  const b = screenToWebDocumentPoint({ x: rect.x + (rect.w || 0), y: rect.y + (rect.h || 0) })
+  return { x: a.x, y: a.y, w: Math.max(0, b.x - a.x), h: Math.max(0, b.y - a.y) }
+}
+
+export function resolveBrushLayoutRect(reference) {
+  if (!reference) return null
+  if (reference.kind === 'page') {
+    // Page fallback adapts horizontal position, not the full document height:
+    // content reflow far below a free stroke must not move it vertically.
+    return { x: 0, y: 0, w: (frameEl()?.clientWidth || 0) / iframeZoom(), h: 1 }
+  }
+  const rects = (reference.objects || []).flatMap((item) => {
+    const el = findByWebId(item.webId)
+    if (!el?.isConnected) return []
+    if (item.ranges?.length) {
+      const entries = normalizedCharEntries(el)
+      return item.ranges.flatMap((range) => entries.slice(range.start, range.end)
+        .map((entry) => screenToWebDocumentRect(toViewport(entry.rect))).filter(validLayoutRect))
+    }
+    const rect = screenToWebDocumentRect(toViewport(el.getBoundingClientRect()))
+    return validLayoutRect(rect) ? [rect] : []
+  })
+  // Do not partially warp a multi-object gesture if one object disappears.
+  if (!rects.length || (reference.objects || []).some((item) => !findByWebId(item.webId)?.isConnected)) return null
+  return rects.reduce((union, rect) => union ? unionBoxes(union, rect) : rect, null)
+}
+
+export function attachBrushLayoutAnchor(stroke, hitTargets = []) {
+  if (!isWebDocActive() || !stroke.points?.length) return stroke
+  const bounds = aabb(stroke.points)
+  const objects = hitTargets.flatMap((target) => {
+    const rect = screenToWebDocumentRect(liveScreenRect(target))
+    if (!validLayoutRect(rect)) return []
+    const overlap = intersectBoxes(bounds, rect)
+    const coverage = overlap ? overlap.w * overlap.h / (rect.w * rect.h) : 0
+    if (coverage >= 0.35) return [{ webId: target.webId }]
+    // A short underline/strike follows its exact characters, not an entire
+    // paragraph. A blank-area box must not attach to a loose incidental hit.
+    if (!stroke.closed && target.markedRanges?.length) {
+      return [{ webId: target.webId, ranges: target.markedRanges.map(({ start, end }) => ({ start, end })) }]
+    }
+    return []
+  })
+  let reference = objects.length ? { kind: 'objects', objects } : null
+  if (!reference) {
+    const center = { x: bounds.x + bounds.w / 2, y: bounds.y + bounds.h / 2 }
+    // Blank marks belong to their local layout container (card/section), so
+    // they also follow vertical reflow above them without selecting that DOM.
+    let smallest = null
+    for (const el of getDoc().body.querySelectorAll('section,article,main,div,li,td')) {
+      const rect = screenToWebDocumentRect(toViewport(el.getBoundingClientRect()))
+      if (!validLayoutRect(rect) || el.ownerDocument.defaultView.getComputedStyle(el).pointerEvents === 'none') continue
+      if (center.x < rect.x || center.x > rect.x + rect.w || center.y < rect.y || center.y > rect.y + rect.h) continue
+      if (rect.w < bounds.w * 0.5 || rect.h < bounds.h * 0.5) continue
+      if (!smallest || rect.w * rect.h < smallest.area) smallest = { el, area: rect.w * rect.h }
+    }
+    reference = smallest ? { kind: 'objects', objects: [{ webId: smallest.el.getAttribute('data-markset-id') }] } : { kind: 'page' }
+  }
+  return anchorBrushStroke(stroke, reference, resolveBrushLayoutRect(reference))
+}
+
+export function refreshBrushTargetGeometry(target) {
+  const el = findByWebId(target.webId)
+  if (!el?.isConnected) return target
+  const fresh = spanFromEl(el, target.kind)
+  // Preserve user-selected character ranges and explicit exclusions; resizing
+  // is not a hit test and must never select extra objects or characters.
+  return { ...target, screenRect: fresh.screenRect, documentRect: fresh.documentRect,
+    imageRect: fresh.imageRect, charRects: fresh.charRects, context: fresh.context }
+}
+
+export function observeBrushPage(group) {
+  return readPageObservation(getDoc(), group.targets || [], group.strokes || [], (el) => screenToWebDocumentRect(toViewport(el.getBoundingClientRect())))
+}
+
 function toViewport(r) {
   const frame = iframeBox()
   if (!frame || !r) return null
@@ -1336,10 +1546,117 @@ function sampleHitPoints(poly) {
   return pts.slice(0, 9)
 }
 
-function spanFromEl(el, kind) {
+function normalizedCharEntries(el) {
+  const nodes = visibleTextNodes(el)
+  const raw = []
+  for (const node of nodes) {
+    const value = String(node.nodeValue || '')
+    for (let offset = 0; offset < value.length; offset += 1) {
+      const range = el.ownerDocument.createRange()
+      let rect = null
+      try {
+        range.setStart(node, offset)
+        range.setEnd(node, offset + 1)
+        const box = range.getBoundingClientRect()
+        if (box.width || box.height) rect = { x: box.x, y: box.y, w: box.width, h: box.height }
+      } catch { /* a detached text node can be skipped */ }
+      if (!rect) {
+        const box = node.parentElement?.getBoundingClientRect?.()
+        if (box) rect = { x: box.x, y: box.y, w: box.width, h: box.height }
+      }
+      raw.push({ node, offset, char: value[offset], rect })
+    }
+  }
+  const entries = []
+  let pendingSpace = null
+  for (const item of raw) {
+    if (/\s/u.test(item.char)) {
+      if (entries.length && !pendingSpace) pendingSpace = item
+      continue
+    }
+    if (pendingSpace) {
+      entries.push({ char: ' ', node: pendingSpace.node, offset: pendingSpace.offset, rect: pendingSpace.rect })
+      pendingSpace = null
+    }
+    entries.push({ char: item.char, node: item.node, offset: item.offset, rect: item.rect })
+  }
+  if (entries.length && entries[entries.length - 1].char === ' ') entries.pop()
+  return entries
+}
+
+function rectToSpan(rect) {
+  if (!rect) return null
+  const screen = toViewport({ left: rect.x, top: rect.y, width: rect.w, height: rect.h })
+  const documentRect = screen ? screenToWebDocumentRect(screen) : null
+  return {
+    x: rect.x, y: rect.y, w: rect.w, h: rect.h,
+    screenRect: screen, documentRect,
+  }
+}
+
+function markedTextRanges(entries, poly) {
+  if (!entries.length || !poly?.length) return []
+  const paintBox = aabb(poly)
+  const hit = entries.map((entry) => {
+    const rect = entry.rect
+    if (!rect || !rect.w || !rect.h) return false
+    const center = { x: rect.x + rect.w / 2, y: rect.y + rect.h / 2 }
+    if (pointInPolygon(center.x, center.y, poly)) return true
+    const overlap = intersectBoxes(rect, paintBox)
+    // A thin strike-through often intersects only a few pixels of a glyph.
+    // The AABB test is intentionally permissive here; the model receives the
+    // exact ranges and the executor validates them again before mutation.
+    return Boolean(overlap && overlap.w >= Math.min(2, rect.w) && overlap.h >= 1)
+  })
+  const ranges = []
+  let start = -1
+  for (let i = 0; i <= hit.length; i += 1) {
+    const isHit = i < hit.length && hit[i]
+    if (isHit && start < 0) start = i
+    if ((!isHit || i === hit.length) && start >= 0) {
+      let end = i
+      while (end > start && entries[end - 1].char === ' ') end -= 1
+      if (end > start) {
+        const text = entries.slice(start, end).map((entry) => entry.char).join('')
+        if (text.trim()) ranges.push({ start, end, text, coverage: Number(((end - start) / Math.max(1, entries.length)).toFixed(3)) })
+      }
+      start = -1
+    }
+  }
+  return ranges
+}
+
+function spanFromEl(el, kind, markPoly = null) {
   const r = el.getBoundingClientRect()
   const screen = toViewport(r)
   const id = el.getAttribute('data-markset-id') || ''
+  const parent = el.parentElement
+  const siblings = parent
+    ? [...parent.children]
+        .filter((node) => node !== el && !decoNode(node) && !isTombstone(node))
+        .slice(0, 8)
+        .map((node) => ({
+          webId: node.getAttribute('data-markset-id') || '',
+          tag: node.tagName.toLowerCase(),
+          text: textOf(node).slice(0, 90),
+          rect: (() => {
+            const sr = toViewport(node.getBoundingClientRect())
+            return sr ? { x: Math.round(sr.x), y: Math.round(sr.y), w: Math.round(sr.w), h: Math.round(sr.h) } : null
+          })(),
+        }))
+    : []
+  const computed = el.ownerDocument?.defaultView?.getComputedStyle?.(el)
+  const context = {
+    tag: el.tagName.toLowerCase(),
+    role: el.getAttribute('role') || '',
+    ariaLabel: el.getAttribute('aria-label') || '',
+    className: typeof el.className === 'string' ? el.className.slice(0, 120) : '',
+    parentTag: parent?.tagName?.toLowerCase() || '',
+    parentId: parent?.getAttribute?.('data-markset-id') || '',
+    display: computed?.display || '',
+    layout: computed?.display === 'grid' ? 'grid' : computed?.display === 'flex' ? 'flex' : 'flow',
+    siblings,
+  }
   if (kind === 'image') {
     const nw = el.naturalWidth || Math.round(r.width)
     const nh = el.naturalHeight || Math.round(r.height)
@@ -1348,24 +1665,92 @@ function spanFromEl(el, kind) {
       webId: id,
       block_id: `web-img-${id}`,
       screenRect: screen,
+      documentRect: screen ? screenToWebDocumentRect(screen) : null,
       imageRect: screen,
       bbox: { x: 0, y: 0, w: nw, h: nh },
       naturalSize: { w: nw, h: nh },
       mode: 'object',
       why: 'web-doc',
+      context,
     }
   }
-  const text = textOf(el).slice(0, 240)
+  const fullText = textOf(el)
+  const text = fullText.slice(0, 800)
+  const entries = normalizedCharEntries(el)
+  const charRects = entries.slice(0, 1200).map((entry, index) => ({
+    index,
+    char: entry.char,
+    ...rectToSpan(entry.rect),
+  })).filter((entry) => entry.screenRect)
+  const markedRanges = markedTextRanges(entries, markPoly)
   return {
     kind: 'text',
     webId: id,
     block_id: `web-${id}`,
     text,
+    textTruncated: fullText.length > text.length,
+    textLength: fullText.length,
     start: 0,
     end: text.length,
+    charRects,
+    textFragments: markedRanges.map((range) => ({ start: range.start, end: range.end, text: range.text })),
+    markedRanges,
     screenRect: screen,
+    documentRect: screen ? screenToWebDocumentRect(screen) : null,
     why: 'web-doc',
+    context,
   }
+}
+
+
+/**
+ * When a user draws an arrow after marking only one card, include the other
+ * visible siblings as candidates. The model can only reason over supplied
+ * objects, so this keeps the candidate set complete without letting it invent
+ * arbitrary DOM nodes.
+ */
+export function expandBrushTargets(targets = [], { includePeers = false, max = 8 } = {}) {
+  const base = uniqueWebTargets(targets)
+  if (!includePeers || !base.length) return base
+  const out = [...base]
+  const seen = new Set(out.map((target) => target.webId).filter(Boolean))
+  for (const target of base) {
+    const el = target.webId ? findByWebId(target.webId) : null
+    const parent = el?.parentElement
+    const computed = parent?.ownerDocument?.defaultView?.getComputedStyle?.(parent)
+    const layout = computed?.display === 'grid' ? 'grid' : computed?.display === 'flex' ? 'flex' : ''
+    const siblings = parent ? [...parent.children] : []
+    const eligible = siblings
+      .filter((node) => node !== el && !decoNode(node) && !isTombstone(node))
+      .filter((node) => {
+        const r = node.getBoundingClientRect()
+        return r.width >= 12 && r.height >= 12 && (isImageEl(node) || isTextBlock(node) || isWidgetEl(node) || isGraphicEl(node))
+      })
+      .filter((node) => layout || node.tagName === el?.tagName)
+      .slice(0, Math.max(0, max - out.length))
+    for (const node of eligible) {
+      const webId = node.getAttribute('data-markset-id')
+      if (!webId || seen.has(webId)) continue
+      const kind = isImageEl(node) || isGraphicEl(node) ? 'image' : 'text'
+      const candidate = spanFromEl(node, kind)
+      if (!candidate?.webId) continue
+      seen.add(candidate.webId)
+      out.push(candidate)
+      if (out.length >= max) return out
+    }
+  }
+  return out
+}
+
+function uniqueWebTargets(targets = []) {
+  const out = []
+  const seen = new Set()
+  for (const target of targets) {
+    if (!target?.webId || seen.has(target.webId)) continue
+    seen.add(target.webId)
+    out.push(target)
+  }
+  return out
 }
 
 function polygonCover(el, poly) {
@@ -1587,8 +1972,8 @@ export function hitWebDoc(polygon, { loose = false } = {}) {
   const images = []
   const texts = []
   for (const hit of items) {
-    if (hit.kind === 'image') images.push(spanFromEl(hit.el, 'image'))
-    else texts.push(spanFromEl(hit.el, 'text'))
+    if (hit.kind === 'image') images.push(spanFromEl(hit.el, 'image', poly))
+    else texts.push(spanFromEl(hit.el, 'text', poly))
   }
   return {
     texts: { found: texts, suggest: [] },
@@ -4877,4 +5262,577 @@ export function exportWebDoc() {
   a.click()
   URL.revokeObjectURL(a.href)
   return true
+}
+
+
+function directChildOf(el, ancestor) {
+  let cur = el
+  while (cur?.parentElement && cur.parentElement !== ancestor) cur = cur.parentElement
+  return cur?.parentElement === ancestor ? cur : null
+}
+
+function layoutHostFor(elements) {
+  const first = elements[0]
+  if (!first) return null
+  let cur = first.parentElement
+  let best = null
+  while (cur && cur !== cur.ownerDocument?.body && cur !== cur.ownerDocument?.documentElement) {
+    const children = elements.map((el) => directChildOf(el, cur))
+    const unique = new Set(children.filter(Boolean))
+    if (unique.size === elements.length && cur.children.length >= elements.length && cur.children.length <= 32) {
+      const style = cur.ownerDocument.defaultView?.getComputedStyle(cur)
+      const display = style?.display || ''
+      if (display !== 'inline' && display !== 'contents') best = { host: cur, units: children }
+    }
+    cur = cur.parentElement
+  }
+  return best
+}
+
+function layoutDirection(strokes = [], preferred = '', preferredOrder = '') {
+  const sign = preferredOrder === 'reverse' ? -1 : 1
+  if (preferred === 'vertical') return { axis: 'y', direction: sign }
+  if (preferred === 'horizontal') return { axis: 'x', direction: sign }
+  let best = null
+  for (const stroke of strokes) {
+    const points = stroke?.points || []
+    if (points.length < 2) continue
+    const first = points[0]
+    const last = points[points.length - 1]
+    const dx = last.x - first.x
+    const dy = last.y - first.y
+    const length = Math.hypot(dx, dy)
+    if (!best || length > best.length) best = { dx, dy, length }
+  }
+  if (!best) return { axis: 'x', direction: 1 }
+  return Math.abs(best.dx) >= Math.abs(best.dy)
+    ? { axis: 'x', direction: best.dx >= 0 ? 1 : -1 }
+    : { axis: 'y', direction: best.dy >= 0 ? 1 : -1 }
+}
+
+export function applyBrushLayoutReorder(targets, strokes = [], preferredDirection = '', preferredOrder = '', targetOrder = []) {
+  const ids = []
+  const elements = []
+  const seen = new Set()
+  for (const target of targets || []) {
+    const el = target?.webId ? findByWebId(target.webId) : null
+    if (!el || seen.has(el)) continue
+    seen.add(el)
+    ids.push(target.webId)
+    elements.push(el)
+  }
+  if (elements.length < 2) return { ok: false, reason: '至少需要两个对象才能重排' }
+  const layout = layoutHostFor(elements)
+  if (!layout?.host) return { ok: false, reason: '暂时找不到可以一起排列这些对象的容器' }
+  const { host, units } = layout
+  const uniqueUnits = [...new Set(units)]
+  if (uniqueUnits.length < 2) return { ok: false, reason: '这些对象还不在同一个可排列区域中' }
+  const direction = layoutDirection(strokes, preferredDirection, preferredOrder)
+  const sorted = [...uniqueUnits].sort((a, b) => {
+    if (targetOrder.length) return targetOrder.indexOf(ids[units.indexOf(a)]) - targetOrder.indexOf(ids[units.indexOf(b)])
+    const ra = a.getBoundingClientRect()
+    const rb = b.getBoundingClientRect()
+    const av = direction.axis === 'x' ? ra.left : ra.top
+    const bv = direction.axis === 'x' ? rb.left : rb.top
+    return (av - bv) * direction.direction
+  })
+  const before = [snapshotStyle(host), ...uniqueUnits.map((el) => snapshotStyle(el))]
+  const hostStyle = host.style
+  const previousDisplay = getComputedStyle(host).display
+  const useGrid = previousDisplay !== 'flex'
+  if (useGrid) {
+    hostStyle.display = 'grid'
+    hostStyle.gridTemplateColumns = direction.axis === 'x'
+      ? `repeat(${Math.min(sorted.length, 4)}, minmax(0, 1fr))`
+      : 'minmax(0, 1fr)'
+    hostStyle.gridAutoRows = direction.axis === 'y' ? 'auto' : ''
+    hostStyle.gridAutoFlow = direction.axis === 'x' ? 'row' : 'column'
+  } else {
+    hostStyle.display = 'flex'
+    hostStyle.flexDirection = direction.axis === 'x' ? 'row' : 'column'
+    hostStyle.flexWrap = 'nowrap'
+  }
+  if (!hostStyle.gap) hostStyle.gap = '16px'
+  hostStyle.alignItems = 'stretch'
+  for (const [index, el] of sorted.entries()) {
+    el.style.order = String(index + 1)
+    el.style.minWidth = direction.axis === 'x' ? '0' : ''
+    el.style.boxSizing = 'border-box'
+  }
+  const after = [snapshotStyle(host), ...uniqueUnits.map((el) => snapshotStyle(el))]
+  const changed = before.some((shot, index) => shot.cssText !== after[index]?.cssText)
+  if (!changed) return { ok: false, reason: '这些对象已经是当前排列' }
+  recordWebEdit('重新排列内容', before, after)
+  fitHeight()
+  ping()
+  return { ok: true, count: uniqueUnits.length, message: `已重新排列 ${uniqueUnits.length} 个对象` }
+}
+
+function visibleTextNodes(el) {
+  const doc = el?.ownerDocument
+  if (!doc) return []
+  const walker = doc.createTreeWalker(el, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      const parent = node.parentElement
+      if (!parent || /^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE)$/.test(parent.tagName)) return NodeFilter.FILTER_REJECT
+      if (parent.closest('[hidden], [aria-hidden="true"]')) return NodeFilter.FILTER_REJECT
+      const style = doc.defaultView?.getComputedStyle?.(parent)
+      return style?.display === 'none' || style?.visibility === 'hidden'
+        ? NodeFilter.FILTER_REJECT
+        : NodeFilter.FILTER_ACCEPT
+    },
+  })
+  const nodes = []
+  let node = walker.nextNode()
+  while (node) { nodes.push(node); node = walker.nextNode() }
+  return nodes
+}
+
+function locateTextBoundary(nodes, offset, isEnd = false) {
+  let cursor = 0
+  for (const node of nodes) {
+    const next = cursor + (node.nodeValue || '').length
+    if (offset < next || (isEnd && offset === next)) return { node, offset: Math.max(0, offset - cursor) }
+    cursor = next
+  }
+  const last = nodes[nodes.length - 1]
+  return last ? { node: last, offset: (last.nodeValue || '').length } : null
+}
+
+export function applyBrushTextReplacement(targets, plan = {}, { dryRun = false } = {}) {
+  const replacementText = String(plan?.replacementText || '').trim()
+  if (!replacementText) return { ok: false, reason: '需要明确的替换文案' }
+  if (Array.isArray(plan?.targetRanges) && plan.targetRanges.length) {
+    return applyBrushTextRangeReplacement(targets, plan.targetRanges, replacementText, { dryRun })
+  }
+  const targetText = String(plan?.targetText || '').trim()
+  if (!targetText) return { ok: false, reason: '需要明确的原文和替换文案' }
+  const live = []
+  const seen = new Set()
+  for (const target of targets || []) {
+    const el = target?.webId ? findByWebId(target.webId) : null
+    if (!el || seen.has(el) || target.kind !== 'text') continue
+    seen.add(el)
+    const nodes = visibleTextNodes(el)
+    const text = nodes.map((node) => node.nodeValue || '').join('')
+    let from = 0
+    while (from <= text.length) {
+      const start = text.indexOf(targetText, from)
+      if (start < 0) break
+      const begin = locateTextBoundary(nodes, start)
+      const finish = locateTextBoundary(nodes, start + targetText.length, true)
+      if (begin && finish) live.push({ el, doc: el.ownerDocument, begin, finish })
+      from = start + Math.max(1, targetText.length)
+    }
+  }
+  if (live.length !== 1) return { ok: false, reason: live.length ? '原文在所选内容中出现多次，无法确定要改哪一处' : '所选内容中找不到这段原文；网页未被修改' }
+
+  if (dryRun) return { ok: true, count: 1, message: '已确认可以安全局部替换' }
+
+  const before = [snapshotNode(live[0].el)]
+  try {
+    const { el, doc, begin, finish } = live[0]
+    const range = doc.createRange()
+    range.setStart(begin.node, begin.offset)
+    range.setEnd(finish.node, finish.offset)
+    range.deleteContents()
+    range.insertNode(doc.createTextNode(replacementText))
+    el.setAttribute('data-markset-edited', '1')
+  } catch (error) {
+    applyShot(before[0])
+    return { ok: false, reason: '无法安全修改这段文字，页面保持原样' }
+  }
+  const after = [snapshotNode(live[0].el)]
+  recordWebEdit('局部替换文字', before, after)
+  fitHeight()
+  ping()
+  return { ok: true, count: 1, message: '已局部替换文字' }
+}
+
+function collectTextRangeOperations(targets, ranges) {
+  const byId = new Map((targets || []).filter((target) => target?.webId).map((target) => [String(target.webId), target]))
+  const operations = []
+  const seen = new Set()
+  for (const item of ranges || []) {
+    const target = byId.get(String(item?.targetId || ''))
+    const start = Number(item?.start)
+    const end = Number(item?.end)
+    if (!target || target.kind !== 'text' || !Number.isInteger(start) || !Number.isInteger(end) || start < 0 || end <= start) return { ok: false, reason: '文字标记范围无效，网页未被修改' }
+    const el = findByWebId(target.webId)
+    if (!el) return { ok: false, reason: '文字对象已变化，请重新标记' }
+    const entries = normalizedCharEntries(el)
+    if (end > entries.length) return { ok: false, reason: '文字标记范围已过期，请重新标记' }
+    const current = entries.slice(start, end).map((entry) => entry.char).join('')
+    const expected = String(item?.expectedText || '').trim()
+    if (expected && current !== expected) return { ok: false, reason: `标记文字已变化（原为“${expected}”），网页未被修改` }
+    const first = entries[start]
+    const last = entries[end - 1]
+    if (!first?.node || !last?.node) return { ok: false, reason: '找不到标记文字，网页未被修改' }
+    const key = `${target.webId}:${start}:${end}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    operations.push({ target, el, start, end, begin: { node: first.node, offset: first.offset }, finish: { node: last.node, offset: last.offset + 1 } })
+  }
+  if (!operations.length) return { ok: false, reason: '没有找到可操作的文字范围' }
+  const perElement = new Map()
+  for (const operation of operations) {
+    const list = perElement.get(operation.el) || []
+    list.push(operation)
+    perElement.set(operation.el, list)
+  }
+  for (const list of perElement.values()) {
+    list.sort((a, b) => a.start - b.start)
+    for (let i = 1; i < list.length; i += 1) if (list[i].start < list[i - 1].end) return { ok: false, reason: '文字标记范围重叠，网页未被修改' }
+  }
+  return { ok: true, operations, perElement }
+}
+
+function applyBrushTextRangeReplacement(targets, ranges, replacementText, { dryRun = false } = {}) {
+  const collected = collectTextRangeOperations(targets, ranges)
+  if (!collected.ok) return collected
+  if (dryRun) return { ok: true, count: collected.operations.length, message: '已确认可以安全局部替换' }
+  const elements = [...collected.perElement.keys()]
+  const before = elements.map((el) => snapshotNode(el))
+  try {
+    for (const list of collected.perElement.values()) {
+      for (const operation of [...list].sort((a, b) => b.start - a.start)) {
+        const range = operation.el.ownerDocument.createRange()
+        range.setStart(operation.begin.node, operation.begin.offset)
+        range.setEnd(operation.finish.node, operation.finish.offset)
+        range.deleteContents()
+        range.insertNode(operation.el.ownerDocument.createTextNode(replacementText))
+      }
+      list[0].el.setAttribute('data-markset-edited', '1')
+    }
+  } catch {
+    before.forEach(applyShot)
+    return { ok: false, reason: '无法安全替换标记文字，页面保持原样' }
+  }
+  const after = elements.map((el) => snapshotNode(el))
+  recordWebEdit('替换标记文字', before, after)
+  fitHeight()
+  ping()
+  return { ok: true, count: collected.operations.length, message: `已替换 ${collected.operations.length} 处标记文字` }
+}
+
+/**
+ * Delete only the character ranges selected by the brush. This is deliberately
+ * separate from applyBrushDelete: a text element can contain a heading, a
+ * sentence and an unmarked word that must all survive the edit.
+ */
+export function applyBrushTextDeletion(targets, ranges = [], { dryRun = false } = {}) {
+  const collected = collectTextRangeOperations(targets, ranges)
+  if (!collected.ok) return { ...collected, reason: collected.reason === '没有找到可操作的文字范围' ? '没有找到可删除的文字范围' : collected.reason }
+  const { operations, perElement } = collected
+  if (dryRun) return { ok: true, count: operations.length, message: '已确认可以安全删除标记文字' }
+  const elements = [...perElement.keys()]
+  const before = elements.map((el) => snapshotNode(el))
+  try {
+    for (const list of perElement.values()) {
+      for (const operation of [...list].sort((a, b) => b.start - a.start)) {
+        const range = operation.el.ownerDocument.createRange()
+        range.setStart(operation.begin.node, operation.begin.offset)
+        range.setEnd(operation.finish.node, operation.finish.offset)
+        range.deleteContents()
+      }
+      list[0].el.setAttribute('data-markset-edited', '1')
+    }
+  } catch {
+    before.forEach(applyShot)
+    return { ok: false, reason: '无法安全删除标记文字，页面保持原样' }
+  }
+  const after = elements.map((el) => snapshotNode(el))
+  recordWebEdit('删除标记文字', before, after)
+  fitHeight()
+  ping()
+  return { ok: true, count: operations.length, message: `已删除 ${operations.length} 处标记文字` }
+}
+
+export function applyBrushDelete(targets) {
+  const live = []
+  const seen = new Set()
+  for (const target of targets || []) {
+    const el = target?.webId ? findByWebId(target.webId) : null
+    if (!el?.isConnected || isTombstone(el)) return { ok: false, reason: '选中对象已变化，请重新标记；网页未被修改' }
+    if (el === getDoc()?.body || el === getDoc()?.documentElement) return { ok: false, reason: '不能删除整个网页根节点，请选中具体模块' }
+    if (seen.has(el)) continue
+    seen.add(el)
+    live.push(el)
+  }
+  if (!live.length) return { ok: false, reason: '找不到仍在页面上的对象' }
+  // A parent and its child can both be hit by the same stroke. Snapshot and
+  // remove only top-level selected roots so undo cannot duplicate descendants
+  // or pair a different object's snapshot with a surviving tombstone.
+  const roots = live.filter((el) => !live.some((other) => other !== el && other.contains(el)))
+  const before = roots.map((el) => snapshotNode(el))
+  const tombstones = []
+  try {
+    for (const el of roots) {
+      const tombstone = leaveTombstone(el)
+      if (!tombstone) throw new Error('Target detached during deletion')
+      tombstones.push(tombstone)
+    }
+  } catch {
+    before.forEach(applyShot)
+    return { ok: false, reason: '移除失败，整组内容已恢复' }
+  }
+  const after = tombstones.map((el, index) => snapshotNode(el, { removed: true, tombstone: true, webId: before[index]?.webId || el.getAttribute('data-markset-id') || '' }))
+  recordWebEdit('移除内容', before, after)
+  fitHeight()
+  ping()
+  return { ok: true, count: roots.length, message: `已移除 ${roots.length} 个对象` }
+}
+
+export function applyBrushImageReplacement(targets, src) {
+  const url = String(src || '').trim()
+  if (!url) return { ok: false, reason: '请输入图片 URL' }
+  const live = []
+  const seen = new Set()
+  for (const target of targets || []) {
+    const root = target?.webId ? findByWebId(target.webId) : null
+    const el = root?.matches?.('img') ? root : root?.querySelector?.('img')
+    if (!el) return { ok: false, reason: '部分图片对象已不存在；整组没有修改' }
+    if (seen.has(el)) continue
+    seen.add(el)
+    live.push(el)
+  }
+  if (!live.length) return { ok: false, reason: '找不到仍在页面上的图片对象' }
+  const before = live.map((el) => snapshotNode(el))
+  for (const el of live) {
+    el.src = url
+    el.removeAttribute('srcset')
+    el.setAttribute('data-markset-edited', '1')
+  }
+  const after = live.map((el) => snapshotNode(el))
+  recordWebEdit('替换图片', before, after)
+  fitHeight()
+  ping()
+  return { ok: true, count: live.length, message: `已替换 ${live.length} 张图片` }
+}
+
+export function brushOriginalImage(target) {
+  const root = findByWebId(target?.webId)
+  const img = root?.matches('img') ? root : root?.querySelector('img')
+  if (!img) return ''
+  const source = img.currentSrc || img.src
+  // Imported resources are often proxied; rasterizing also captures blob URLs.
+  try {
+    const canvas = img.ownerDocument.createElement('canvas')
+    canvas.width = img.naturalWidth; canvas.height = img.naturalHeight
+    canvas.getContext('2d').drawImage(img,0,0)
+    if (canvas.width && canvas.height) return canvas.toDataURL('image/png')
+  } catch {}
+  if (/^data:image\//u.test(source)) return source
+  try {
+    const url = new URL(source, location.href)
+    if (url.pathname === '/api/asset') return url.searchParams.get('url') || ''
+    if (url.protocol === 'https:' && url.hostname !== location.hostname) return url.href
+  } catch {}
+  return ''
+}
+
+function createEditNodes(doc, specs) {
+  return specs.map((spec) => {
+    const node = doc.createElement(spec.tag)
+    node.setAttribute('data-markset-id', `new-${Date.now()}-${Math.random().toString(36).slice(2,9)}`)
+    if (spec.text) node.textContent = spec.text
+    for (const [name,value] of Object.entries(spec.attributes || {})) node.setAttribute(name,value)
+    if (spec.tag === 'a') { node.setAttribute('rel','noopener'); node.setAttribute('target','_blank') }
+    if (spec.tag === 'button') node.setAttribute('type','button')
+    for (const [property,value] of Object.entries(spec.styles || {})) node.style.setProperty(property,value)
+    if (spec.children?.length) node.append(...createEditNodes(doc,spec.children))
+    return node
+  })
+}
+
+function applyBrushPrimitive(plan) {
+  const doc = getDoc()
+  const elements = (plan.targets || []).map((target) => findByWebId(target.webId))
+  if (!doc || !elements.length || elements.some((el) => !el || el === doc.body || el === doc.documentElement || isTombstone(el))) return { ok:false,reason:'目标组件已经变化或不可修改' }
+  if (plan.type === 'style') {
+    const reason = checkStyleDeclarations(plan.styles)
+    if (reason) return { ok:false,reason }
+    for (const [property,value] of Object.entries(plan.styles)) {
+      if (value && doc.defaultView.CSS?.supports && !doc.defaultView.CSS.supports(property,value)) return { ok:false,reason:`无效CSS值：${property}=${value}` }
+    }
+  }
+  const before = { documentBody:doc.body.innerHTML }
+  try {
+    if (plan.type === 'style') for (const el of elements) for (const [property,value] of Object.entries(plan.styles)) el.style.setProperty(property,value)
+    else {
+      const anchor = findByWebId(plan.insertion?.anchorId)
+      if (!anchor || anchor === doc.body || anchor === doc.documentElement || elements.some((el) => el === anchor || el.contains(anchor))) throw new Error('移动锚点非法或会形成父子循环')
+      if (elements.some((el,i) => elements.some((other,j) => i!==j && el.contains(other)))) throw new Error('移动目标包含重叠的父子节点')
+      if (plan.insertion.placement === 'inside-start') anchor.prepend(...elements)
+      else if (plan.insertion.placement === 'inside-end') anchor.append(...elements)
+      else if (plan.insertion.placement === 'before') anchor.before(...elements)
+      else if (plan.insertion.placement === 'after') anchor.after(...elements)
+      else throw new Error('不支持的移动位置')
+    }
+    if (before.documentBody === doc.body.innerHTML) return { ok:false,reason:'此方案没有产生变化' }
+    recordWebEdit(plan.goal || '局部设计调整',[before],[{documentBody:doc.body.innerHTML}]); fitHeight(); ping()
+    return { ok:true,count:elements.length,message:plan.suggestion?.text || plan.goal || '已调整标记对象' }
+  } catch (error) { applyShot(before); return { ok:false,reason:error.message } }
+}
+
+export function applyBrushInsert(targets, plan) {
+  const doc = getDoc()
+  if (!doc) return { ok: false, reason: '网页尚未加载' }
+  const placement = plan.insertion?.placement || (plan.parameters?.bounds ? 'position' : 'after')
+  if (!['inside-start','inside-end','before','after','position'].includes(placement)) return {ok:false,reason:'插入方式无效'}
+  const anchorId = plan.insertion?.anchorId
+  if (anchorId && !(targets || []).some((target) => target.webId === anchorId) && !plan.allowedAnchorIds?.includes(anchorId)) return { ok: false, reason: '插入锚点不在允许的局部模块内' }
+  const anchor = anchorId ? findByWebId(anchorId) : null
+  if (anchorId && (!anchor || isTombstone(anchor))) return { ok: false, reason: '插入位置已经变化' }
+  if (anchor === doc.body || anchor === doc.documentElement) return { ok: false, reason: '请标记具体模块，不要选择网页根节点' }
+  if (placement !== 'position' && !anchor) return {ok:false,reason:'缺少明确的插入锚点'}
+  const image = plan.contentKind === 'image'
+  const content = String(plan.replacementText || '').trim()
+  if (plan.nodes?.length) { const reason = checkNodeSpecs(plan.nodes); if (reason) return { ok:false,reason } }
+  if (!plan.nodes?.length && (!content || (image && !/^(?:https?:\/\/|data:image\/)/u.test(content)))) return { ok: false, reason: '缺少有效的插入内容' }
+  const el = doc.createElement(plan.nodes?.length ? 'div' : image ? 'img' : 'p')
+  el.setAttribute('data-markset-id', `insert-${Date.now()}-${Math.random().toString(36).slice(2,7)}`)
+  el.setAttribute('data-markset-insert', image ? 'image' : 'text')
+  if (image) { el.src = content; el.alt = plan.goal || '配图'; el.style.cssText = 'display:block;max-width:100%;width:min(100%,640px);height:auto;object-fit:contain;margin:16px 0;border-radius:12px' }
+  else { el.textContent = content; el.style.cssText = 'font:inherit;color:inherit;margin:16px 0;line-height:1.6' }
+  if (plan.nodes?.length) { el.replaceChildren(...createEditNodes(doc,plan.nodes)) }
+  if (plan.styles) {
+    const reason = checkStyleDeclarations(plan.styles)
+    if (reason) return { ok:false,reason }
+    for (const [property,value] of Object.entries(plan.styles)) el.style.setProperty(property,value)
+  }
+  try {
+    if (anchor && placement !== 'position') {
+      if (placement.startsWith('inside-')) {
+        const module = /^(SECTION|ARTICLE|DIV|ASIDE|LI|FIGURE|HEADER|FOOTER|NAV)$/u.test(anchor.tagName) ? anchor : anchor.closest('section,article,div,aside,li,figure')
+        if (!module || module === doc.body || module === doc.documentElement) return { ok: false, reason: '该对象不支持内部插入，请选择模块容器或插在对象前后' }
+        if (placement === 'inside-start') module.prepend(el); else module.append(el)
+      } else if (placement === 'before') anchor.before(el); else anchor.after(el)
+    } else {
+      const box = plan.parameters?.bounds
+      if (!box || ![box.x,box.y,box.w,box.h].every(Number.isFinite) || box.w <= 0 || box.h <= 0) return { ok: false, reason: '插入位置无效' }
+      el.style.position = 'absolute'; el.style.left = `${box.x}px`; el.style.top = `${box.y}px`
+      el.style.width = `${box.w}px`; el.style.maxWidth = `${box.w}px`; el.style.margin = '0'; el.style.boxSizing = 'border-box'
+      // The slot, not the generated image's natural aspect ratio, determines
+      // page geometry. Contain the whole image without pushing it below the box.
+      if (image) {el.style.height=`${box.h}px`;el.style.maxHeight=`${box.h}px`;el.style.objectFit='contain'}
+      doc.body.append(el)
+      // Evidence uses measured document geometry. A positioned/translated body
+      // changes the origin; CSS zoom/scale also changes the measured slot size.
+      // Correct this node only, not the imported page's layout or root styles.
+      const actual=el.getBoundingClientRect(),scroll=iframeScroll()
+      if (actual.width>0 && actual.height>0) {
+        const scaleX=actual.width/box.w,scaleY=actual.height/(image ? box.h : el.offsetHeight || actual.height)
+        el.style.width=`${box.w/scaleX}px`;el.style.maxWidth=el.style.width
+        if (image) {el.style.height=`${box.h/scaleY}px`;el.style.maxHeight=el.style.height}
+        el.style.left=`${box.x+(box.x-actual.left-scroll.x)/scaleX}px`
+        el.style.top=`${box.y+(box.y-actual.top-scroll.y)/scaleY}px`
+      }
+    }
+    const after = snapshotNode(el)
+    recordWebEdit(image ? '添加配图' : '添加内容', [{ ...after, removed: true, absent: true }], [after])
+    fitHeight(); ping()
+    return { ok: true, count: 1, message: image ? '已添加配图' : '已添加内容',insertions:[{stepIndex:0,webId:el.getAttribute('data-markset-id')}] }
+  } catch { el.remove(); return { ok: false, reason: '插入失败，网页没有改变' } }
+}
+
+export function applyBrushPlan(plan, strokes = []) {
+  const targets = plan.targets || []
+  if (plan.type === 'replace') return applyBrushTextReplacement(targets, plan)
+  if (plan.type === 'delete') return plan.targetRanges?.length ? applyBrushTextDeletion(targets,plan.targetRanges) : applyBrushDelete(targets)
+  if (plan.type === 'color') return applyBrushColor(targets,plan.parameters?.color || plan.color || plan.replacementText)
+  if (plan.type === 'style' || plan.type === 'move') return applyBrushPrimitive(plan)
+  if (plan.type === 'insert') return applyBrushInsert(targets,plan)
+  if (plan.type === 'replace-image') return applyBrushImageReplacement(targets,plan.replacementText)
+  if (plan.type === 'reorder') return applyBrushLayoutReorder(targets,strokes,plan.parameters?.direction,plan.parameters?.order,plan.parameters?.targetOrder)
+  if (plan.type !== 'batch') return { ok: false, reason: '不支持的执行方案' }
+  const doc = getDoc(), edits = webEdits
+  if (!doc || !plan.steps?.length) return { ok: false, reason: '缺少分步方案' }
+  const before = { documentBody: doc.body.innerHTML }
+  try {
+    const insertions=[]
+    for (const [stepIndex,step] of plan.steps.entries()) {
+      if (step.type === 'batch') throw new Error('不能嵌套修改组')
+      const result = applyBrushPlan(step, strokes)
+      if (!result.ok) throw new Error(result.reason)
+      insertions.push(...(result.insertions || []).map(item=>({...item,stepIndex})))
+    }
+    const after = { documentBody: doc.body.innerHTML }
+    webEdits = edits
+    recordWebEdit(plan.goal || '组合修改', [before], [after])
+    return { ok: true, count: plan.steps.length, message: `已完成 ${plan.steps.length} 项组合修改`,insertions }
+  } catch (error) {
+    applyShot(before); webEdits = edits; fitHeight(); ping()
+    return { ok: false, reason: `整组已回滚：${error.message}` }
+  }
+}
+
+// Use the SAME executor/undo path in a separate, offscreen document. No preview
+// UI or mutation of the user's document/history, and no model code execution.
+function waitForTrialLayout(signal) {
+  return new Promise((resolve,reject)=>{
+    let first,second,timer
+    const finish = (error) => {
+      clearTimeout(timer); cancelAnimationFrame(first); cancelAnimationFrame(second)
+      signal?.removeEventListener('abort',abort)
+      if (error) reject(error); else resolve()
+    }
+    const abort = () => finish(signal.reason || new DOMException('Cancelled','AbortError'))
+    if (signal?.aborted) return abort()
+    signal?.addEventListener('abort',abort,{once:true})
+    // Background tabs can suspend RAF indefinitely. Measuring forces layout;
+    // this fallback and abort listener ensure no abandoned validation iframe.
+    timer=setTimeout(()=>finish(),120)
+    first=requestAnimationFrame(()=>{second=requestAnimationFrame(()=>finish())})
+  })
+}
+
+export async function verifyBrushPlan(plan, strokes = [], { signal } = {}) {
+  if (!isWebDocActive()) return { ok:false,issues:[{code:'page-not-loaded'}] }
+  const live = frameEl(), original = getDoc(), trial = document.createElement('iframe')
+  trial.setAttribute('sandbox','allow-same-origin')
+  trial.setAttribute('aria-hidden','true'); trial.tabIndex = -1
+  trial.style.cssText = `position:fixed;left:-100000px;top:0;width:${live.clientWidth}px;height:${Math.max(live.clientHeight,640)}px;visibility:hidden;pointer-events:none;border:0`
+  let trialEdits = []
+  const inTrial = (action) => {
+    const previousEdits = webEdits, previousSeq = webEditSeq
+    executionFrame=trial; webEdits=trialEdits
+    try { return action() } finally { trialEdits=webEdits; executionFrame=null; webEdits=previousEdits; webEditSeq=previousSeq }
+  }
+  try {
+    document.body.append(trial)
+    const clone = trial.contentDocument, parsed = new DOMParser().parseFromString(original.documentElement.outerHTML,'text/html')
+    stripExecutableMarkup(parsed)
+    parsed.querySelectorAll('link,iframe,video,audio,source').forEach((node)=>node.remove())
+    parsed.querySelectorAll('img').forEach((img)=>{
+      const source = original.querySelector(`[data-markset-id="${CSS.escape(img.getAttribute('data-markset-id') || '')}"]`)
+      if (source) { const rect=source.getBoundingClientRect(); img.style.width=`${rect.width}px`; img.style.height=`${rect.height}px` }
+      img.removeAttribute('srcset')
+      if (!/^data:image\//u.test(img.getAttribute('src') || '')) img.removeAttribute('src')
+    })
+    // Block network URLs in cloned CSS too, without granting allow-scripts.
+    parsed.querySelectorAll('style').forEach((style)=>{ style.textContent=style.textContent.replace(/@import[^;]+;|url\([^)]*\)/giu,'') })
+    parsed.querySelectorAll('[style]').forEach((node)=>{ node.setAttribute('style',node.getAttribute('style').replace(/url\([^)]*\)/giu,'')) })
+    clone.replaceChild(clone.importNode(parsed.documentElement,true),clone.documentElement)
+    await waitForTrialLayout(signal)
+    signal?.throwIfAborted()
+    const beforeHtml = clone.body.innerHTML, beforeStyle=clone.body.getAttribute('style'), before = measurePlanDocument(clone)
+    const testPlan = structuredClone(plan)
+    const placeholder = 'data:image/svg+xml,'+encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="640" height="360"><rect width="640" height="360" fill="#e6e9ef"/></svg>')
+    for (const step of testPlan.type === 'batch' ? testPlan.steps : [testPlan]) {
+      if (step.imagePrompt && !step.replacementText) step.replacementText=placeholder
+    }
+    const result = inTrial(()=>applyBrushPlan(testPlan,strokes))
+    if (!result.ok) return {ok:false,issues:[{code:'execution-failed',detail:result.reason}],checks:['execution']}
+    await waitForTrialLayout(signal)
+    signal?.throwIfAborted()
+    const report=auditPlanResult(testPlan,before,measurePlanDocument(clone),{insertions:result.insertions})
+    inTrial(()=>undoWebEditsSince())
+    if (clone.body.innerHTML !== beforeHtml || clone.body.getAttribute('style') !== beforeStyle) return planCheckReport([...report.issues,{code:'undo-mismatch'}],{checks:report.checks})
+    report.provisionalImage=Boolean((plan.type === 'batch' ? plan.steps : [plan]).some((step)=>step.imagePrompt && !step.replacementText))
+    return report
+  } catch (error) {
+    if (signal?.aborted) throw error
+    return {ok:false,issues:[{code:'verification-failed',detail:error.message}]}
+  } finally { trial.remove() }
 }

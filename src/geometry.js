@@ -137,6 +137,9 @@ function radialPeakCount(pts) {
 
 export function looksLikeXStroke(pts) {
   if (!pts || pts.length < 8 || !isSelfIntersecting(pts)) return false
+  // A closed lasso can self-intersect because of noisy pointer samples or
+  // retracing. It is selection evidence, never an X/delete command.
+  if (looksLikeEnclosingStroke(pts)) return false
   if (looksLikeStarStroke(pts)) return false
   const box = aabb(pts)
   if (box.w < 16 || box.h < 16) return false
@@ -229,30 +232,46 @@ export function looksLikeRadialBurst(strokes) {
   return innerSpan < outerSpan * 0.58
 }
 
-/** Shaft plus optional arrowhead, or a single long pointing stroke. */
+/** An arrow requires a shaft AND a backwards, angled head near its tip.
+ * A plain pointing line is evidence of direction, not an arrow by itself. */
 export function looksLikeArrowGesture(strokes) {
   const list = (strokes || []).filter((s) => s?.length >= 2)
   if (!list.length || list.length > 6) return false
-  if (looksLikeRadialBurst(list)) return false
-  let best = null
-  for (const s of list) {
-    const len = pathLength(s)
-    const box = aabb(s)
-    const chord = dist(s[0], s[s.length - 1])
-    if (len < 70 || chord < 56) continue
-    if (len > chord * 2.4) continue
-    const aspect = Math.max(box.w, box.h) / Math.max(1, Math.min(box.w, box.h))
-    if (aspect < 1.8) continue
-    if (!best || len > best.len) best = { s, len, chord }
+  function hasHead(start, tip, shaftLength, heads) {
+    const length = dist(start, tip)
+    if (length < 50 || shaftLength > length * 1.25) return false
+    const dx = (tip.x - start.x) / length
+    const dy = (tip.y - start.y) / length
+    const tolerance = Math.max(8, Math.min(18, length * 0.12))
+    return heads.some((head) => {
+      if (pathLength(head) > length * 1.4) return false
+      if (!head.some((p) => dist(p, tip) <= tolerance)) return false
+      return head.some((p) => {
+        const x = p.x - tip.x, y = p.y - tip.y
+        const backwards = -(x * dx + y * dy)
+        const sideways = Math.abs(x * dy - y * dx)
+        const arm = Math.hypot(x, y)
+        return arm >= 8 && arm < length * 0.65 && backwards > 4
+          && sideways > Math.max(4, arm * 0.2) && backwards > arm * 0.25
+      })
+    })
   }
-  if (!best) return false
-  const end = best.s[best.s.length - 1]
-  const heads = list.filter((s) => {
-    if (s === best.s) return false
-    const nearEnd = dist(s[0], end) < 42 || dist(s[s.length - 1], end) < 42
-    return nearEnd && pathLength(s) < best.len * 0.55
-  })
-  return heads.length >= 1 || (list.length <= 2 && best.chord > 90)
+  for (const shaft of list) {
+    // A wide oval has a long, shallow first half and a returning second half;
+    // that is not a shaft plus arrowhead, even when the endpoint overlaps.
+    const start = shaft[0], end = shaft.at(-1)
+    const box = aabb(shaft)
+    if (dist(start, end) < Math.max(box.w, box.h) * 0.6 && looksLikeEnclosingStroke(shaft)) continue
+    // A separate V or one/two head strokes at the end of a straight shaft.
+    if (hasHead(start, end, pathLength(shaft), list.filter((s) => s !== shaft))) return true
+    // A continuous arrow: shaft -> tip -> backwards head. The farthest point
+    // from the start is the tip, not the end of the entire pen trajectory.
+    let tipIndex = 0
+    for (let i = 1; i < shaft.length; i++) if (dist(start, shaft[i]) > dist(start, shaft[tipIndex])) tipIndex = i
+    if (tipIndex > 0 && tipIndex < shaft.length - 1
+      && hasHead(start, shaft[tipIndex], pathLength(shaft.slice(0, tipIndex + 1)), [shaft.slice(tipIndex)])) return true
+  }
+  return false
 }
 
 export function looksLikeUnderlineGesture(strokes) {
@@ -260,16 +279,30 @@ export function looksLikeUnderlineGesture(strokes) {
   if (!list.length || list.length > 3) return false
   if (looksLikeRadialBurst(list) || looksLikeArrowGesture(list)) return false
   return list.every((s) => {
+    if (looksLikeEnclosingStroke(s)) return false
     const box = aabb(s)
     const len = pathLength(s)
     return box.w > 36 && box.w > box.h * 3.2 && len < box.w * 2.2
   })
 }
 
-/** Long stroke that is a line (not a closed lasso, X, or small box). */
-export function looksLikeDrawnLine(pts) {
+// Primitive measurements only: enclosing -> line -> X -> enclosing used to
+// recurse forever on a lasso with a slightly retraced/self-crossing endpoint.
+// Region recognition must never call a classifier that depends on regions.
+function hasStraightOpenGeometry(pts) {
   if (!pts || pts.length < 6) return false
-  if (looksLikeBoxStroke(pts) || looksLikeXStroke(pts)) return false
+  const first = pts[0], last = pts[pts.length - 1]
+  const chord = dist(first, last)
+  if (chord < 40 || pathLength(pts) > chord * 1.12) return false
+  const tolerance = Math.max(5, Math.min(16, chord * 0.04))
+  // Measure perpendicular deviation, not axis-aligned aspect ratio: a
+  // diagonal line spans two quadrants too, but does not enclose a region.
+  return pts.every((p) => Math.abs((last.x-first.x)*(p.y-first.y)-(last.y-first.y)*(p.x-first.x)) / chord <= tolerance)
+}
+
+function hasLineGeometry(pts) {
+  if (!pts || pts.length < 6) return false
+  if (hasStraightOpenGeometry(pts)) return true
   const box = aabb(pts)
   const len = pathLength(pts)
   const chord = dist(pts[0], pts[pts.length - 1])
@@ -281,6 +314,11 @@ export function looksLikeDrawnLine(pts) {
   if (len > chord * 2.6) return false
   if (chord < len * 0.32) return false
   return true
+}
+
+/** Long stroke that is a line (not a closed lasso, X, or small box). */
+export function looksLikeDrawnLine(pts) {
+  return hasLineGeometry(pts) && !looksLikeBoxStroke(pts) && !looksLikeXStroke(pts)
 }
 
 /** Small near-closed square/rectangle, e.g. two boxes drawn before a paragraph. */
@@ -363,9 +401,10 @@ function regionInflate(pts) {
 /** Casual circle / C / incomplete box still counts as a filled region, not a neat rectangle. */
 export function looksLikeEnclosingStroke(pts) {
   if (!pts || pts.length < 6) return false
+  if (hasStraightOpenGeometry(pts)) return false
   const box = aabb(pts)
   if (box.w < 22 || box.h < 16) return false
-  if (looksLikeDrawnLine(pts) && Math.min(box.w, box.h) < 36) return false
+  if (Math.min(box.w, box.h) < 36 && hasLineGeometry(pts)) return false
   const peri = 2 * (box.w + box.h)
   const len = pathLength(pts)
   if (len < peri * 0.24) return false

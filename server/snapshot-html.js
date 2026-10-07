@@ -2,7 +2,7 @@ import { assertPublicUrl } from './safe-url.js'
 
 const VIEW_W = 1180
 const MAX_ASSET = 900_000
-const MAX_ASSETS = 40
+const MAX_ASSETS = 96
 const MAX_DOC = 7_000_000
 const FETCH_MS = 18000
 
@@ -103,23 +103,29 @@ function sanitizeHtml(html) {
     .replace(/<meta[^>]+http-equiv=["']refresh["'][^>]*>/gi, '')
 }
 
-function makeInliner(baseUrl) {
+function makeInliner(baseUrl, assetProxy = '/api/asset') {
   const cache = new Map()
   let used = 0
   const warnings = []
+  function proxyUrl(abs) {
+    if (!assetProxy || !/^https?:\/\//i.test(abs)) return abs
+    return `${assetProxy}?url=${encodeURIComponent(abs)}`
+  }
   async function toData(href, accept) {
     const abs = resolveUrl(href, baseUrl)
     if (!abs) return ''
     if (abs.startsWith('data:') || abs.startsWith('#')) return abs
     if (cache.has(abs)) return cache.get(abs)
-    if (used >= MAX_ASSETS) return abs
+    if (used >= MAX_ASSETS) return proxyUrl(abs)
     cache.set(abs, abs)
     try {
       await assertPublicUrl(abs)
       const { buf, type } = await fetchBuffer(abs, accept)
       if (buf.length > MAX_ASSET) {
-        warnings.push('有的图片或样式太大，未内嵌')
-        return abs
+        warnings.push('有的图片或样式较大，已改用本地资源代理')
+        const proxied = proxyUrl(abs)
+        cache.set(abs, proxied)
+        return proxied
       }
       used += 1
       const mime = guessMime(type, abs)
@@ -127,8 +133,10 @@ function makeInliner(baseUrl) {
       cache.set(abs, data)
       return data
     } catch {
-      warnings.push('有的外部资源被网站拦住了')
-      return abs
+      warnings.push('有的外部资源被网站拦住了，已尝试使用本地资源代理')
+      const proxied = proxyUrl(abs)
+      cache.set(abs, proxied)
+      return proxied
     }
   }
   return { toData, warnings }
@@ -158,8 +166,9 @@ function injectShell(html, baseUrl) {
   return `<!doctype html><html><head>${headBits}</head><body>${cleaned}</body></html>`
 }
 
-export async function buildSnapshotHtml(html, baseUrl) {
-  const inliner = makeInliner(baseUrl)
+export async function buildSnapshotHtml(html, baseUrl, options = {}) {
+  const assetProxy = String(options.assetProxy || '/api/asset').trim()
+  const inliner = makeInliner(baseUrl, assetProxy)
   let doc = injectShell(sanitizeHtml(html).slice(0, 2_500_000), baseUrl)
 
   doc = await replaceAsync(doc, /<link\b[^>]*>/gi, async (m) => {

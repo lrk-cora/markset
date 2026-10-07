@@ -323,7 +323,7 @@ export async function importPageRequest(body, env) {
 
   let snapshotHtml = ''
   try {
-    const snap = await buildSnapshotHtml(html, baseUrl)
+    const snap = await buildSnapshotHtml(html, baseUrl, { assetProxy: body?.assetProxy || '/api/asset' })
     snapshotHtml = snap.html
     warnings.push(...(snap.warnings || []))
   } catch {

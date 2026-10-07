@@ -3,91 +3,196 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>MarkSet · 本地完善</title>
+    <meta name="theme-color" content="#f5f6f8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <title>Markset · 在网页上表达修改</title>
   </head>
   <body>
-    <div class="app">
-      <header class="topbar">
-        <div class="brand">
-          <span class="mark">MarkSet</span>
-          <span class="week">圈画批注后导出网页</span>
+    <div class="app-shell">
+      <header class="topbar app-ui">
+        <div class="brand-lockup">
+          <div class="brand-mark" aria-label="Markset">M</div>
+          <div>
+            <div class="brand-name">Markset</div>
+            <div class="brand-tagline">在已有网页上，画出你的修改意图</div>
+          </div>
         </div>
-        <div class="top-actions">
-          <div class="import-box">
-            <button type="button" id="btn-import-html" class="mode-btn">导入 HTML</button>
-            <button type="button" id="btn-export-html" class="mode-btn">导出网页</button>
-          </div>
-          <div class="import-box select-box">
-            <button type="button" id="btn-lasso" class="mode-btn" aria-pressed="false">圈选</button>
-            <button type="button" id="btn-add" class="mode-btn" aria-pressed="false">加选</button>
-            <button type="button" id="btn-subtract" class="mode-btn" aria-pressed="false">减选</button>
-            <button type="button" id="btn-habits" class="mode-btn">标记偏好</button>
-          </div>
+        <div class="topbar-actions">
+          <button id="btn-import-html" class="button button-quiet" type="button">
+            <span class="button-icon">↥</span> 导入网页
+          </button>
+          <button id="btn-export-html" class="button button-quiet" type="button" disabled>
+            <span class="button-icon">↧</span> 导出
+          </button>
+          <span class="topbar-divider" aria-hidden="true"></span>
+          <button id="btn-undo" class="icon-button" type="button" title="撤销" disabled>↶</button>
+          <button id="btn-redo" class="icon-button" type="button" title="重做" disabled>↷</button>
+          <button id="btn-brush" class="brush-toggle" type="button" aria-pressed="false">
+            <span class="brush-dot"></span><span class="brush-label">开启画笔</span>
+            <kbd>B</kbd>
+          </button>
         </div>
       </header>
 
       <div class="workspace">
-        <main class="stage">
-          <article class="page is-guide" aria-label="用法说明">
-            <p class="kicker" id="page-kicker" hidden></p>
+        <main class="stage" id="stage">
+          <article class="page is-guide" id="page-shell" aria-label="Markset 工作区">
             <section id="start-guide" class="start-guide">
-              <p class="start-kicker">导入网页前</p>
-              <h1>MarkSet 怎么用</h1>
-              <p class="start-lead">圈画批注，判断后改网页，导出去掉标记。</p>
-
-              <h2>基本流程</h2>
-              <ol class="start-steps">
-                <li><strong>导入 HTML</strong></li>
-                <li>画好后点 <strong>开始判断</strong></li>
-                <li>选择操作</li>
-                <li><strong>导出网页</strong></li>
-              </ol>
-
-              <h2>圈选和标记</h2>
-              <ul>
-                <li>偏好记错：<strong>管理偏好</strong> 或 <strong>标记偏好</strong></li>
-                <li><strong>重新框选</strong>：清笔迹再画</li>
-              </ul>
-
-              <h2>快捷键</h2>
-              <dl class="start-keys">
-                <div>
-                  <dt><kbd>Shift</kbd> + 圈</dt>
-                  <dd>加选</dd>
-                </div>
-                <div>
-                  <dt><kbd>Alt</kbd> + 圈</dt>
-                  <dd>减选</dd>
-                </div>
-                <div>
-                  <dt><kbd>Esc</kbd></dt>
-                  <dd>取消当前笔画；再按清空</dd>
-                </div>
-                <div>
-                  <dt><kbd>Backspace</kbd></dt>
-                  <dd>擦上一笔</dd>
-                </div>
-                <div>
-                  <dt><kbd>Ctrl</kbd> / <kbd>⌘</kbd> + <kbd>Z</kbd></dt>
-                  <dd>撤回修改</dd>
-                </div>
-              </dl>
-              <p class="start-note">顶栏「加选」「减选」同快捷键。</p>
+              <p class="eyebrow">MARKSET / EDIT WITH INTENT</p>
+              <h1>把“想怎么改”<br /><em>画在网页上。</em></h1>
+              <p class="guide-lead">导入一个已有网页。开启画笔，圈出对象、画出关系，Markset 会把你的笔迹转成可确认、可撤销的网页修改。</p>
+              <button id="btn-guide-import" class="button button-primary guide-import-button" type="button">
+                <span>导入一个 HTML 网页</span><span class="guide-import-arrow" aria-hidden="true">↗</span>
+              </button>
+              <div class="guide-notes">
+                <span><i class="note-icon">○</i> 圈 / 框　指定对象</span>
+                <span><i class="note-icon">↗</i> 箭头　表达方向</span>
+                <span><i class="note-icon">×</i> 叉　表达替换或移除</span>
+              </div>
             </section>
+            <p class="kicker" id="page-kicker" hidden></p>
             <div id="editor" hidden></div>
             <div id="web-doc-host" class="web-doc-host" hidden>
-              <iframe id="web-doc-frame" class="web-doc-frame" title="导入的网页" sandbox="allow-same-origin"></iframe>
+              <iframe id="web-doc-frame" class="web-doc-frame" title="导入的网页" sandbox="allow-same-origin" scrolling="no"></iframe>
             </div>
           </article>
         </main>
 
-        <aside class="inspector" aria-label="当前篮子">
-          <h2>选中列表</h2>
-          <p class="inspector-lead">用画笔涂过要改的字或图，再在旁边手写一两个字。系统按写下的字推测操作，由你点选。写错可擦掉重写。认不出时仍给通用项。价格、物流不改。</p>
-          <ul id="selection-list" class="selection-list"></ul>
-          <h2>未涂全</h2>
-          <ul id="suggest-list" class="selection-list"></ul>
-          <pre id="inspector-json">{}</pre>
+        <aside class="side-panel app-ui" aria-label="记录与偏好" data-view="home">
+          <div class="side-panel-head">
+            <div class="panel-heading-copy">
+              <p class="eyebrow">WORKSPACE</p>
+              <h2>记录与偏好</h2>
+            </div>
+            <div class="panel-head-actions">
+              <span class="status-pill" id="mode-pill">浏览中</span>
+              <button id="btn-toggle-panel" class="panel-toggle" type="button" aria-expanded="true" title="收起修改工作台">›</button>
+            </div>
+            <nav class="panel-view-nav" aria-label="工作台页面">
+              <button type="button" data-panel-target="history">历史</button>
+              <button type="button" data-panel-target="preferences">偏好</button>
+              <button type="button" data-panel-target="brush">画笔</button>
+              <button type="button" data-panel-target="models">模型状态</button>
+              <button type="button" data-panel-target="agent">Agent 记录</button>
+            </nav>
+          </div>
+          <div class="side-scroll">
+            <section id="empty-state" class="panel-section empty-panel legacy-section">
+              <div class="empty-orb">✎</div>
+              <h3>先浏览，再表达</h3>
+              <p>网页默认可以正常点击和滚动。准备好后，点击顶部的「开启画笔」，在页面上圈出你想改变的部分。</p>
+              <div class="shortcut-tip"><kbd>B</kbd> 开启画笔；顶部按钮退出</div>
+            </section>
+
+            <section id="brush-state" class="panel-section brush-panel legacy-section" hidden>
+              <div class="section-heading"><span class="live-dot"></span><span>画笔已开启</span></div>
+              <p class="panel-copy">圈选对象、画一条箭头，或在空白处框出你想添加的位置。停笔后我会先理解，再给你建议。</p>
+              <div class="gesture-list">
+                <div><span class="gesture glyph-circle">○</span><span><b>圈 / 框</b><small>指定对象或一组内容</small></span></div>
+                <div><span class="gesture glyph-arrow">↗</span><span><b>箭头</b><small>表达移动、排序或关系</small></span></div>
+                <div><span class="gesture glyph-cross">×</span><span><b>叉 / 划掉</b><small>表达替换、删除或排除</small></span></div>
+              </div>
+              <button id="btn-clear-strokes" class="text-button" type="button">清除当前笔迹</button>
+            </section>
+
+            <section id="proposal-section" class="panel-section proposal-section legacy-section" hidden>
+              <div class="section-heading"><span>当前修改</span><span class="analysis-state" id="analysis-state">已理解</span></div>
+              <div id="proposal-confidence" class="confidence-line"></div>
+              <p id="proposal-text" class="proposal-text"></p>
+              <div id="proposal-alternatives" class="alternatives" hidden></div>
+              <div id="replace-editor" class="replace-editor" hidden>
+                <label for="replace-input">替换为</label>
+                <textarea id="replace-input" rows="3" placeholder="输入新的标题或文案…"></textarea>
+                <button id="btn-preview" class="button button-primary button-wide" type="button">生成预览</button>
+              </div>
+              <div id="proposal-actions" class="proposal-actions" hidden>
+                <button id="btn-preview-layout" class="button button-secondary button-wide" type="button" hidden>生成布局预览</button>
+                <button id="btn-apply" class="button button-primary" type="button">确认修改</button>
+                <button id="btn-keep-drawing" class="button button-secondary" type="button">继续画</button>
+                <button id="btn-dismiss" class="text-button" type="button">取消这次修改</button>
+              </div>
+              <div id="proposal-hint" class="proposal-hint"></div>
+            </section>
+
+            <section class="panel-section history-section" id="history-section" hidden>
+              <div class="section-heading"><span>修改历史</span><span id="history-count" class="section-count">0</span></div>
+              <ol id="history-list" class="history-list"></ol>
+            </section>
+            <section class="panel-section preference-section" id="preference-section">
+              <div class="section-heading"><span>用户偏好</span><span class="preference-status" id="preference-status">自动学习中</span></div>
+              <p class="preference-copy">默认行为可调整。开启自动学习后，系统只根据多次成功操作更新习惯。</p>
+              <label class="preference-toggle"><input id="preference-recording" type="checkbox" checked><span>允许系统学习我的操作习惯</span></label>
+              <div class="behavior-settings" aria-label="默认行为设置">
+                <label><span>意图清晰时</span><select id="behavior-clear-action"><option value="direct">直接提供修改</option><option value="preview">先给预览</option></select></label>
+                <label><span>存在歧义时</span><select id="behavior-ambiguous-mode"><option value="choices">优先给选择题</option><option value="input">优先让我输入</option></select></label>
+                <label><span>文字修改范围</span><select id="behavior-text-scope"><option value="marked-range">只改笔迹覆盖范围</option><option value="text-object">改整个文本对象</option></select></label>
+                <label><span>修改策略</span><select id="behavior-edit-style"><option value="minimal">尽量少改动</option><option value="preserve-layout">优先保持原布局</option></select></label>
+              </div>
+              <div id="preference-list" class="preference-list"></div>
+              <button id="btn-clear-behavior" class="text-button preference-clear" type="button">恢复默认并清空学习记录</button>
+              <button id="btn-clear-preferences" class="text-button preference-clear" type="button">清空偏好记录</button>
+            </section>
+            <section class="panel-section brush-settings-section" id="brush-settings-section" hidden>
+              <div class="section-heading"><span>画笔参数</span><button id="btn-reset-brush-settings" class="text-button" type="button">恢复默认</button></div>
+              <div class="brush-preview" aria-label="笔迹效果预览">
+                <svg viewBox="0 0 220 60" aria-hidden="true"><polyline id="brush-preview-line" fill="none" stroke-linecap="round" stroke-linejoin="round"/><circle id="brush-preview-dot" cx="208" cy="28"/></svg>
+                <span>笔迹预览</span>
+              </div>
+              <div class="brush-parameters">
+                <label class="brush-parameter" for="brush-width"><span>笔迹粗细 <output id="brush-width-value" for="brush-width">4.5 px</output></span><input id="brush-width" type="range" min="2" max="24" step="0.5" value="4.5"></label>
+                <div class="brush-parameter brush-color-parameter">
+                  <label for="brush-color">笔迹颜色 <output id="brush-color-value" for="brush-color">#3C6FD4</output></label>
+                  <div class="brush-color-palette" aria-label="常用笔迹颜色">
+                    <button type="button" class="brush-swatch" data-brush-color="#3c6fd4" style="--swatch:#3c6fd4" aria-label="蓝色笔迹" aria-pressed="true"></button>
+                    <button type="button" class="brush-swatch" data-brush-color="#d94c3d" style="--swatch:#d94c3d" aria-label="红色笔迹" aria-pressed="false"></button>
+                    <button type="button" class="brush-swatch" data-brush-color="#2f8f5b" style="--swatch:#2f8f5b" aria-label="绿色笔迹" aria-pressed="false"></button>
+                    <button type="button" class="brush-swatch" data-brush-color="#8758cf" style="--swatch:#8758cf" aria-label="紫色笔迹" aria-pressed="false"></button>
+                    <button type="button" class="brush-swatch" data-brush-color="#182033" style="--swatch:#182033" aria-label="深色笔迹" aria-pressed="false"></button>
+                    <input id="brush-color" type="color" value="#3c6fd4" aria-label="自定义笔迹颜色" title="自定义颜色">
+                  </div>
+                </div>
+              </div>
+              <details class="brush-advanced">
+                <summary>高级设置</summary>
+                <label class="brush-advanced-row" for="brush-smoothing"><span>笔迹平滑</span><select id="brush-smoothing"><option value="none">关闭</option><option value="light" selected>轻度</option><option value="strong">较强</option></select></label>
+                <label class="preference-toggle brush-auto-toggle"><input id="brush-auto-analyze" type="checkbox" checked><span>停笔后自动分析</span></label>
+                <label class="brush-parameter" for="brush-analysis-delay"><span>停笔分析等待 <output id="brush-analysis-delay-value" for="brush-analysis-delay">1.2 秒</output></span><input id="brush-analysis-delay" type="range" min="500" max="3000" step="100" value="1200"></label>
+                <p class="brush-settings-note">关闭后，画完点击「开始分析」。平滑只调整显示，不改变原始笔迹。</p>
+              </details>
+              <p class="brush-settings-note">外观设置用于接下来的笔迹。笔迹颜色不代表修改网页颜色。</p>
+              <p id="brush-settings-storage-status" class="brush-settings-storage" role="status">设置自动保存在当前浏览器</p>
+            </section>
+            <section class="panel-section model-status-section" id="model-status-section" hidden>
+              <div class="section-heading"><span>连接检测</span><button id="btn-check-models" class="text-button" type="button">检测全部</button></div>
+              <p class="diagnostics-copy">轻量检测，约 8 秒内返回。生图只检查连接与模型列表，不生成图片。</p>
+              <div class="model-cards">
+                <article id="model-card-analysis" class="model-card" data-state="unchecked">
+                  <div class="model-card-head"><h3>分析模型</h3><span class="model-state" role="status" aria-live="polite">尚未检测</span></div>
+                  <p class="model-name"></p><p class="model-message"></p>
+                  <div class="model-card-foot"><span class="model-checked"></span><button type="button" class="button button-secondary" data-check-model="analysis">检测</button></div>
+                </article>
+                <article id="model-card-image" class="model-card" data-state="unchecked">
+                  <div class="model-card-head"><h3>生图模型</h3><span class="model-state" role="status" aria-live="polite">尚未检测</span></div>
+                  <p class="model-name"></p><p class="model-message"></p>
+                  <div class="model-card-foot"><span class="model-checked"></span><button type="button" class="button button-secondary" data-check-model="image">检测</button></div>
+                </article>
+              </div>
+              <p class="diagnostics-note">这是一次即时检测，不是持续监控。快速检测超时不代表实际分析一定失败；模型列表可见也不保证每次生图成功。</p>
+            </section>
+            <section class="panel-section agent-record-section" id="agent-record-section" hidden>
+              <div class="section-heading"><span>操作与判断</span><span id="agent-record-count" class="section-count">0</span><button id="btn-clear-agent-records" class="text-button" type="button">清空</button></div>
+              <p class="diagnostics-copy">仅供查看，不会额外发送给模型。只保留本次会话最近 100 条摘要，刷新清空。</p>
+              <ol id="agent-record-list" class="agent-record-list" aria-label="Agent 操作记录"></ol>
+            </section>
+          </div>
+          <div class="side-panel-foot">修改立即生效 · 顶部按钮可撤销</div>
+          <div class="collapsed-rail" aria-label="工作台快捷入口">
+            <button class="rail-icon rail-history" type="button" data-panel-target="history" title="查看修改历史"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4.5 12a7.5 7.5 0 1 0 2.2-5.3"/><path d="M4.5 5.2v4.3h4.3"/><path d="M12 8v4l2.7 1.7"/></svg></button>
+            <button class="rail-icon rail-preference" type="button" data-panel-target="preferences" title="查看用户偏好"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16"/><circle cx="9" cy="6" r="1.8"/><circle cx="15" cy="12" r="1.8"/><circle cx="11" cy="18" r="1.8"/></svg></button>
+            <button class="rail-icon rail-brush" type="button" data-panel-target="brush" title="调整画笔参数" aria-label="调整画笔参数"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m14 4 6 6-8 8-6-6 8-8Z"/><path d="M6 12c-3 0-3 3-3 7 4 0 7 0 7-3"/></svg></button>
+            <button class="rail-icon rail-models" type="button" data-panel-target="models" title="检测模型状态" aria-label="检测模型状态"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 3v5m10-5v5M5 8h14v3a7 7 0 0 1-7 7v3m-7-10a7 7 0 0 0 7 7"/><path d="M9 12h6"/></svg></button>
+            <button class="rail-icon rail-agent" type="button" data-panel-target="agent" title="查看 Agent 分析记录" aria-label="查看 Agent 分析记录"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H9l-6 3V6a2 2 0 0 1 2-2Z"/><path d="M7 9h10M7 13h6"/></svg></button>
+          </div>
         </aside>
       </div>
     </div>
@@ -95,8 +200,29 @@
     <svg id="lasso-layer" class="lasso-layer" aria-hidden="true"></svg>
     <svg id="paint-layer" class="paint-layer" aria-hidden="true"></svg>
     <svg id="ink-layer" class="ink-layer" aria-hidden="true"></svg>
-    <div id="chrome-layer" class="chrome-layer"></div>
-    <div id="toast" class="toast" hidden></div>
+    <div id="ghost-layer" class="ghost-layer" aria-hidden="true"></div>
+    <div id="target-controls-layer" class="target-controls-layer app-ui" role="group" aria-label="选中组件操作"></div>
+    <div id="region-labels-layer" class="region-labels-layer" role="group" aria-label="标记区域序号"></div>
+    <div id="chrome-layer" class="chrome-layer">
+      <section id="inline-proposal" class="inline-proposal app-ui" hidden aria-label="网页修改建议">
+        <div class="inline-proposal-kicker"><span id="inline-status-visual" class="inline-status-visual" aria-hidden="true" hidden></span><span id="inline-proposal-kind">Markset 建议</span><button id="btn-inline-dismiss" class="inline-close" type="button" aria-label="取消当前建议">×</button></div>
+        <p id="inline-proposal-text" class="inline-proposal-text"></p>
+        <p id="inline-analysis-progress" class="inline-analysis-progress" role="status" aria-live="polite" hidden></p>
+        <p id="inline-error-message" class="inline-error-message" role="status" aria-live="polite" hidden></p>
+        <p id="inline-check-warning" class="inline-analysis-progress" role="status" hidden></p>
+        <p id="inline-plan-detail" class="inline-plan-detail" hidden></p>
+        <div id="inline-proposal-alternatives" class="inline-proposal-alternatives" hidden></div>
+        <div class="inline-feedback"><span class="inline-feedback-label">有补充或想调整？</span><div id="inline-custom-intent" class="inline-custom-intent"><input id="inline-custom-intent-input" type="text" placeholder="输入具体要求…" aria-label="补充具体修改要求"><button id="btn-inline-custom-intent" class="inline-custom-submit" type="button">修改</button></div></div>
+        <textarea id="inline-replace-input" class="inline-replace-input" rows="2" placeholder="输入要替换的新内容…" hidden></textarea>
+        <div class="inline-proposal-actions">
+          <button id="btn-analyze-strokes" class="button button-primary" type="button" hidden>开始分析</button>
+          <button id="btn-inline-primary" class="button button-primary" type="button">修改</button>
+          <button id="btn-inline-retry" class="button button-secondary inline-retry" type="button" hidden>重试理解</button>
+          <button id="btn-inline-details" class="button button-secondary" type="button" hidden>返回</button>
+        </div>
+      </section>
+    </div>
+    <div id="toast" class="toast" role="status" hidden></div>
 
     <script type="module" src="/src/main.js"></script>
   </body>

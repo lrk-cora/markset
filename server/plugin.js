@@ -1,6 +1,33 @@
+import dns from 'node:dns'
+import { bailianConfig, publicBailianConfig } from './bailian-config.js'
+import { routeAnalysis } from './model-routing.js'
+import { requestBailianImage } from './bailian-image.js'
+import { brushResponseFormat } from './brush-plan.js'
+import { planningSystem, runPlanningAgent } from './planning-agent.js'
+import { planningTargets } from '../src/edit-capabilities.js'
+import { sampleStrokePoints, initialPlanningEvidence, compactPlanningContext } from '../src/planning-evidence.js'
+import { partialPlanSuggestion } from './model-stream.js'
+import { startAnalysisStream } from './analysis-stream.js'
+import { planningRegionEvidence } from '../src/brush-regions.js'
+import { randomUUID } from 'node:crypto'
+import { requestModelChat } from './model-chat.js'
+import { createModelStatusProbe } from './model-status.js'
+import { downloadGatewayImage, requestGatewayImage } from './image-gateway.js'
+import { createImageJobStore } from './image-jobs.js'
+import { requestFailure, withDeadline } from './retry.js'
+import { imageRequestPolicy, modelRequestPolicy } from '../src/request-policy.js'
+import { analysisIssue } from '../src/analysis-errors.js'
+import { modelTimeoutMetadata, sanitizeModelAttempts } from '../src/model-diagnostics.js'
+import { MAX_PLAN_REPAIRS } from '../src/plan-check-policy.js'
 import { importPageRequest, maybeSmartArrange } from './import-page.js'
+import { assertPublicUrl } from './safe-url.js'
+import { isAnnotationChoice } from '../src/proposal-choices.js'
+
+dns.setDefaultResultOrder('ipv4first')
 
 function send(res, status, body) {
+  if (res.destroyed || res.writableEnded) return
+  if (res.analysisStream) return res.analysisStream.finish(status, body)
   const json = JSON.stringify(body)
   res.statusCode = status
   res.setHeader('Content-Type', 'application/json; charset=utf-8')
@@ -10,8 +37,16 @@ function send(res, status, body) {
 function readBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = []
-    req.on('data', (c) => chunks.push(c))
+    let size = 0, oversized = false
+    req.on('data', (c) => {
+      size += c.length
+      if (size > 32 * 1024 * 1024) {
+        if (!oversized) reject(requestFailure('请求过大，请缩小图片或网页文件', 'request_too_large', 413))
+        oversized = true; chunks.length = 0
+      } else if (!oversized) chunks.push(c)
+    })
     req.on('end', () => {
+      if (oversized) return
       const raw = Buffer.concat(chunks).toString('utf8')
       if (!raw) {
         resolve({})
@@ -20,7 +55,7 @@ function readBody(req) {
       try {
         resolve(JSON.parse(raw))
       } catch {
-        reject(new Error('invalid json'))
+        reject(requestFailure('请求不是有效 JSON', 'invalid_json', 400))
       }
     })
     req.on('error', reject)
@@ -28,6 +63,8 @@ function readBody(req) {
 }
 
 function dashBase(env) {
+  const official = bailianConfig(env)
+  if (official) return official.baseUrl
   return (env.DASHSCOPE_BASE_URL || 'https://dashscope.aliyuncs.com/compatible-mode/v1').replace(
     /\/$/,
     '',
@@ -35,6 +72,8 @@ function dashBase(env) {
 }
 
 function models(env) {
+  const official = bailianConfig(env)
+  if (official) return { rewriteModel: official.brushModel, plannerModel: official.maxModel, ocrModel: official.brushModel, inpaintModel: official.imageModel, t2iModel: official.imageModel }
   return {
     rewriteModel: env.DASHSCOPE_REWRITE_MODEL || 'qwen3.6-flash',
     plannerModel: env.DASHSCOPE_PLANNER_MODEL || 'qwen3-vl-plus',
@@ -44,9 +83,33 @@ function models(env) {
   }
 }
 
-function missing(env) {
+function modelGateway(env) {
+  const official = bailianConfig(env)
+  if (official) return official
   return {
-    dashscope: !env.DASHSCOPE_API_KEY,
+    baseUrl: (env.MARKSET_MODEL_BASE_URL || env.DASHSCOPE_BASE_URL || 'https://dashscope.aliyuncs.com/compatible-mode/v1').replace(/\/$/, ''),
+    apiKey: env.MARKSET_MODEL_API_KEY || env.DASHSCOPE_API_KEY || '',
+    brushModel: env.MARKSET_BRUSH_MODEL || 'gpt-6-sol',
+  }
+}
+
+function imageGateway(env) {
+  const official = bailianConfig(env)
+  if (official) return { ...official, model: official.imageModel, highModel: official.imageProModel }
+  return {
+    baseUrl: (env.MARKSET_IMAGE_BASE_URL || env.MARKSET_MODEL_BASE_URL || 'https://api.jinkundong.store/v1').replace(/\/$/, ''),
+    apiKey: env.MARKSET_IMAGE_API_KEY || env.MARKSET_MODEL_API_KEY || '',
+    model: env.MARKSET_IMAGE_MODEL || 'gpt-image-2.5-sunburst',
+  }
+}
+
+function missing(env) {
+  const gateway = modelGateway(env)
+  const image = imageGateway(env)
+  return {
+    dashscope: !(bailianConfig(env)?.apiKey || env.DASHSCOPE_API_KEY),
+    modelGateway: !gateway.apiKey,
+    imageGateway: !image.apiKey,
   }
 }
 
@@ -56,8 +119,8 @@ function allowModelCalls(env, _req) {
 
 function redact(text, env) {
   let out = String(text || 'api error')
-  const secret = env.DASHSCOPE_API_KEY
-  if (secret && secret.length > 6) out = out.split(secret).join('[redacted]')
+  const secrets = [env.DASHSCOPE_API_KEY, env.MARKSET_MODEL_API_KEY, env.MARKSET_IMAGE_API_KEY, bailianConfig(env)?.apiKey].filter((value) => value && value.length > 6)
+  for (const secret of secrets) out = out.split(secret).join('[redacted]')
   return out
 }
 
@@ -79,7 +142,38 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms))
 }
 
-async function dashChat(env, { model, messages, temperature = 0.2, thinking = 'off' }) {
+async function proxyAsset(req, res, env) {
+  const raw = new URL(req.url || '/', 'http://markset.local').searchParams.get('url') || ''
+  const target = await assertPublicUrl(raw)
+  const ctrl = new AbortController()
+  const timer = setTimeout(() => ctrl.abort(), 18000)
+  try {
+    const upstream = await fetch(target.href, {
+      signal: ctrl.signal,
+      redirect: 'follow',
+      headers: {
+        Accept: 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.5',
+        'User-Agent': 'Mozilla/5.0 (compatible; MarkSetAssetProxy/0.1)',
+      },
+    })
+    if (upstream.url && upstream.url !== target.href) await assertPublicUrl(upstream.url)
+    if (!upstream.ok) throw new Error(`upstream ${upstream.status}`)
+    const type = upstream.headers.get('content-type') || 'application/octet-stream'
+    if (!/^image\//i.test(type) && !/^font\//i.test(type)) throw new Error('unsupported asset type')
+    const buf = Buffer.from(await upstream.arrayBuffer())
+    if (buf.length > 4_000_000) throw new Error('asset too large')
+    res.statusCode = 200
+    res.setHeader('Content-Type', type)
+    res.setHeader('Cache-Control', 'public, max-age=3600')
+    res.setHeader('Access-Control-Allow-Origin', '*')
+    res.end(buf)
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+async function dashChat(env, { model, messages, temperature = 0.2, thinking = 'off', signal }) {
+  if (bailianConfig(env)) return modelChat(env, { model, messages, temperature, signal })
   const body = {
     model,
     temperature,
@@ -88,6 +182,7 @@ async function dashChat(env, { model, messages, temperature = 0.2, thinking = 'o
   if (thinking === 'off') body.enable_thinking = false
   const res = await fetch(`${dashBase(env)}/chat/completions`, {
     method: 'POST',
+    signal,
     headers: {
       Authorization: `Bearer ${env.DASHSCOPE_API_KEY}`,
       'Content-Type': 'application/json',
@@ -107,6 +202,167 @@ async function dashChat(env, { model, messages, temperature = 0.2, thinking = 'o
     throw err
   }
   return textOut
+}
+
+async function modelChat(env, { model, messages, temperature = 0, maxTokens = 1200, signal, structured = false, onResponse, onAttempt, onRetry, onDelta, onStart, stream = false, tools, retries, returnMessage = false }) {
+  const gateway = modelGateway(env)
+  return requestModelChat({
+    ...gateway, ...modelRequestPolicy(env), model: model || gateway.brushModel, messages, temperature, maxTokens, signal, onResponse, onAttempt, onRetry, onDelta, onStart, stream, returnMessage, ...(retries == null ? {} : { retries }),
+    // Native function arguments carry the schema during Agent turns. Avoid
+    // simultaneously constraining assistant content to JSON and tool calls.
+    requestOptions: { ...(gateway.chatOptions || {}), ...(structured && !tools?.length ? { response_format: brushResponseFormat } : {}), ...(tools ? { tools,tool_choice:'auto' } : {}) },
+  })
+}
+
+function parseJsonObject(raw) {
+  const text = String(raw || '').trim().replace(/^```json\s*/i, '').replace(/```$/i, '').trim()
+  const start = text.indexOf('{')
+  const end = text.lastIndexOf('}')
+  if (start < 0 || end <= start) throw new Error('model did not return JSON')
+  return JSON.parse(text.slice(start, end + 1))
+}
+
+function normalizeBounds(value) {
+  if (!value || !Number.isFinite(Number(value.x)) || !Number.isFinite(Number(value.y))) return null
+  const w = Math.max(0, Math.min(4000, Number(value.w) || 0))
+  const h = Math.max(0, Math.min(4000, Number(value.h) || 0))
+  return { x: Number(value.x), y: Number(value.y), w, h }
+}
+
+export async function brushIntent(env, payload, { signal, onRawOutput, onProgress } = {}) {
+  const gateway = modelGateway(env)
+  const targets = planningTargets(Array.isArray(payload.targets) ? payload.targets.slice(0,24) : [], payload.observation)
+  const strokes = Array.isArray(payload.strokes) ? payload.strokes.slice(0, 12) : []
+  const regions = planningRegionEvidence(Array.isArray(payload.regions) ? payload.regions : [], targets.filter(target => target.selected !== false), strokes)
+  const regionNumbers = new Map(regions.flatMap(region => region.targetIds.map(id => [id, region.number])))
+  const images = Array.isArray(payload.imageDataUrls) ? payload.imageDataUrls.filter(Boolean).slice(0, 3) : []
+  const pageText = String(payload.pageText || '').slice(0, 5000)
+  const userInstruction = String(payload.userInstruction || '').trim().slice(0, 1000)
+  const preferences = Array.isArray(payload.preferences) ? payload.preferences.map((item) => String(item).trim().slice(0, 180)).filter(Boolean).slice(0, 8) : []
+  const behaviorMemory = payload.behaviorMemory && typeof payload.behaviorMemory === 'object'
+    ? {
+      profile: payload.behaviorMemory.profile || {},
+      profileSources: payload.behaviorMemory.profileSources || {},
+      memories: Array.isArray(payload.behaviorMemory.memories) ? payload.behaviorMemory.memories.slice(0, 8) : [],
+      recentEpisodes: Array.isArray(payload.behaviorMemory.recentEpisodes) ? payload.behaviorMemory.recentEpisodes.slice(0, 6) : [],
+      learningEnabled: payload.behaviorMemory.learningEnabled !== false,
+    }
+    : null
+  // Stable system/tool prefix is cache-friendly. Per-operation preferences and
+  // page evidence belong in context, not a rewritten system message each turn.
+  const instruction = planningSystem
+  const context = {
+    coordinateSpace: 'web-document',
+    imageNotes: '图片依次为带笔迹的整页缩略图、标记区域放大图。蓝底白字角标为与用户界面一致的区域序号，不是网页内容或手写笔迹。数值坐标为原网页 CSS 像素，不是缩放后图片像素。',
+    regions,
+    strokes: strokes.map((stroke) => ({
+      id:stroke.id || '',closed:Boolean(stroke.closed),role:stroke.role || '',
+      shape: stroke.shape || '',
+      points:sampleStrokePoints(stroke.documentPoints || stroke.points),
+      viewportPoints:sampleStrokePoints(stroke.points),
+    })),
+    targets: targets.filter((target) => target.selected !== false).map((target) => ({
+      webId: target.webId,
+      regionNumber: regionNumbers.get(String(target.webId)) || null,
+      selected: target.selected !== false, related: Boolean(target.related),
+      kind: target.kind,
+      text: String(target.text || '').slice(0, 600),
+      textTruncated: Boolean(target.textTruncated),
+      textLength: Number(target.textLength || String(target.text || '').length),
+      rect: target.documentRect || target.screenRect || null,
+      viewportRect: target.screenRect || null,
+      documentRect: target.documentRect || null,
+      context: target.context || null,
+      charRects: Array.isArray(target.charRects) ? target.charRects.slice(0, 1200).map((item) => ({ index: item.index, char: item.char, rect: item.documentRect || item.screenRect || null })) : [],
+      textFragments: Array.isArray(target.textFragments) ? target.textFragments.slice(0, 20) : [],
+      markedRanges: Array.isArray(target.markedRanges) ? target.markedRanges.slice(0, 20) : [],
+    })),
+    pageText,
+    userInstruction,
+    localEvidence: payload.localInterpretation?.evidence || null,
+    moduleCatalog: payload.observation?.modules || [],
+    initialEvidence: initialPlanningEvidence(payload.observation),
+    strokeEndpoints: payload.observation?.strokeEndpoints || [],
+    answeredClarifications: payload.answeredClarifications || [],
+    evidence: payload.evidence || null,
+    preferences,
+    behaviorMemory,
+  }
+  // The system message already contains these rules. Duplicating them in the
+  // user message increases vision-request latency without adding evidence.
+  const compactContext = compactPlanningContext(context)
+  const content = [{ type: 'text', text: `上下文 JSON：${JSON.stringify(compactContext)}` }]
+  for (const url of images) content.push({ type: 'image_url', image_url: { url } })
+  const routing = gateway.provider === 'bailian' ? routeAnalysis(payload, gateway) : { model: gateway.brushModel, tier: 'default', reason: '既有配置' }
+  const startedAt = Date.now()
+  let retriesUsed = 0, progressTrace=[], usage = null
+  const timings = { modelRequests: 0, modelAttempts: 0, upstreamMs: 0, readToolCalls: 0, serverMs: 0, attempts: [] }
+  timings.evidenceChars = JSON.stringify(compactContext).length
+  timings.originalEvidenceChars = JSON.stringify(context).length
+  const notify = value => { if (!signal?.aborted) onProgress?.(value) }
+  const retryBudget=Number.isInteger(payload.retryBudget) ? Math.max(0,Math.min(2,payload.retryBudget)) : 2
+  try {
+    const result = await withDeadline((totalSignal) => runPlanningAgent({
+      targets, observation:payload.observation, fallback:payload.localInterpretation, instruction:userInstruction,
+      answered:payload.answeredClarifications || [], signal:totalSignal, repairFeedback:payload.repairFeedback,repairsUsed:payload.repairsUsed,
+      onProgress:(trace)=>{
+        progressTrace=trace
+        const last = trace.at(-1)
+        if (last?.stage === 'observe') notify({ stage:'observe', draftSummary:'' })
+        if (last?.stage === 'repair') notify({ stage:'repair', draftSummary:'' })
+      },
+      messages:[{role:'system',content:instruction},{role:'user',content}],
+      chat:async (messages,{tools}) => {
+        timings.modelRequests++
+        const request = timings.modelRequests
+        let lastSummary = '', firstSummary = false, lastPublished = 0
+        const message = await modelChat(env, { model:routing.model,structured:gateway.provider === 'bailian',returnMessage:true,tools,
+          // Observe useful progress even for JSON clients; UI streaming is an
+          // independent choice and never changes the upstream timeout semantics.
+          stream:true,
+          onStart:()=>{ lastSummary=''; lastPublished=0; notify({stage:payload.repairFeedback || progressTrace.some(item=>item.stage==='repair') ? 'repair' : 'planning',draftSummary:''}) },
+          onDelta:({content,toolCalls})=>{
+            const proposal = toolCalls.find(call=>call.function.name === 'propose_edit')
+            // Mixed read/write turns are rejected; don't present their draft.
+            if (toolCalls.length > 1) return notify({stage:'observe',draftSummary:''})
+            const summary = partialPlanSuggestion(proposal?.function.arguments || (!toolCalls.length ? content : ''))
+            if (summary.length < 6 || summary === lastSummary) return
+            if (lastSummary && Date.now()-lastPublished < 100 && summary.length-lastSummary.length < 12) return
+            lastSummary=summary; lastPublished=Date.now()
+            if (!firstSummary) { firstSummary=true; timings.firstSummaryMs ??= Date.now()-startedAt }
+            notify({stage:'draft',draftSummary:summary})
+          },
+          retries:Math.max(0,retryBudget-retriesUsed),onRetry:()=>{retriesUsed++; notify({stage:'retry',retry:retriesUsed,draftSummary:''})},
+          onAttempt:(attempt)=>{
+            timings.modelAttempts++; timings.upstreamMs+=attempt.elapsedMs
+            timings.attempts = sanitizeModelAttempts([...timings.attempts, { request, ...attempt }])
+          },
+          onResponse:(value)=>{
+            if (value.usage) {
+              usage ||= { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
+              for (const key of Object.keys(usage)) usage[key]+=Number(value.usage[key]) || 0
+            }
+          },
+          temperature:0,maxTokens:routing.tier === 'max' ? 4000 : 2200,signal:totalSignal,messages })
+        if (!message.tool_calls?.some(call=>call.function.name !== 'propose_edit')) {
+          const summary=partialPlanSuggestion(message.tool_calls?.[0]?.function.arguments || message.content)
+          if (summary) { timings.firstSummaryMs ??= Date.now()-startedAt; notify({stage:'draft',draftSummary:summary}) }
+        }
+        if (message.content) onRawOutput?.(message.content)
+        return message
+      },
+    }),{signal,timeoutMs:modelRequestPolicy(env).timeoutMs,timeoutError:requestFailure('AI规划达到总时限','model_total_timeout',504,
+      {timeoutSource:'local',timeoutStage:'total',timeoutMs:modelRequestPolicy(env).timeoutMs})})
+    timings.readToolCalls = result.toolCalls || 0
+    timings.serverMs = Date.now()-startedAt
+    return { ...result, model:routing.model,routing,elapsedMs:timings.serverMs,retriesUsed,usage,timings }
+  } catch (error) {
+    error.trace ||= progressTrace
+    timings.serverMs = Date.now()-startedAt
+    timings.readToolCalls = error.trace.filter(stage=>stage.stage==='observe').length
+    Object.assign(error, { model: routing.model, routing, elapsedMs: timings.serverMs, retriesUsed, timings })
+    throw error
+  }
 }
 
 function modelUnavailable(err) {
@@ -451,15 +707,7 @@ async function plan(env, payload) {
 
 async function inlineImage(url) {
   if (!url || String(url).startsWith('data:')) return url
-  const res = await fetch(url)
-  if (!res.ok) {
-    const err = new Error('万相结果图下载失败')
-    err.status = 502
-    throw err
-  }
-  const buf = Buffer.from(await res.arrayBuffer())
-  const mime = res.headers.get('content-type') || 'image/png'
-  return `data:${mime};base64,${buf.toString('base64')}`
+  return downloadGatewayImage(url)
 }
 
 function wanxError(body, fallback) {
@@ -552,7 +800,7 @@ async function wanxInpaint(env, { model, prompt, imageUrl, maskUrl }) {
   })
 }
 
-async function enrichImagePrompt(env, payload) {
+async function enrichImagePrompt(env, payload, { signal } = {}) {
   const prompt = String(payload.prompt || '').trim()
   const pageContext = String(payload.pageContext || '').trim()
   const images = collectPayloadImages({
@@ -581,15 +829,31 @@ async function enrichImagePrompt(env, payload) {
   ]
   for (const url of images) content.push({ type: 'image_url', image_url: { url } })
   try {
-    const out = await dashChat(env, {
-      model: plannerModel,
-      temperature: 0.4,
-      messages: [{ role: 'user', content }],
-    })
+    const out = env.DASHSCOPE_API_KEY
+      ? await dashChat(env, {
+          model: plannerModel,
+          temperature: 0.4,
+          signal,
+          messages: [{ role: 'user', content }],
+        })
+      : await modelChat(env, {
+          model: modelGateway(env).brushModel,
+          temperature: 0.2,
+          maxTokens: 1000,
+          signal,
+          messages: [
+            {
+              role: 'system',
+              content: '你是网页配图提示词整理器。只输出适合图片生成模型的简洁提示词，不要解释。保留用户明确要求，结合网页上下文补足主体、构图、风格和配色。',
+            },
+            { role: 'user', content },
+          ],
+        })
     return String(out || prompt)
       .trim()
       .slice(0, 1200) || prompt
   } catch {
+    signal?.throwIfAborted()
     return [prompt, pageContext].filter(Boolean).join('\n').slice(0, 1200)
   }
 }
@@ -639,7 +903,46 @@ async function generateWanxImage(env, payload) {
   return { imageUrl: await inlineImage(url), model }
 }
 
-async function inpaint(env, payload) {
+async function generateImage(env, payload, { requestId, taskId, onTask, model, region } = {}) {
+  const official = bailianConfig(env)
+  if (official && region && region !== official.region) throw requestFailure('原图片任务属于另一地域，禁止跨地域查询或重新提交', 'image_region_conflict', 409)
+  if (official) return requestBailianImage({ config: model ? { ...official, imageModel: model, imageProModel: model } : official, payload, taskId, onTask, ...imageRequestPolicy(env) })
+  const rawPrompt = String(payload.prompt || '').trim()
+  if (!rawPrompt) {
+    const err = new Error('请先描述要生成的图片')
+    err.status = 400
+    err.code = 'missing_prompt'
+    throw err
+  }
+  const policy = imageRequestPolicy(env)
+  const deadlineError = requestFailure('图片准备超时，尚未提交生成任务', 'image_timeout', 504)
+  return withDeadline(async (signal) => {
+    const prompt = await enrichImagePrompt(env, payload, { signal })
+    signal.throwIfAborted()
+    return requestGatewayImage({
+      ...imageGateway(env), ...policy, prompt, size: pickOpenAiImageSize(payload.width, payload.height),
+      quality: env.MARKSET_IMAGE_QUALITY || 'medium', requestId, signal, deadlineError,
+    })
+  }, { timeoutMs: policy.timeoutMs, timeoutError: deadlineError })
+}
+
+function pickOpenAiImageSize(w, h) {
+  const width = Number(w) || 0
+  const height = Number(h) || 0
+  if (!width || !height) return '1024x1024'
+  const ratio = width / height
+  if (ratio >= 1.45) return '1536x1024'
+  if (ratio <= 0.7) return '1024x1536'
+  return '1024x1024'
+}
+
+async function inpaint(env, payload, options = {}) {
+  if (bailianConfig(env)) {
+    // Qwen Image 3.0 uses original-image + instruction editing, not a hard mask
+    // API. Never silently ignore a supplied mask or switch to another provider.
+    if (payload.maskDataUrl || payload.mask_url) throw requestFailure('千问图像 3.0 不支持硬蒙版接口；请使用原图和具体编辑描述', 'image_mask_unsupported', 400)
+    return generateImage(env, { ...payload, imageDataUrl: payload.imageDataUrl || payload.image_url, mode: 'edit', replaceExisting: true }, options)
+  }
   const { inpaintModel } = models(env)
   const prompt = String(payload.prompt || '').trim() || '按标注修改选中区域，其余画面保持不变'
   const imageUrl = payload.imageDataUrl || payload.image_url
@@ -665,29 +968,64 @@ async function inpaint(env, payload) {
   return { imageUrl: resultUrl, model: inpaintModel }
 }
 
-export function marksetApi(env) {
+export function marksetApi(env, { imageJobs: suppliedJobs } = {}) {
+  const official = bailianConfig(env)
+  const imageJobs = suppliedJobs || createImageJobStore(official ? { ttlMs: 24 * 3600_000, ledgerFile: '.markset-private/image-tasks.json' } : {})
+  const lastCalls = { analysis: null, image: null }
+  const gateway = modelGateway(env)
+  const checkModels = createModelStatusProbe({
+    analysis: { ...gateway, model: gateway.brushModel, highModel: gateway.maxModel }, image: imageGateway(env),
+    allowCalls: env.MARKSET_ALLOW_MODEL_CALLS === '1', listOnly: Boolean(official), lastCalls, fetchImpl: (...args) => fetch(...args),
+  })
   return {
     name: 'markset-api',
     configureServer(server) {
       server.middlewares.use(async (req, res, next) => {
         const url = req.url?.split('?')[0] || ''
         if (!url.startsWith('/api/')) return next()
+        const isImageRequest = ['/api/generate-image', '/api/inpaint'].includes(url)
+        const imageId = isImageRequest ? req.headers['idempotency-key'] : ''
+        const validImageId = typeof imageId === 'string' && /^[\w.-]{1,128}$/u.test(imageId)
+        const requestId = url === '/api/brush-intent' || isImageRequest ? validImageId ? imageId : randomUUID() : ''
+        const startedAt = Date.now()
+        if (requestId) res.setHeader('X-Request-Id', requestId)
+        const analysisController = new AbortController()
+        if (url === '/api/brush-intent') res.once('close', () => {
+          if (!res.writableEnded) analysisController.abort(new DOMException('Client disconnected', 'AbortError'))
+        })
 
         try {
+          if (imageId && !validImageId) throw requestFailure('图片请求标识无效', 'image_invalid_request_id', 400)
           if (req.method === 'GET' && url === '/api/health') {
             const miss = missing(env)
+            const image = imageGateway(env)
             send(res, 200, {
-              ok: !miss.dashscope,
+              ok: !miss.dashscope || !miss.modelGateway || !miss.imageGateway,
               dashscope: !miss.dashscope,
+              modelGateway: !miss.modelGateway,
+              imageGateway: !miss.imageGateway,
               wanx: !miss.dashscope,
+              imageGeneration: Boolean(image.apiKey),
+              imageModel: image.model,
               fal: false,
               sam: false,
               allowCalls: env.MARKSET_ALLOW_MODEL_CALLS === '1',
               importPage: true,
               renderedImport: Boolean(env.BROWSERLESS_API_KEY || env.BROWSERLESS_TOKEN),
               ...models(env),
-              hints: keyHints(env),
+              brushModel: modelGateway(env).brushModel,
+              retryPolicy: { analysis: {...modelRequestPolicy(env),planRepairs:MAX_PLAN_REPAIRS}, image: imageRequestPolicy(env) },
+              hints: keyHints(env), ...publicBailianConfig(official), lastCalls,
             })
+            return
+          }
+
+          if (req.method === 'GET' && url === '/api/asset') {
+            try {
+              await proxyAsset(req, res, env)
+            } catch (err) {
+              send(res, err.status || 502, { error: err.message || 'asset proxy failed', code: err.code || 'asset_proxy' })
+            }
             return
           }
 
@@ -699,8 +1037,23 @@ export function marksetApi(env) {
           const body = await readBody(req)
           const miss = missing(env)
 
+          if (url === '/api/model-status') {
+            send(res, 200, await checkModels(body.target || 'all'))
+            return
+          }
+
+          if (url === '/api/model-test') {
+            if (!allowModelCalls(env, req)) throw requestFailure('模型调用已关闭', 'calls_disabled', 403)
+            const start = Date.now()
+            await modelChat(env, { messages: [{ role: 'user', content: '只回答OK' }], maxTokens: 16 })
+            lastCalls.analysis = { model: gateway.brushModel, succeededAt: Date.now(), elapsedMs: Date.now() - start }
+            send(res, 200, lastCalls.analysis); return
+          }
+
           if (url === '/api/import-page') {
-            let page = await importPageRequest(body, env)
+            const proto = String(req.headers['x-forwarded-proto'] || 'http').split(',')[0].trim()
+            const host = String(req.headers.host || 'localhost:5173')
+            let page = await importPageRequest({ ...body, assetProxy: `${proto}://${host}/api/asset` }, env)
             if (body?.smart) {
               if (!allowModelCalls(env, req)) {
                 page.warnings = [
@@ -721,6 +1074,22 @@ export function marksetApi(env) {
               }
             }
             send(res, 200, page)
+            return
+          }
+
+          if (url === '/api/brush-intent') {
+            if (!allowModelCalls(env, req)) {
+              send(res, 403, { error: 'model calls disabled', code: 'calls_disabled' })
+              return
+            }
+            if (miss.modelGateway) {
+              send(res, 503, { error: 'missing model gateway key', code: 'missing_model_key' })
+              return
+            }
+            const emit = req.headers.accept?.includes('text/event-stream') ? startAnalysisStream(res) : null
+            const result = await brushIntent(env, body, { signal: analysisController.signal, onProgress:emit ? progress=>emit('progress',progress) : undefined })
+            lastCalls.analysis = { model: result.model, succeededAt: Date.now(), elapsedMs: result.elapsedMs, retriesUsed: result.retriesUsed }
+            send(res, 200, result)
             return
           }
 
@@ -759,16 +1128,24 @@ export function marksetApi(env) {
               send(res, 503, { error: 'missing DASHSCOPE_API_KEY' })
               return
             }
-            send(res, 200, await inpaint(env, body))
+            const result = await imageJobs.run(requestId, { ...body, endpoint: 'inpaint' }, (recovery = {}) => inpaint(env, body, { requestId, ...recovery }))
+            lastCalls.image = { model: result.model, succeededAt: Date.now(), elapsedMs: result.elapsedMs, taskId: result.taskId }
+            send(res, 200, { ...result, requestId })
             return
           }
 
           if (url === '/api/generate-image') {
-            if (miss.dashscope) {
-              send(res, 503, { error: 'missing DASHSCOPE_API_KEY' })
+            if (!miss.imageGateway) {
+              const result = await imageJobs.run(requestId, body, (recovery = {}) => generateImage(env, body, { requestId, ...recovery }))
+              lastCalls.image = { model: result.model, succeededAt: Date.now(), elapsedMs: result.elapsedMs, taskId: result.taskId }
+              send(res, 200, { ...result, requestId })
               return
             }
-            send(res, 200, await generateWanxImage(env, body))
+            if (!miss.dashscope) {
+              send(res, 200, await imageJobs.run(requestId, body, () => generateWanxImage(env, body)))
+              return
+            }
+            send(res, 503, { error: 'missing image generation key', code: 'missing_image_key' })
             return
           }
 
@@ -779,6 +1156,26 @@ export function marksetApi(env) {
 
           send(res, 404, { error: 'not found' })
         } catch (err) {
+          if (isImageRequest) {
+            console.warn('[markset image]', JSON.stringify({ requestId, code: err.code || 'image_failed', status: err.status || 500, elapsedMs: Date.now() - startedAt }))
+            send(res, err.status || 500, { error: redact(err.message, env), code: err.code || 'image_failed', requestId, ambiguous: Boolean(err.ambiguous), taskId: err.taskId || '', providerCode: err.providerCode || '' })
+            return
+          }
+          if (requestId) {
+            const status = err.status || 500
+            const timeout = modelTimeoutMetadata(err)
+            const issue = analysisIssue({ code: err.code, status, reason:err.reason,repairsUsed:err.repairsUsed, ...timeout })
+            console.warn('[markset brush-intent]', JSON.stringify({
+              requestId, code: issue.code, status, upstreamStatus: err.upstreamStatus || null,
+              causeCode: err.causeCode || '', elapsedMs: Date.now() - startedAt,
+              model: err.model || '', retriesUsed: err.retriesUsed || 0,
+              ...timeout, attempts: sanitizeModelAttempts(err.timings?.attempts),
+            }))
+            send(res, status, { error: issue.message, code: issue.code, requestId, model: err.model || '',
+              routing: err.routing || null, retriesUsed: err.retriesUsed || 0, elapsedMs: err.elapsedMs || Date.now() - startedAt,
+              reason:err.reason || '',repairsUsed:err.repairsUsed || 0,trace:err.trace?.slice(-12) || [],timings:err.timings || null, ...timeout })
+            return
+          }
           send(res, err.status || 500, { error: redact(err.message, env), code: err.code })
         }
       })

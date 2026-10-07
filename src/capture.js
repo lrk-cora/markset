@@ -3,8 +3,40 @@ import { loadImageEl } from './mask.js'
 import { getSnapshot } from './store.js'
 import { getInkStrokes, inkToDataUrl } from './ink.js'
 import { getPaintMarks, lastPaintPoints } from './overlay.js'
-import { describeCircledHits, insertHostScreenBox, isWebDocActive } from './web-doc.js'
+import { displayStrokePoints, drawCanvasStroke } from './stroke-render.js'
+import { drawBrushRegionNumbers } from './brush-regions.js'
+import { describeCircledHits, insertHostScreenBox, isWebDocActive, screenToWebDocumentPoint } from './web-doc.js'
 import { habitForShape, habitForStroke, habitGuess, listMarkFingerprints, shapeTitle } from './symbol-habits.js'
+import { createRevisionCache } from './revision-cache.js'
+import { pageEvidenceVersion, pageEvidenceCacheable } from './page-evidence-version.js'
+import { runAnalysisTask } from './analysis-task.js'
+
+let plannerBase = null
+function plannerPage() {
+  const iframe = document.getElementById('web-doc-frame')
+  const host = document.getElementById('web-doc-host')
+  const imported = Boolean(iframe?.contentDocument?.body && host && !host.hidden)
+  const root = imported ? iframe.contentDocument.documentElement : document.querySelector('.page')
+  return { root, doc: imported ? iframe.contentDocument : document, imported }
+}
+
+/** Local-only warmup: no ink snapshot, UI change, model call or edit. */
+export async function warmAnnotationBase() {
+  const page = plannerPage()
+  if (!page.root) return { value: '', cacheHit: false, buildMs: 0 }
+  if (plannerBase?.root !== page.root) {
+    plannerBase = { root: page.root, cache: createRevisionCache({
+      version: () => pageEvidenceVersion(page.doc, page.root),
+      cacheable: () => pageEvidenceCacheable(page.doc),
+      // Abandoned/hung captures cannot poison the shared in-flight entry.
+      produce: () => runAnalysisTask(() => page.imported
+        ? captureImportedPage({ quality: 0.86, pixelRatio: 1.1 }) : captureDemoPage(), { timeoutMs: 7_000 }),
+    }) }
+  }
+  return plannerBase.cache.get()
+}
+
+export function clearAnnotationBaseCache() { plannerBase?.cache.clear(); plannerBase = null }
 
 function markLine(span) {
   const id = span.markId ? `#${String(span.markId).replace(/^#/, '')}` : '(no-id)'
@@ -72,21 +104,38 @@ function importedPageText() {
     .slice(0, 4000)
 }
 
-function drawStrokes(ctx, points, color, width, frame, scaleX, scaleY) {
-  if (!points || points.length < 2 || !frame) return
-  ctx.beginPath()
-  ctx.moveTo((points[0].x - frame.left) * scaleX, (points[0].y - frame.top) * scaleY)
-  for (let i = 1; i < points.length; i += 1) {
-    ctx.lineTo((points[i].x - frame.left) * scaleX, (points[i].y - frame.top) * scaleY)
+function importedImageSpace(image) {
+  const iframe = document.getElementById('web-doc-frame')
+  const doc = iframe?.contentDocument
+  if (!doc?.body || !iframe || !image) return null
+  const root = doc.documentElement
+  const cssWidth = Math.max(root?.scrollWidth || 0, doc.body?.scrollWidth || 0, iframe.clientWidth || 1)
+  const cssHeight = Math.max(root?.scrollHeight || 0, doc.body?.scrollHeight || 0, iframe.clientHeight || 1)
+  return {
+    cssWidth,
+    cssHeight,
+    scaleX: (image.naturalWidth || image.width) / cssWidth,
+    scaleY: (image.naturalHeight || image.height) / cssHeight,
+    toImagePoint(point) {
+      const docPoint = screenToWebDocumentPoint(point)
+      return { x: docPoint.x * this.scaleX, y: docPoint.y * this.scaleY }
+    },
   }
-  ctx.strokeStyle = color
-  ctx.lineWidth = width
-  ctx.lineCap = 'round'
-  ctx.lineJoin = 'round'
-  ctx.stroke()
 }
 
-async function compositePageAndStrokes(pageDataUrl) {
+function drawImageSpaceStrokes(ctx, points, color, width, space) {
+  if (!space) return
+  drawCanvasStroke(ctx, points, color, width, (point) => space.toImagePoint(point))
+}
+
+function drawViewportStrokes(ctx, points, color, width, frame, scaleX, scaleY) {
+  if (!frame) return
+  drawCanvasStroke(ctx, points, color, width, (point) => ({
+    x: (point.x - frame.left) * scaleX, y: (point.y - frame.top) * scaleY,
+  }))
+}
+
+async function compositePageAndStrokes(pageDataUrl, regions = []) {
   if (!pageDataUrl) return ''
   const frame = pageFrame()
   if (!frame || frame.width < 8 || frame.height < 8) return pageDataUrl
@@ -97,18 +146,26 @@ async function compositePageAndStrokes(pageDataUrl) {
     canvas.height = image.naturalHeight || image.height
     const ctx = canvas.getContext('2d')
     ctx.drawImage(image, 0, 0, canvas.width, canvas.height)
-    const scaleX = canvas.width / frame.width
-    const scaleY = canvas.height / frame.height
-    const paintW = Math.max(4, canvas.width / 140)
-    const inkW = Math.max(5, canvas.width / 120)
+    const space = importedImageSpace(image)
+    const inkW = Math.max(5, canvas.width / 150)
     for (const mark of getPaintMarks()) {
-      ctx.globalAlpha = 0.78
-      drawStrokes(ctx, mark.points, mark.color || '#3c6fd4', paintW, frame, scaleX, scaleY)
+      ctx.globalAlpha = mark.opacity
+      const zoom = Number.parseFloat(document.getElementById('web-doc-frame')?.contentDocument?.documentElement?.style?.zoom) || 1
+      const paintW = mark.width * (space ? space.scaleX / zoom : canvas.width / frame.width)
+      const points = displayStrokePoints(mark.points, mark.smoothing)
+      if (space) drawImageSpaceStrokes(ctx, points, mark.color || '#3c6fd4', paintW, space)
+      else drawViewportStrokes(ctx, points, mark.color || '#3c6fd4', paintW, frame, canvas.width / frame.width, canvas.height / frame.height)
     }
     ctx.globalAlpha = 1
     for (const stroke of getInkStrokes()) {
-      drawStrokes(ctx, stroke, '#111111', inkW, frame, scaleX, scaleY)
+      if (space) drawImageSpaceStrokes(ctx, stroke, '#111111', inkW, space)
+      else drawViewportStrokes(ctx, stroke, '#111111', inkW, frame, canvas.width / frame.width, canvas.height / frame.height)
     }
+    const zoom = Number.parseFloat(document.getElementById('web-doc-frame')?.contentDocument?.documentElement?.style?.zoom) || 1
+    drawBrushRegionNumbers(ctx, regions, (region, point) => {
+      if (space) return region.coordinateSpace === 'web-document' ? { x: point.x * space.scaleX, y: point.y * space.scaleY } : space.toImagePoint(point)
+      return { x: (point.x - frame.left) * canvas.width / frame.width, y: (point.y - frame.top) * canvas.height / frame.height }
+    }, space ? space.scaleX / zoom : canvas.width / frame.width)
     return canvas.toDataURL('image/jpeg', 0.86)
   } catch {
     return pageDataUrl
@@ -432,10 +489,10 @@ function strokeBoardDataUrl() {
 async function fitDataUrl(dataUrl, { maxSide = 720, quality = 0.84 } = {}) {
   if (!dataUrl) return ''
   try {
-    const image = await loadImageEl(dataUrl)
+    const image = typeof dataUrl === 'string' ? await loadImageEl(dataUrl) : dataUrl
     const w = image.naturalWidth || image.width
     const h = image.naturalHeight || image.height
-    if (w < 4 || h < 4) return dataUrl
+    if (w < 4 || h < 4) return typeof dataUrl === 'string' ? dataUrl : ''
     const scale = Math.min(1, maxSide / Math.max(w, h))
     const canvas = document.createElement('canvas')
     canvas.width = Math.max(1, Math.round(w * scale))
@@ -446,26 +503,42 @@ async function fitDataUrl(dataUrl, { maxSide = 720, quality = 0.84 } = {}) {
     ctx.drawImage(image, 0, 0, canvas.width, canvas.height)
     return canvas.toDataURL('image/jpeg', quality)
   } catch {
-    return dataUrl
+    return typeof dataUrl === 'string' ? dataUrl : ''
   }
 }
 
-async function cropFromPoints(pageDataUrl, pts, { pad = 36, maxSide = 880 } = {}) {
+async function cropFromPoints(pageDataUrl, pts, { pad = 36, maxSide = 880, quality = 0.92 } = {}) {
   const frame = pageFrame()
   if (!pageDataUrl || !frame || !pts || pts.length < 2) return ''
   try {
-    const image = await loadImageEl(pageDataUrl)
-    const box = aabb(pts)
-    const sx = (image.naturalWidth || image.width) / Math.max(1, frame.width)
-    const sy = (image.naturalHeight || image.height) / Math.max(1, frame.height)
-    let x = (box.x - frame.left - pad) * sx
-    let y = (box.y - frame.top - pad) * sy
-    let w = (box.w + pad * 2) * sx
-    let h = (box.h + pad * 2) * sy
-    x = Math.max(0, x)
-    y = Math.max(0, y)
-    w = Math.min((image.naturalWidth || image.width) - x, Math.max(120, w))
-    h = Math.min((image.naturalHeight || image.height) - y, Math.max(120, h))
+    const image = typeof pageDataUrl === 'string' ? await loadImageEl(pageDataUrl) : pageDataUrl
+    const iw = image.naturalWidth || image.width
+    const ih = image.naturalHeight || image.height
+    const imported = importedImageSpace(image)
+    let box
+    let sx
+    let sy
+    let padX
+    let padY
+    if (imported) {
+      const mapped = pts.map((point) => imported.toImagePoint(point))
+      box = aabb(mapped)
+      sx = 1
+      sy = 1
+      padX = pad * imported.scaleX
+      padY = pad * imported.scaleY
+    } else {
+      box = aabb(pts)
+      sx = iw / Math.max(1, frame.width)
+      sy = ih / Math.max(1, frame.height)
+      box = { x: (box.x - frame.left) * sx, y: (box.y - frame.top) * sy, w: box.w * sx, h: box.h * sy }
+      padX = pad * sx
+      padY = pad * sy
+    }
+    let x = Math.max(0, box.x - padX)
+    let y = Math.max(0, box.y - padY)
+    let w = Math.min(iw - x, Math.max(120 * sx, box.w + padX * 2))
+    let h = Math.min(ih - y, Math.max(120 * sy, box.h + padY * 2))
     if (w < 16 || h < 16) return ''
     const canvas = document.createElement('canvas')
     const outScale = Math.min(3.2, maxSide / Math.max(w, h))
@@ -475,7 +548,7 @@ async function cropFromPoints(pageDataUrl, pts, { pad = 36, maxSide = 880 } = {}
     ctx.fillStyle = '#ffffff'
     ctx.fillRect(0, 0, canvas.width, canvas.height)
     ctx.drawImage(image, x, y, w, h, 0, 0, canvas.width, canvas.height)
-    return canvas.toDataURL('image/jpeg', 0.92)
+    return canvas.toDataURL('image/jpeg', quality)
   } catch {
     return ''
   }
@@ -541,12 +614,13 @@ export async function captureInsertScene() {
 }
 
 /** Page + ink + numbered marks for intent understanding. */
-export async function captureAnnotationScene(editor) {
+export async function captureAnnotationScene(editor, { regions = [], mode = 'legacy', signal } = {}) {
+  if (mode === 'planner') return capturePlannerScene({ regions, signal })
   const marked = await captureMarkedPage(editor)
   const imported = await captureImportedPage({ quality: 0.86, pixelRatio: 1.1 })
   const demo = imported ? '' : await captureDemoPage()
   const pageShot = imported || demo || marked.imageDataUrl
-  const combined = await compositePageAndStrokes(pageShot)
+  const combined = await compositePageAndStrokes(pageShot, regions)
   const source = combined || pageShot
   const writing = await fitDataUrl(handwritingBoardDataUrl() || inkToDataUrl(), { maxSide: 720, quality: 0.94 })
   const board = await fitDataUrl(strokeBoardDataUrl() || writing, { maxSide: 720, quality: 0.92 })
@@ -564,6 +638,36 @@ export async function captureAnnotationScene(editor) {
     combinedDataUrl: page,
     ocrImageDataUrls: ocrImages,
     imageDataUrls: images,
+  }
+}
+
+// The active Agent needs just the marked overview and legible local close-up.
+// Keep legacy OCR/ink-board captures available to their original callers.
+async function capturePlannerScene({ regions, signal }) {
+  const start = performance.now()
+  const base = await warmAnnotationBase()
+  signal?.throwIfAborted()
+  const baseReady = performance.now()
+  const page = plannerPage()
+  const version = pageEvidenceVersion(page.doc, page.root)
+  if (base.version && base.version !== version) throw Object.assign(new Error('页面已变化，请重新分析'), { code: 'capture_page_changed' })
+  const points = allStrokePoints()
+  const source = await compositePageAndStrokes(base.value, regions)
+  signal?.throwIfAborted()
+  // Decode once; derive both images from the same pixels/coordinate snapshot.
+  const image = source ? await loadImageEl(source) : null
+  const [overview, closeup] = image ? await Promise.all([
+    fitDataUrl(image, { maxSide: 720, quality: 0.78 }),
+    cropFromPoints(image, points, { pad: 36, maxSide: 860, quality: 0.88 }),
+  ]) : ['', '']
+  signal?.throwIfAborted()
+  if (version !== pageEvidenceVersion(page.doc, page.root)) throw Object.assign(new Error('页面已变化，请重新分析'), { code: 'capture_page_changed' })
+  return {
+    pageText: importedPageText(), combinedDataUrl: overview, closeupDataUrl: closeup,
+    imageDataUrls: uniqueUrls([overview, closeup]),
+    captureMetrics: { captureMs: Math.round(performance.now() - start), baseWaitMs: Math.round(baseReady - start),
+      baseBuildMs: Math.round(base.buildMs || 0), baseCacheHit: Boolean(base.cacheHit), baseShared: Boolean(base.shared),
+      imageCount: uniqueUrls([overview, closeup]).length },
   }
 }
 

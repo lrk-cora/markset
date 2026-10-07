@@ -1,8 +1,8 @@
-import { pathLength, looksLikeXStroke, paintHitPolygon } from './geometry.js'
+import { isRegionStroke, paintHitPolygon } from './geometry.js'
 import { ping } from './store.js'
-
-const MIN_PATH = 28
-const START_MOVE = 8
+import { StrokeSession } from './stroke-session.js'
+import { DEFAULT_BRUSH_SETTINGS, getBrushSettings, setBrushSettings, subscribeBrushSettings } from './brush-settings.js'
+import { displayStrokePoints } from './stroke-render.js'
 
 export const SELECT_COLOR = '#3c6fd4'
 
@@ -18,7 +18,8 @@ let lassoMode = false
 let subtractMode = false
 let addMode = false
 let colorMode = false
-let strokeColor = SELECT_COLOR
+let strokeColor = getBrushSettings().color
+let finishActiveStroke = null
 
 export function isLassoMode() {
   return lassoMode
@@ -49,13 +50,9 @@ export function layoutPenOf(hex = strokeColor) {
 }
 
 export function setStrokeColor(hex) {
-  strokeColor = hex || SELECT_COLOR
-  if (isLayoutPen()) {
-    lassoMode = true
-    subtractMode = false
-    addMode = false
-    colorMode = false
-  }
+  // Appearance never arms the brush or implies a webpage color operation.
+  setBrushSettings({ color: hex || SELECT_COLOR })
+  strokeColor = getBrushSettings().color
   syncButtons()
   ping()
 }
@@ -87,6 +84,7 @@ function syncButtons() {
 }
 
 export function setLassoMode(on) {
+  if (!on) finishActiveStroke?.()
   lassoMode = Boolean(on)
   if (lassoMode) {
     subtractMode = false
@@ -102,6 +100,7 @@ export function setLassoMode(on) {
 }
 
 export function disarmDrawing() {
+  finishActiveStroke?.()
   lassoMode = false
   subtractMode = false
   addMode = false
@@ -144,21 +143,70 @@ export function setColorMode(on) {
 }
 
 function uiTarget(e) {
-  const el = e.target instanceof Element ? e.target : e.target.parentElement
+  const el = e.target instanceof Element ? e.target : e.target?.parentElement
   return el?.closest?.(
-    '.hl-handle, .img-handle, .badge, .scheme-tag, .toolbar, .novice-card, .card-guesses, .topbar, .inspector, .suggest, .confirm, .change-badge, .change-toggle, .coach, [data-guess-index], [data-typed-req], input, textarea',
+    '.app-ui, .hl-handle, .img-handle, .badge, .scheme-tag, .toolbar, .novice-card, .card-guesses, .topbar, .inspector, .suggest, .confirm, .change-badge, .change-toggle, .coach, [data-guess-index], [data-typed-req], input, textarea',
   )
 }
 
 let paintMarks = []
+let paintRenderFrame = 0
+let paintFrameDoc = null
+let paintSessionId = 0
+let nextPaintMarkId = 0
+let lastRenderedPaintKey = ''
+let lastRenderedPaintViewportKey = ''
+
+function frameSpace() {
+  const iframe = document.getElementById('web-doc-frame')
+  const doc = iframe?.contentDocument
+  const frame = iframe?.getBoundingClientRect?.()
+  if (!iframe || !doc || !frame) return null
+  const root = doc.documentElement
+  const win = doc.defaultView
+  const zoomValue = Number.parseFloat(root?.style?.zoom || '')
+  const zoom = Number.isFinite(zoomValue) && zoomValue > 0.05 ? zoomValue : 1
+  return {
+    iframe,
+    doc,
+    left: frame.left,
+    top: frame.top,
+    scrollX: win?.scrollX || root?.scrollLeft || 0,
+    scrollY: win?.scrollY || root?.scrollTop || 0,
+    zoom,
+  }
+}
+
+function viewportToPage(point, space = frameSpace()) {
+  if (!space) return { x: point.x, y: point.y }
+  return {
+    x: (point.x - space.left) / space.zoom + space.scrollX,
+    y: (point.y - space.top) / space.zoom + space.scrollY,
+  }
+}
+
+function pageToViewport(point, coordinateSpace = 'viewport', space = frameSpace()) {
+  if (!space || coordinateSpace !== 'web-document') return { x: point.x, y: point.y }
+  return {
+    x: space.left + (point.x - space.scrollX) * space.zoom,
+    y: space.top + (point.y - space.scrollY) * space.zoom,
+  }
+}
 
 export function getPaintMarks() {
+  const space = frameSpace()
   return paintMarks.map((m) => ({
+    id: m.id,
+    revision: m.revision || 0,
     color: m.color,
+    width: m.width ?? DEFAULT_BRUSH_SETTINGS.width,
+    opacity: m.opacity ?? DEFAULT_BRUSH_SETTINGS.opacity,
+    smoothing: m.smoothing || DEFAULT_BRUSH_SETTINGS.smoothing,
     role: m.role || 'select',
     shape: m.shape || '',
     fingerprint: m.fingerprint || '',
-    points: m.points.map((p) => ({ x: p.x, y: p.y })),
+    closed: Boolean(m.closed),
+    points: m.points.map((point) => pageToViewport(point, m.coordinateSpace, space)),
   }))
 }
 
@@ -166,15 +214,21 @@ export function hasPaintSelection() {
   return paintMarks.some((m) => m.role !== 'subtract' && m.role !== 'symbol' && m.points?.length >= 3)
 }
 
-export function keepPaintMark(points, { append = false, color = '#3c6fd4', role = 'select', shape = '', fingerprint = '' } = {}) {
+export function keepPaintMark(points, { append = true, color = '#3c6fd4', role = 'select', shape = '', fingerprint = '', closed = false, id = '', revision = 0, width = DEFAULT_BRUSH_SETTINGS.width, opacity = DEFAULT_BRUSH_SETTINGS.opacity, smoothing = DEFAULT_BRUSH_SETTINGS.smoothing } = {}) {
   if (!points?.length) return
   if (!append) paintMarks = []
+  const space = frameSpace()
   paintMarks.push({
-    points: points.map((p) => ({ x: p.x, y: p.y })),
+    id: id || `paint-${++nextPaintMarkId}`,
+    revision: Number(revision) || 0,
+    points: points.map((point) => viewportToPage(point, space)),
+    coordinateSpace: space ? 'web-document' : 'viewport',
     color,
+    width, opacity, smoothing,
     role: role || 'select',
     shape: shape || '',
     fingerprint: fingerprint || '',
+    closed: Boolean(closed),
   })
   renderPaintMarks()
 }
@@ -189,13 +243,37 @@ export function setLastPaintRole(role) {
 }
 
 export function lastPaintPoints() {
-  const m = paintMarks[paintMarks.length - 1]
+  const marks = getPaintMarks()
+  const m = marks[marks.length - 1]
   return m?.points?.map((p) => ({ x: p.x, y: p.y })) || []
 }
 
 export function clearPaintMarks() {
   paintMarks = []
+  paintSessionId += 1
+  lastRenderedPaintKey = ''
+  lastRenderedPaintViewportKey = ''
   renderPaintMarks()
+}
+
+// Keep the visual ink independent from the transient lasso SVG. The caller
+// can restore this snapshot after any full application render without
+// reinterpreting the gesture.
+export function setPaintMarks(marks = []) {
+  const nextMarks = (Array.isArray(marks) ? marks : []).map((mark) => ({
+    ...mark,
+    id: mark.id || `paint-${++nextPaintMarkId}`,
+    revision: Number(mark.revision) || 0,
+    points: (mark.points || []).map((point) => ({ x: point.x, y: point.y })),
+  }))
+  // This is a projection of the authoritative group, not a second history.
+  // Stale analysis is rejected before it reaches the group store.
+  paintMarks = nextMarks
+  renderPaintMarks()
+}
+
+export function getPaintSessionId() {
+  return paintSessionId
 }
 
 function polyToPath(pts) {
@@ -206,35 +284,68 @@ function polyToPath(pts) {
 function renderPaintMarks() {
   const svg = document.getElementById('paint-layer')
   if (!svg) return
+  const stage = document.querySelector('.stage')?.getBoundingClientRect?.()
+  const frame = document.getElementById('web-doc-frame')?.getBoundingClientRect?.()
+  // Fixed SVGs sit above the workspace. Paint belongs to the live canvas,
+  // never to the sidebar, including during a layout transition.
+  const rect = stage && frame ? {
+    left: Math.max(stage.left, frame.left, 0), top: Math.max(stage.top, frame.top, 0),
+    right: Math.min(stage.right, frame.right, window.innerWidth), bottom: Math.min(stage.bottom, frame.bottom, window.innerHeight),
+  } : null
+  const clip = rect ? `inset(${rect.top}px ${Math.max(0, window.innerWidth - rect.right)}px ${Math.max(0, window.innerHeight - rect.bottom)}px ${rect.left}px)` : ''
+  svg.style.clipPath = clip
+  const lasso = document.getElementById('lasso-layer')
+  if (lasso) lasso.style.clipPath = clip
+  const marks = getPaintMarks()
+  const paintKey = marks.map((mark) => `${mark.id}:${mark.revision}:${mark.color}:${mark.width}:${mark.opacity}:${mark.smoothing}:${mark.role}:${mark.closed}:${mark.points.map((p) => `${p.x},${p.y}`).join(';')}`).join('|')
+  const space = frameSpace()
+  const viewportKey = space ? `${space.left}:${space.top}:${space.scrollX}:${space.scrollY}:${space.zoom}` : ''
+  const fills = marks.map((mark) => mark.role !== 'symbol' && mark.closed && mark.points.length >= 3 ? paintHitPolygon(mark.points, 8) : [])
+  const expectedNodes = marks.filter((mark) => mark.points.length >= 1).length + fills.filter((poly) => poly.length >= 3).length
+  const actualNodes = svg.querySelectorAll('[data-stroke-id]').length
+  if (paintKey === lastRenderedPaintKey && viewportKey === lastRenderedPaintViewportKey && actualNodes === expectedNodes) return
   svg.replaceChildren()
-  for (const mark of paintMarks) {
-    if (mark.role === 'symbol') continue
-    if (mark.points.length < 3) continue
-    const poly = paintHitPolygon(mark.points, 8)
+  lastRenderedPaintKey = paintKey
+  lastRenderedPaintViewportKey = viewportKey
+  for (const [index, mark] of marks.entries()) {
+    const poly = fills[index]
     if (poly.length < 3) continue
     const fill = document.createElementNS('http://www.w3.org/2000/svg', 'path')
+    fill.setAttribute('data-stroke-id', mark.id)
+    fill.setAttribute('data-stroke-part', 'fill')
     fill.setAttribute('d', polyToPath(poly))
     fill.setAttribute('stroke', 'none')
     fill.setAttribute('pointer-events', 'none')
-    if (mark.role === 'subtract') {
-      fill.setAttribute('fill', 'rgba(180, 69, 50, 0.2)')
-    } else {
-      fill.setAttribute('fill', mark.role === 'add' ? 'rgba(47, 143, 91, 0.16)' : 'rgba(60, 111, 212, 0.14)')
-    }
+    fill.setAttribute('fill', mark.color)
+    fill.setAttribute('fill-opacity', mark.opacity * 0.18)
     svg.append(fill)
   }
-  for (const mark of paintMarks) {
-    if (mark.points.length < 2) continue
+  for (const mark of marks) {
+    if (!mark.points.length) continue
+    if (mark.points.length === 1) {
+      const dot = document.createElementNS('http://www.w3.org/2000/svg', 'circle')
+      dot.setAttribute('data-stroke-id', mark.id)
+      dot.setAttribute('data-stroke-part', 'dot')
+      dot.setAttribute('cx', mark.points[0].x)
+      dot.setAttribute('cy', mark.points[0].y)
+      dot.setAttribute('r', mark.width / 2)
+      dot.setAttribute('fill', mark.color)
+      dot.setAttribute('opacity', mark.opacity)
+      svg.append(dot)
+      continue
+    }
     const line = document.createElementNS('http://www.w3.org/2000/svg', 'polyline')
+    line.setAttribute('data-stroke-id', mark.id)
+    line.setAttribute('data-stroke-part', 'line')
     line.setAttribute('fill', 'none')
     line.setAttribute('stroke', mark.color)
-    line.setAttribute('stroke-width', mark.role === 'subtract' ? '3.5' : '4.5')
+    line.setAttribute('stroke-width', mark.width)
     line.setAttribute('stroke-linecap', 'round')
     line.setAttribute('stroke-linejoin', 'round')
-    line.setAttribute('opacity', '0.78')
+    line.setAttribute('opacity', mark.opacity)
     line.setAttribute('vector-effect', 'non-scaling-stroke')
     if (mark.role === 'subtract') line.setAttribute('stroke-dasharray', '7 5')
-    line.setAttribute('points', mark.points.map((p) => `${p.x},${p.y}`).join(' '))
+    line.setAttribute('points', displayStrokePoints(mark.points, mark.smoothing).map((p) => `${p.x},${p.y}`).join(' '))
     svg.append(line)
   }
 }
@@ -247,172 +358,176 @@ function drawColor({ erase, shiftHeld } = {}) {
   return strokeColor
 }
 
-export function bindLasso({ onBegin, onMove, onFinish, onCancel }) {
+function schedulePaintRender() {
+  if (paintRenderFrame) return
+  paintRenderFrame = requestAnimationFrame(() => {
+    paintRenderFrame = 0
+    renderPaintMarks()
+  })
+}
+
+function bindPaintPositionTracking() {
+  window.addEventListener('scroll', schedulePaintRender, true)
+  window.addEventListener('resize', schedulePaintRender)
+  const iframe = document.getElementById('web-doc-frame')
+  iframe?.addEventListener('load', () => {
+    if (paintFrameDoc === iframe.contentDocument) return
+    paintFrameDoc = iframe.contentDocument
+    paintFrameDoc?.addEventListener('scroll', schedulePaintRender, { passive: true, capture: true })
+    paintFrameDoc?.defaultView?.addEventListener('scroll', schedulePaintRender, { passive: true })
+    schedulePaintRender()
+  })
+}
+
+bindPaintPositionTracking()
+subscribeBrushSettings(() => {
+  strokeColor = getBrushSettings().color
+  syncButtons()
+})
+
+export function bindLasso({ onStart, onBegin, onMove, onFinish, onCancel }) {
   const svg = document.getElementById('lasso-layer')
-  let drawing = false
-  let armed = false
-  let points = []
+  const session = new StrokeSession()
   let line = null
   let shiftHeld = false
   let subtractHeld = false
+  let pointerCaptureTarget = null
+  let began = false
+  let appearance = getBrushSettings()
 
-  function clearSvg() {
-    svg.replaceChildren()
-    line = null
-  }
-
-  function noteMods(e) {
-    if (!e) return
-    if (e.shiftKey) shiftHeld = true
-    if (e.ctrlKey || e.metaKey || subtractMode || e.altKey) subtractHeld = true
-  }
-
-  function draw(pts) {
-    if (!pts.length) return
-    const erase = subtractHeld || subtractMode
-    const color = drawColor({ erase, shiftHeld })
+  function clearSvg() { svg.replaceChildren(); line = null }
+  function draw() {
     if (!line) {
       line = document.createElementNS('http://www.w3.org/2000/svg', 'polyline')
-      line.setAttribute('fill', 'none')
-      line.setAttribute('stroke-width', '4.5')
-      line.setAttribute('stroke-linecap', 'round')
-      line.setAttribute('stroke-linejoin', 'round')
-      line.setAttribute('opacity', '0.9')
-      line.setAttribute('vector-effect', 'non-scaling-stroke')
+      for (const [key, value] of Object.entries({ fill: 'none', 'stroke-width': appearance.width, 'stroke-linecap': 'round', 'stroke-linejoin': 'round', opacity: appearance.opacity, 'vector-effect': 'non-scaling-stroke' })) line.setAttribute(key, value)
       svg.append(line)
     }
-    line.setAttribute('stroke', color)
-    line.setAttribute('points', pts.map((p) => `${p.x},${p.y}`).join(' '))
+    line.setAttribute('stroke', appearance.color)
+    line.setAttribute('points', displayStrokePoints(session.points, appearance.smoothing).map((p) => `${p.x},${p.y}`).join(' '))
   }
-
-  function beginDraw() {
-    drawing = true
-    document.body.classList.add('is-lassoing')
-    clearSvg()
-    draw(points)
-    onBegin?.()
+  function releaseCapture(id) {
+    const target = pointerCaptureTarget
+    pointerCaptureTarget = null
+    try { target?.releasePointerCapture?.(id) } catch {}
   }
-
-  function finish(e) {
-    const wasDrawing = drawing
-    drawing = false
-    armed = false
+  function finish(e, { cancelled = false } = {}) {
+    const id = session.pointerId
+    const result = session.finish(e?.pointerId ?? id, e ? { x: e.clientX, y: e.clientY } : null, { cancelled })
+    if (!result) return
+    // Reset before callbacks: store emissions and lostpointercapture can be reentrant.
+    releaseCapture(id)
     document.body.classList.remove('is-lassoing')
-    noteMods(e)
-    if (!wasDrawing) {
-      onCancel?.({ drew: false })
-      return
-    }
-    if (e) points.push({ x: e.clientX, y: e.clientY })
-    const polygon = paintHitPolygon(points, 8)
-    const tooSmall = polygon.length < 3 || pathLength(points) < MIN_PATH
-    if (tooSmall) {
-      clearSvg()
-      onCancel?.({ drew: true })
-      return
-    }
-    const wantsSubtract = Boolean(subtractHeld || subtractMode)
-    const wantsAdd = Boolean((addMode || shiftHeld) && !wantsSubtract)
-    const persist = onFinish?.(polygon, {
-      shift: shiftHeld && !wantsSubtract,
-      subtract: wantsSubtract,
-      add: wantsAdd,
-      color: colorMode && !wantsSubtract,
-      crossOut: looksLikeXStroke(points),
-      rawPoints: points.map((p) => ({ x: p.x, y: p.y })),
-    })
-    const color = drawColor({ erase: wantsSubtract, shiftHeld: wantsAdd })
-    if (persist !== false) {
-      const prior = paintMarks.some((m) => m.role !== 'subtract' && m.points?.length >= 3)
-      let role = persist?.role || (wantsSubtract ? 'subtract' : wantsAdd ? 'add' : 'select')
-      if (role === 'add' && !prior) role = 'select'
-      const append =
-        Boolean(persist?.append) || role === 'add' || role === 'subtract' || isLayoutPen()
-      keepPaintMark(points, {
-        append,
-        color,
-        role,
-        shape: persist?.shape || '',
-        fingerprint: persist?.fingerprint || '',
-      })
-    }
-    clearSvg()
+    try {
+      if (result.kind === 'cancel') {
+        onCancel?.({ drew: false, cancelled: true, tap: false })
+        return
+      }
+      // A deliberate tap is ink too. Collapse sub-threshold mouse jitter to
+      // one point; interrupted contact without a completed tap is not ink.
+      const isDot = result.kind === 'tap'
+      const points = isDot ? result.points.slice(0, 1) : result.points
+      const wantsSubtract = Boolean(subtractHeld || subtractMode)
+      const wantsAdd = Boolean((addMode || shiftHeld) && !wantsSubtract)
+      const color = appearance.color
+      const strokeId = `stroke-${++nextPaintMarkId}`
+      // Recognition can fail, but it must never gate persistence of raw ink.
+      let polygon = []
+      let closed = false
+      try { polygon = paintHitPolygon(points, 8); closed = !isDot && isRegionStroke(points) } catch (error) {
+        console.debug('[markset brush] geometry skipped', error)
+      }
+      let persist
+      try {
+        persist = onFinish?.(polygon, {
+          shift: shiftHeld && !wantsSubtract, subtract: wantsSubtract, add: wantsAdd,
+          color: colorMode && !wantsSubtract, strokeColor: color, crossOut: false,
+          rawPoints: points.map((p) => ({ ...p })), strokeId, closed, shape: isDot ? 'dot' : '',
+          width: appearance.width, opacity: appearance.opacity, smoothing: appearance.smoothing,
+        })
+      } catch (error) {
+        console.error('[markset brush] stroke commit failed', error)
+      }
+      if (persist !== false && !persist?.paintOwned) {
+        // Legacy callers may still let the overlay own persistence. Never
+        // duplicate a stroke already committed by an app callback that threw.
+        if (!paintMarks.some((mark) => mark.id === strokeId)) keepPaintMark(points, {
+          append: persist?.append !== false, id: persist?.strokeId || strokeId,
+          color, role: persist?.role || (wantsSubtract ? 'subtract' : wantsAdd ? 'add' : 'select'),
+          width: appearance.width, opacity: appearance.opacity, smoothing: appearance.smoothing,
+          shape: persist?.shape || (isDot ? 'dot' : ''), fingerprint: persist?.fingerprint || '',
+          closed: persist?.closed ?? closed,
+        })
+      }
+    } finally { clearSvg() }
   }
+  function interrupt() { if (session.active) finish(null, { cancelled: true }) }
+  finishActiveStroke = interrupt
 
   function onPointerDown(e) {
-    if (e.button !== 0 || uiTarget(e)) return
-    if (document.querySelector('.page.is-guide')) return
-    if (!e.altKey && !lassoMode && !subtractMode && !addMode && !colorMode) return
-    e.preventDefault()
-    e.stopPropagation()
-    armed = true
-    drawing = false
+    if (e.button !== 0 || uiTarget(e) || e.isPrimary === false) return
+    // Do not turn toolbar, stage gutters or the scrollbar into a drawing surface.
+    if (!e.target?.closest?.('.page') || document.querySelector('.page.is-guide')) return
+    if (!lassoMode && !subtractMode && !addMode && !colorMode) return
+    if (session.active) {
+      if (session.pointerId !== e.pointerId) return
+      // A fresh down for the same mouse/pen means its previous up was lost.
+      // Finish the old samples instead of merging two independent strokes.
+      interrupt()
+    }
+    e.preventDefault(); e.stopPropagation()
+    session.begin(e.pointerId, { x: e.clientX, y: e.clientY })
     shiftHeld = Boolean(e.shiftKey)
-    subtractHeld = Boolean(e.ctrlKey || e.metaKey || subtractMode || e.altKey)
-    points = [{ x: e.clientX, y: e.clientY }]
+    subtractHeld = Boolean(subtractMode || e.ctrlKey || e.metaKey || e.altKey)
+    // Snapshot appearance once. A settings change cannot restyle half a stroke.
+    appearance = { ...getBrushSettings(), color: drawColor({ erase: subtractHeld, shiftHeld }) }
+    began = false
+    // Window has no setPointerCapture. Capture on a stable parent-document
+    // element so release is delivered even outside the page or over the UI.
+    pointerCaptureTarget = document.getElementById('page-shell') || e.target
+    try { pointerCaptureTarget.setPointerCapture(e.pointerId) } catch {}
+    document.body.classList.add('is-lassoing')
+    clearSvg()
+    onStart?.()
   }
-
   function onPointerMove(e) {
-    if (!armed && !drawing) return
+    if (!session.active || e.pointerId !== session.pointerId) return
+    // Recover a missed release rather than locking out every following stroke.
+    if (e.pointerType === 'mouse' && e.buttons === 0) { interrupt(); return }
     e.preventDefault()
-    noteMods(e)
-    const last = points[points.length - 1] ?? { x: e.clientX, y: e.clientY }
-    if (Math.hypot(e.clientX - last.x, e.clientY - last.y) < 1.5) return
-    points.push({ x: e.clientX, y: e.clientY })
-    if (!drawing && pathLength(points) >= START_MOVE) beginDraw()
-    if (drawing) {
-      draw(points)
-      onMove?.(points)
-    }
+    const samples = e.getCoalescedEvents?.() || []
+    for (const sample of [...samples, e]) session.add(e.pointerId, { x: sample.clientX, y: sample.clientY })
+    if (session.length < 3) return
+    if (!began) { began = true; onBegin?.() }
+    draw(); onMove?.(session.points)
   }
-
   function onPointerUp(e) {
-    if (!armed && !drawing) return
-    e.preventDefault()
-    finish(e)
+    if (!session.active || e.pointerId !== session.pointerId) return
+    e.preventDefault(); finish(e)
   }
-
-  function onWheel(e) {
-    if (drawing) e.preventDefault()
+  function onPointerCancel(e) {
+    if (!session.active || e.pointerId !== session.pointerId) return
+    finish(e, { cancelled: true })
   }
-
+  function onWheel(e) { if (session.active) e.preventDefault() }
   function onKey(e) {
-    if ((armed || drawing) && e.type === 'keydown' && e.key === 'Shift') shiftHeld = true
-    if (
-      (armed || drawing) &&
-      e.type === 'keydown' &&
-      (e.key === 'Control' || e.key === 'Meta' || e.key === 'Alt')
-    ) {
-      subtractHeld = true
-    }
-    if (e.key === 'Alt') {
-      e.preventDefault()
-      document.body.classList.toggle('is-subtract', subtractMode || e.type === 'keydown')
-    }
-    if (e.type === 'keydown' && e.key === 'Escape' && (drawing || armed)) {
-      drawing = false
-      armed = false
+    if (e.key === 'Escape' && session.active) {
+      const id = session.pointerId
+      session.reset(); releaseCapture(id); clearSvg()
       document.body.classList.remove('is-lassoing')
-      clearSvg()
-      onCancel?.({ drew: true })
+      onCancel?.({ drew: began, cancelled: true, tap: false })
     }
   }
-
-  window.addEventListener('pointerdown', onPointerDown, true)
-  window.addEventListener('pointermove', onPointerMove, true)
-  window.addEventListener('pointerup', onPointerUp, true)
-  window.addEventListener('pointercancel', onPointerUp, true)
+  const events = [
+    ['pointerdown', onPointerDown], ['pointermove', onPointerMove], ['pointerup', onPointerUp],
+    ['pointercancel', onPointerCancel], ['lostpointercapture', onPointerCancel],
+    ['blur', interrupt], ['keydown', onKey],
+  ]
+  for (const [type, handler] of events) window.addEventListener(type, handler, true)
   window.addEventListener('wheel', onWheel, { passive: false, capture: true })
-  window.addEventListener('keydown', onKey, true)
-  window.addEventListener('keyup', onKey, true)
-
   return () => {
-    window.removeEventListener('pointerdown', onPointerDown, true)
-    window.removeEventListener('pointermove', onPointerMove, true)
-    window.removeEventListener('pointerup', onPointerUp, true)
-    window.removeEventListener('pointercancel', onPointerUp, true)
+    interrupt()
+    if (finishActiveStroke === interrupt) finishActiveStroke = null
+    for (const [type, handler] of events) window.removeEventListener(type, handler, true)
     window.removeEventListener('wheel', onWheel, true)
-    window.removeEventListener('keydown', onKey, true)
-    window.removeEventListener('keyup', onKey, true)
   }
 }
