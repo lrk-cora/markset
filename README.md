@@ -39,6 +39,14 @@ npm run dev
 
 `samples/` 里有可直接导入的示例页。
 
+## 论文与研究资料
+
+- [UIST 论文工作稿](docs/research/uist-manuscript.md)
+- [研究方案与文献地图](docs/research/README.md)
+- [BibTeX 引用](related-papers/markset-hci-references.bib)
+
+论文中的直接指代纠正与依赖方案失效机制仍待实现，正式用户研究尚未开展；不要将研究计划视为应用已有功能或实验结果。
+
 ## 相关文献
 
 论文 related work 对照材料在 `related-papers/`（英文目录名便于 GitHub）：
