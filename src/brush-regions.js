@@ -26,6 +26,15 @@ export function buildBrushRegions(group, resolveTargetRect = target => target.do
   const regions = [], targets = [], seen = new Set()
   const excluded = new Set((group.excludedTargetIds || []).map(String))
   const coordinateSpace = group.coordinateSpace || 'web-document'
+  if (group.inputModality === 'selection') {
+    for (const selection of group.selections || []) {
+      const points = selection.points || [], xs = points.map(p => p.x), ys = points.map(p => p.y)
+      const rect = { x: Math.min(...xs), y: Math.min(...ys), w: Math.max(...xs)-Math.min(...xs), h: Math.max(...ys)-Math.min(...ys) }
+      const ids = (selection.targetIds || []).filter(id => (group.targets || []).some(t => String(t.webId) === id) && !excluded.has(id))
+      if (validRect(rect)) regions.push({ id: `selection:${selection.id}`, kind: ids.length ? 'target' : 'blank', source: 'selection', selectionId: selection.id, coordinateSpace, rect, targetIds: ids, strokeIds: [] })
+    }
+    return orderBrushRegions(regions)
+  }
   for (const target of group.targets || []) {
     const id = String(target.webId || ''), rect = resolveTargetRect(target)
     if (!id || seen.has(id) || excluded.has(id) || !validRect(rect)) continue
@@ -98,7 +107,7 @@ export function drawBrushRegionNumbers(ctx, regions, projectPoint, scale = 1) {
   ctx.restore()
 }
 
-export function planningRegionEvidence(regions = [], targets = [], strokes = []) {
+export function planningRegionEvidence(regions = [], targets = [], strokes = [], selections = []) {
   const targetIds = new Set(targets.map(target => String(target.webId)))
   const strokeIds = new Set(strokes.map(stroke => String(stroke.id)))
   const numbers = new Set()
@@ -106,10 +115,19 @@ export function planningRegionEvidence(regions = [], targets = [], strokes = [])
     if (!region || !Number.isInteger(region.number) || region.number < 1 || numbers.has(region.number) || !validRect(region.rect)) return []
     const ids = (Array.isArray(region.targetIds) ? region.targetIds : []).map(String).filter(id => targetIds.has(id))
     const ink = (Array.isArray(region.strokeIds) ? region.strokeIds : []).map(String).filter(id => strokeIds.has(id))
-    if (region.kind === 'target' ? !ids.length : region.kind !== 'blank' || !ink.length) return []
+    const selection = region.source === 'selection' && selections.find(item => item.id === region.selectionId)
+    if (region.source === 'selection') {
+      const points = selection?.points || []
+      if (points.length !== 4 || points.some(p => !Number.isFinite(p?.x) || !Number.isFinite(p?.y))) return []
+      const xs=points.map(p=>p.x), ys=points.map(p=>p.y)
+      const actual={x:Math.min(...xs),y:Math.min(...ys),w:Math.max(...xs)-Math.min(...xs),h:Math.max(...ys)-Math.min(...ys)}
+      if (Object.keys(actual).some(key => Math.abs(actual[key]-region.rect[key])>1) || ids.some(id => !selection.targetIds?.includes(id))) return []
+    }
+    if (region.kind === 'target' ? !ids.length : region.kind !== 'blank' || !ink.length && !selection) return []
     numbers.add(region.number)
     return [{ id: String(region.id).slice(0, 120), number: region.number, kind: region.kind,
       coordinateSpace: region.coordinateSpace === 'viewport' ? 'viewport' : 'web-document',
-      rect: { x: region.rect.x, y: region.rect.y, w: region.rect.w, h: region.rect.h }, targetIds: ids, strokeIds: ink }]
+      rect: { x: region.rect.x, y: region.rect.y, w: region.rect.w, h: region.rect.h }, targetIds: ids, strokeIds: ink,
+      ...(selection ? { source: 'selection', selectionId: selection.id } : {}) }]
   })
 }

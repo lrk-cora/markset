@@ -108,3 +108,12 @@ test('execution and undo/redo reflect actions, not merely suggestions', () => {
   journal.execution(group.id, '未执行', { failed: true })
   assert.equal(journal.undoLatest(), false)
 })
+
+test('correction summaries are display-only, never marked as model calls or successful execution',()=>{
+  const journal=createAgentJournal();journal.correction(group,'纠正区域 1 的对象和放置关系。')
+  const entry=journal.getEntries()[0]
+  assert.equal(entry.source,'correction');assert.equal(entry.model,'');assert.equal(entry.revision,3)
+  assert.equal(entry.execution,'');assert.match(entry.summary,/旧方案/)
+  assert.equal(journal.undoLatest(),false)
+  assert.doesNotMatch(JSON.stringify(entry),/must not store|screenshot|dom/)
+})

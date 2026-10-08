@@ -106,7 +106,7 @@ export function initDiagnosticsPanel({ journal, root = document }) {
       const reply = node('div', 'agent-message agent-reply')
       reply.dataset.status = entry.status
       const source = entry.status === 'pending' ? 'Agent · 正在理解' : entry.status === 'cancelled' ? 'Agent · 已停止'
-        : entry.source === 'local' ? 'Agent · 本地判断' : entry.source === 'fallback' ? 'Agent · 本地兜底' : 'Agent · AI 分析'
+        : entry.source === 'fixture' ? 'Agent · 预置错误（无模型调用）' : entry.source === 'correction' ? 'Agent · 用户纠正（无模型调用）' : entry.source === 'local' ? 'Agent · 本地判断' : entry.source === 'fallback' ? 'Agent · 本地兜底' : 'Agent · AI 分析'
       reply.append(node('span', 'agent-role', source))
       if (entry.error) reply.append(node('p', 'agent-error', entry.error))
       reply.append(node('p', '', entry.summary))

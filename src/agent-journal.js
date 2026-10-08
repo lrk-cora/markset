@@ -20,11 +20,11 @@ export function summarizeOperation(group = {}, instruction = '') {
   const strokes = group.strokes || []
   const counts = new Map()
   for (const stroke of strokes) { const shape = shapes[stroke.shape] || (stroke.closed ? '圈 / 框' : '笔迹'); counts.set(shape, (counts.get(shape) || 0) + 1) }
-  const mark = counts.size ? `画了${[...counts].map(([shape, count]) => ` ${count} 个${shape}`).join('、')}` : '选定了修改区域'
+  const mark = group.inputModality === 'text' ? '仅用文字描述目标，未圈选对象' : group.inputModality === 'selection' ? `用矩形选了 ${group.selections?.length || 0} 个区域` : counts.size ? `画了${[...counts].map(([shape, count]) => ` ${count} 个${shape}`).join('、')}` : '选定了修改区域'
   const targets = group.targets || []
   const typeCounts = new Map()
   for (const target of targets) { const kind = kinds[target.kind] || '组件'; typeCounts.set(kind, (typeCounts.get(kind) || 0) + 1) }
-  const targetText = targets.length ? `标记${[...typeCounts].map(([kind, count]) => ` ${count} 个${kind}对象`).join('、')}` : '标记了空白位置或尚未命中组件'
+  const targetText = targets.length ? `标记${[...typeCounts].map(([kind, count]) => ` ${count} 个${kind}对象`).join('、')}` : group.inputModality === 'text' ? '由本次目标和页面证据定位' : '标记了空白位置或尚未命中组件'
   const excerpt = targets.find((target) => target.text)?.text
   const input = clean(instruction || group.customInstruction || group.userInstruction, 400)
   return `${mark}，${targetText}${excerpt ? `（“${clean(excerpt, 40)}”）` : ''}。${input ? `要求：${input}` : ''}`
@@ -49,6 +49,12 @@ export function createAgentJournal({ maxEntries = 100, now = Date.now } = {}) {
     Object.assign(entry, patch); notify(); return true
   }
   return {
+    correction(group, label) {
+      const entry = {id:`agent-${++sequence}`,groupId:group?.id || '',revision:(group?.revision || 0)+1,
+        startedAt:now(),elapsedMs:0,status:'ready',source:'correction',user:clean(label,180),model:'',
+        summary:'纠正已保存，整份旧方案和预览已失效。笔迹、输入保留；由用户主动重新分析，再确认修改。',execution:''}
+      entries.push(entry);entries=entries.slice(-maxEntries);notify();return entry.id
+    },
     begin(group, { instruction = '', model = '', localIntent = null } = {}) {
       const entry = { id: `agent-${++sequence}`, groupId: group?.id || '', revision: group?.revision || 0,
         startedAt: now(), status: 'pending', user: summarizeOperation(group, instruction),

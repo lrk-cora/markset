@@ -35,6 +35,12 @@ export function readPageObservation(doc, selected = [], strokes = [], getRect) {
     }
   }
   const result = [], nodes = [], seen = new Set()
+  // Unmarked/text-only requests need readable page evidence without inventing
+  // a user selection. Bounded semantic modules; selectedIds remains empty.
+  if (!modules.size && !strokes.length && !selected.length) {
+    const semantic = all.filter(el => el.matches('section,article,[role="region"]') && !el.parentElement?.closest('section,article,[role="region"]'))
+    for (const module of (semantic.length ? semantic : [doc.querySelector('main') || doc.body]).slice(0,3)) modules.add(module)
+  }
   for (const module of [...modules].slice(0,3)) {
     const rect = getRect(module), signature = `${version}:${JSON.stringify(rect)}`
     let entries = cache.get(module)

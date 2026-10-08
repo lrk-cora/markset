@@ -70,3 +70,13 @@ test('the actual backend forwards matching UI region numbers to the planner and 
     assert.match(context.imageNotes, /角标.*序号/u)
   } finally { globalThis.fetch = nativeFetch }
 })
+
+test('invalid correction objects are rejected before any upstream call',async()=>{
+  const nativeFetch=globalThis.fetch
+  let calls=0
+  globalThis.fetch=async()=>{calls++;throw new Error('No network allowed')}
+  try {
+    await assert.rejects(brushIntent({MARKSET_MODEL_BASE_URL:'https://gateway.test/v1',MARKSET_MODEL_API_KEY:'dummy-not-a-secret',MARKSET_ALLOW_MODEL_CALLS:'1',MARKSET_BRUSH_MODEL:'test'},{targets:[],regions:[],bindingCorrections:{version:1,revision:1,bindings:[{regionId:'fabricated',role:'change',targetIds:['foreign']}],relations:[]}}),error=>{assert.equal(error.status,422);return true})
+    assert.equal(calls,0)
+  } finally {globalThis.fetch=nativeFetch}
+})

@@ -43,6 +43,8 @@ let captureTask = async () => ({})
 let modelTask = async () => { throw new Error('Unexpected model roundtrip') }
 let imageTask = async () => { throw new Error('Unexpected paid image request') }
 let verificationTask = async () => ({ok:true,checks:['mock-layout-adapter']})
+let observationTask = () => undefined
+let snapshotTask = () => undefined
 const liveRects = new Map()
 const layoutRects = new Map()
 const source = readFileSync(new URL('../src/main.js', import.meta.url), 'utf8')
@@ -53,6 +55,8 @@ globalThis.submissionAdapters = {
   setLassoMode: (on) => { drawingArmed = on },
   disarmDrawing: () => { drawingArmed = false },
   verifyBrushPlan: (...args) => verificationTask(...args),
+  observeBrushPage: (...args) => observationTask(...args),
+  brushBindingSnapshot: (...args) => snapshotTask(...args),
   createEditor: () => ({}), isWebDocActive: () => true, listWebEdits: () => [],
   applyBrushPlan: (plan) => {
     if (plan.type === 'color') return globalThis.submissionAdapters.applyBrushColor(plan.targets, plan.parameters?.color || plan.color || plan.replacementText)
@@ -98,6 +102,8 @@ const behavior = await import('../src/behavior-memory.js')
 await import('../src/main.js')
 const target = { webId: 'heading', kind: 'text', text: '原标题', context: { tag: 'h1' } }
 beforeEach(() => {
+  node('binding-inspector').open = false
+  node('btn-research-stop').dispatchEvent(new Event('click'))
   settings.resetBrushSettings()
   globalThis.testJournal.clear()
   calls.length = 0
@@ -108,6 +114,8 @@ beforeEach(() => {
   modelTask = async () => { throw new Error('Unexpected model roundtrip') }
   imageTask = async () => { throw new Error('Unexpected paid image request') }
   verificationTask = async () => ({ok:true,checks:['mock-layout-adapter']})
+  observationTask = () => undefined
+  snapshotTask = () => undefined
   behavior.clearBehaviorOverrides()
   store.resetBrushState()
   store.startGroup({
@@ -1084,5 +1092,101 @@ test('an apply-time failure never spends another model request or resets already
   node('btn-inline-primary').dispatchEvent(new Event('click'));for(let i=0;i<10;i++)await tick()
   assert.equal(calls.filter(call=>call.type==='model').length,0)
   assert.equal(store.getBrushState().group.analysisRetriesUsed,2)
+  assert.equal(store.getBrushState().group.analysisIssue.code,'agent_plan_invalid')
+})
+
+function openCorrectionFixture() {
+  if (!store.getBrushState().group) store.startGroup({id:'marked-title',revision:1,targets:[target],strokes:[],status:'suggested'})
+  const description = { webId:'description',kind:'text',text:'模块说明',context:{tag:'p',parentId:'module'},documentRect:{x:100,y:220,w:300,h:60} }
+  observationTask = () => ({ nodes:[description,{webId:'module',kind:'container',text:'原标题 模块说明',context:{tag:'section'},documentRect:{x:80,y:80,w:500,h:400}}],modules:[] })
+  store.patchGroup({targets:[{...target,context:{tag:'h1',parentId:'module'},documentRect:{x:100,y:100,w:300,h:60}}],strokes:[{id:'correction-ink',points:[{x:100,y:100}],shape:'dot'}],inferredIntent:concreteColor(),feedbackDraft:'保留我的要求'})
+  node('binding-inspector').open = true
+  node('binding-inspector').dispatchEvent(new Event('toggle'))
+  const row = node('binding-inspector-body').children.find(child=>child.dataset.regionId==='target:heading')
+  assert.ok(row,'the inspector renders the actual region')
+  const controls = row.children.flatMap(child=>child.children || [])
+  return { row, control: label => controls.find(control=>control['aria-label']===label), save: () => row.children.find(child=>child.textContent==='保存纠正').dispatchEvent(new Event('click')), description }
+}
+
+test('saving direct correction is local, invalidates the entire plan and preserves ink/input/assets', async t => {
+  t.mock.timers.enable({apis:['setTimeout']})
+  const {control,save} = openCorrectionFixture()
+  store.patchGroup({imageAssets:[{id:'existing-image',url:'data:image/png;base64,cached'}]})
+  const before = store.getBrushState().group
+  control('区域 1 的对象').value='description'
+  control('区域 1 的角色').value='change'
+  save(); t.mock.timers.tick(5000); await tick()
+  const after=store.getBrushState().group
+  assert.equal(after.revision,before.revision+1);assert.equal(after.inferredIntent,null)
+  assert.equal(after.strokes,before.strokes);assert.equal(after.feedbackDraft,before.feedbackDraft);assert.equal(after.imageAssets,before.imageAssets)
+  assert.equal(after.bindingCorrections.bindings[0].targetIds[0],'description')
+  assert.equal(after.analysisPaused,true);assert.equal(node('btn-analyze-strokes').hidden,false)
+  assert.equal(calls.filter(call=>['model','color','generate-image'].includes(call.type)).length,0)
+})
+
+test('a correction cancels a running request; its late result cannot overwrite the corrected group', async () => {
+  const {control,save} = openCorrectionFixture()
+  let release
+  modelTask=()=>new Promise(resolve=>{release=resolve})
+  node('btn-inline-retry').dispatchEvent(new Event('click'));await until(()=>release)
+  control('区域 1 的角色').value='preserve';save()
+  release({model:'test',intent:concreteColor()});for(let i=0;i<10;i++)await tick()
+  assert.equal(store.getBrushState().group.inferredIntent,null)
+  assert.equal(store.getBrushState().group.bindingCorrections.bindings[0].role,'preserve')
+  assert.equal(calls.filter(call=>call.type==='model').length,1)
+  assert.equal(calls.filter(call=>call.type==='color').length,0)
+})
+
+test('explicit reanalysis sends corrections once, publishes a new stamped plan and requires separate Apply', async () => {
+  const {control,save,description}=openCorrectionFixture()
+  control('区域 1 的对象').value='description';control('区域 1 的角色').value='change';save()
+  let submitted
+  modelTask=async payload=>{submitted=payload;return{model:'test',intent:{...concreteColor(),targets:[description]}}}
+  node('btn-analyze-strokes').dispatchEvent(new Event('click'))
+  await until(()=>store.getBrushState().group?.status==='suggested'&&!store.getBrushState().group?.modelPending)
+  assert.equal(submitted.bindingCorrections.revision,1)
+  assert.ok(submitted.targets.some(target=>target.webId==='description'))
+  assert.equal(store.getBrushState().group.inferredIntent.bindingStamp.bindingRevision,1)
+  assert.equal(calls.filter(call=>call.type==='color').length,0)
+  node('btn-inline-primary').dispatchEvent(new Event('click'));await until(()=>calls.some(call=>call.type==='color'))
+  assert.equal(calls.find(call=>call.type==='color').targets[0].webId,'description')
+  assert.equal(calls.filter(call=>call.type==='model').length,1)
+})
+
+test('semantic target change during execution verification blocks Apply without a repair request', async () => {
+  let text='原标题'
+  snapshotTask=()=>[{id:'heading',parent:'module',text,src:''}]
+  store.patchGroup({inferredIntent:concreteColor(),bindingSnapshot:snapshotTask()})
+  verificationTask=async()=>{text='其他程序修改了原标题';return{ok:true}}
+  node('btn-inline-primary').dispatchEvent(new Event('click'));for(let i=0;i<10;i++)await tick()
+  assert.equal(calls.filter(call=>call.type==='color').length,0)
+  assert.equal(calls.filter(call=>call.type==='model').length,0)
+  assert.equal(store.getBrushState().group.analysisIssue.code,'agent_plan_invalid')
+  assert.equal(store.getBrushState().group.validation.issues[0].code,'binding-page-changed')
+})
+
+test('the no-direct-correction study condition is enforced, not merely a label',()=>{
+  store.clearGroup()
+  node('research-consent').checked=true;node('research-condition').value='ink-no-correction';node('research-trial').value='T1A';node('research-participant').value='P01'
+  node('btn-research-start').dispatchEvent(new Event('click'))
+  const {control,save}=openCorrectionFixture()
+  assert.equal(control('区域 1 的角色').disabled,true)
+  control('区域 1 的角色').value='preserve';save()
+  assert.equal(store.getBrushState().group.revision,1)
+  assert.equal(store.getBrushState().group.inferredIntent.type,'color')
+  assert.equal(calls.filter(call=>call.type==='model').length,0)
+  node('btn-research-stop').dispatchEvent(new Event('click'))
+})
+
+test('changed correction source is rejected before requesting the model; geometry is not part of the snapshot',async()=>{
+  let text='原标题'
+  snapshotTask=()=>[{id:'heading',parent:'module',text,src:''}]
+  const {control,save}=openCorrectionFixture()
+  control('区域 1 的角色').value='preserve';save()
+  text='已被外部程序修改'
+  node('btn-analyze-strokes').dispatchEvent(new Event('click'))
+  await until(()=>Boolean(store.getBrushState().group?.analysisIssue))
+  assert.equal(calls.filter(call=>call.type==='model').length,0)
+  assert.equal(store.getBrushState().group.feedbackDraft,'保留我的要求')
   assert.equal(store.getBrushState().group.analysisIssue.code,'agent_plan_invalid')
 })

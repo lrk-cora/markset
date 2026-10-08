@@ -5,7 +5,7 @@ import { getInkStrokes, inkToDataUrl } from './ink.js'
 import { getPaintMarks, lastPaintPoints } from './overlay.js'
 import { displayStrokePoints, drawCanvasStroke } from './stroke-render.js'
 import { drawBrushRegionNumbers } from './brush-regions.js'
-import { describeCircledHits, insertHostScreenBox, isWebDocActive, screenToWebDocumentPoint } from './web-doc.js'
+import { describeCircledHits, insertHostScreenBox, isWebDocActive, screenToWebDocumentPoint, webDocumentToScreenPoint } from './web-doc.js'
 import { habitForShape, habitForStroke, habitGuess, listMarkFingerprints, shapeTitle } from './symbol-habits.js'
 import { createRevisionCache } from './revision-cache.js'
 import { pageEvidenceVersion, pageEvidenceCacheable } from './page-evidence-version.js'
@@ -166,6 +166,14 @@ async function compositePageAndStrokes(pageDataUrl, regions = []) {
       if (space) return region.coordinateSpace === 'web-document' ? { x: point.x * space.scaleX, y: point.y * space.scaleY } : space.toImagePoint(point)
       return { x: (point.x - frame.left) * canvas.width / frame.width, y: (point.y - frame.top) * canvas.height / frame.height }
     }, space ? space.scaleX / zoom : canvas.width / frame.width)
+    // Rectangular selection receives the same visible positional feedback but
+    // never a fabricated raw stroke/gesture in either image or model JSON.
+    for (const region of regions.filter(item => item.source === 'selection')) {
+      const r = region.rect
+      const sx = space ? space.scaleX : canvas.width / frame.width, sy = space ? space.scaleY : canvas.height / frame.height
+      ctx.strokeStyle = '#315cf6'; ctx.lineWidth = 2; ctx.setLineDash([5,4])
+      ctx.strokeRect(r.x*sx,r.y*sy,r.w*sx,r.h*sy); ctx.setLineDash([])
+    }
     return canvas.toDataURL('image/jpeg', 0.86)
   } catch {
     return pageDataUrl
@@ -651,7 +659,7 @@ async function capturePlannerScene({ regions, signal }) {
   const page = plannerPage()
   const version = pageEvidenceVersion(page.doc, page.root)
   if (base.version && base.version !== version) throw Object.assign(new Error('页面已变化，请重新分析'), { code: 'capture_page_changed' })
-  const points = allStrokePoints()
+  const points = [...allStrokePoints(), ...regions.filter(r => r.source === 'selection').flatMap(({rect:r}) => [{x:r.x,y:r.y},{x:r.x+r.w,y:r.y+r.h}].map(webDocumentToScreenPoint))]
   const source = await compositePageAndStrokes(base.value, regions)
   signal?.throwIfAborted()
   // Decode once; derive both images from the same pixels/coordinate snapshot.

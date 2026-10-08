@@ -302,6 +302,17 @@ function findByWebId(id) {
   return doc.querySelector(`[data-markset-id="${CSS.escape(String(id))}"]`)
 }
 
+// Semantic binding snapshot deliberately excludes pixels, viewport and scroll.
+// Sidebar reflow must not invalidate a user's confirmation; changed content or
+// parent identity must. Full strings remain local and never enter study logs.
+export function brushBindingSnapshot(ids = []) {
+  return [...new Set(ids.map(String))].sort().map(id => {
+    const node = findByWebId(id)
+    return node ? { id, tag: node.tagName, parent: node.parentElement?.getAttribute('data-markset-id') || '',
+      text: String(node.textContent || '').replace(/\s+/gu, ' ').trim(), src: node.getAttribute('src') || '', srcset:node.getAttribute('srcset') || '' } : { id, missing: true }
+  })
+}
+
 let webEdits = []
 let webEditSeq = 0
 

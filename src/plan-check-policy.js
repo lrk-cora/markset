@@ -1,4 +1,5 @@
 // Keep the first proposal. Validation never spends another model call, even
+import { correctionDescriptions } from './binding-corrections.js'
 // for malformed output. Transport retries remain a separate bounded policy.
 export const MAX_PLAN_REPAIRS = 0
 export const MINOR_HORIZONTAL_OVERFLOW_PX = 12
@@ -7,6 +8,7 @@ export const planRepairCount = value => Math.min(2, Math.max(0, Math.floor(Numbe
 export const resultRepairCount = result => planRepairCount(result?.repairsUsed ?? (result?.repaired ? 1 : 0))
 
 const descriptions = {
+  ...correctionDescriptions,
   'invalid-plan-json': 'AI 方案格式不完整',
   'mixed-read-and-submit': 'AI 把查证与提交方案混在同一步',
   'unknown-target': '修改目标已失效或不在允许范围',

@@ -5,9 +5,12 @@ import { requestBailianImage } from './bailian-image.js'
 import { brushResponseFormat } from './brush-plan.js'
 import { planningSystem, runPlanningAgent } from './planning-agent.js'
 import { planningTargets } from '../src/edit-capabilities.js'
+import { normalizeBindingCorrections, bindingTargetPool } from '../src/binding-corrections.js'
 import { sampleStrokePoints, initialPlanningEvidence, compactPlanningContext } from '../src/planning-evidence.js'
 import { startAnalysisStream } from './analysis-stream.js'
 import { planningRegionEvidence } from '../src/brush-regions.js'
+import { RESEARCH_CONDITIONS, researchPolicy, flatResearchObservation } from '../src/research-conditions.js'
+import { STUDY_TASKS, STUDY_IMAGE } from '../src/study-tasks.js'
 import { randomUUID } from 'node:crypto'
 import { requestModelChat } from './model-chat.js'
 import { createModelStatusProbe } from './model-status.js'
@@ -230,9 +233,19 @@ function normalizeBounds(value) {
 
 export async function brushIntent(env, payload, { signal, onRawOutput, onProgress } = {}) {
   const gateway = modelGateway(env)
-  const targets = planningTargets(Array.isArray(payload.targets) ? payload.targets.slice(0,24) : [], payload.observation)
-  const strokes = Array.isArray(payload.strokes) ? payload.strokes.slice(0, 12) : []
-  const regions = planningRegionEvidence(Array.isArray(payload.regions) ? payload.regions : [], targets.filter(target => target.selected !== false), strokes)
+  const condition = Object.hasOwn(RESEARCH_CONDITIONS,payload.researchCondition || '') ? payload.researchCondition : null
+  const studyPolicy = researchPolicy(condition)
+  if (condition && !studyPolicy.correction && payload.bindingCorrections?.revision) throw requestFailure('当前对照条件关闭直接纠正','study-correction-disabled',422)
+  const authoritativeObservation = condition && studyPolicy.input === 'text' ? { ...payload.observation, selectedIds:[], strokeEndpoints:[] } : payload.observation
+  const plannerObservation = condition && !studyPolicy.relations ? flatResearchObservation(authoritativeObservation) : authoritativeObservation
+  let targets = planningTargets(studyPolicy.input === 'text' ? [] : Array.isArray(payload.targets) ? payload.targets.slice(0,48) : [], authoritativeObservation)
+  const strokes = studyPolicy.input !== 'ink' ? [] : Array.isArray(payload.strokes) ? payload.strokes.slice(0, 12) : []
+  const selections = studyPolicy.input === 'selection' && Array.isArray(payload.selections) ? payload.selections.slice(0,48) : []
+  const regions = studyPolicy.input === 'text' ? [] : planningRegionEvidence(Array.isArray(payload.regions) ? payload.regions : [], targets.filter(target => target.selected !== false), strokes, selections)
+  const correctionResult = normalizeBindingCorrections(payload.bindingCorrections, targets, regions)
+  if (!correctionResult.ok) throw requestFailure('用户纠正数据无效',correctionResult.reason,422)
+  const corrections = correctionResult.value
+  targets = bindingTargetPool(targets.filter(target => target.selected !== false), authoritativeObservation, corrections)
   const regionNumbers = new Map(regions.flatMap(region => region.targetIds.map(id => [id, region.number])))
   const images = Array.isArray(payload.imageDataUrls) ? payload.imageDataUrls.filter(Boolean).slice(0, 3) : []
   const pageText = String(payload.pageText || '').slice(0, 5000)
@@ -252,8 +265,11 @@ export async function brushIntent(env, payload, { signal, onRawOutput, onProgres
   const instruction = planningSystem
   const context = {
     coordinateSpace: 'web-document',
-    imageNotes: '图片依次为带笔迹的整页缩略图、标记区域放大图。蓝底白字角标为与用户界面一致的区域序号，不是网页内容或手写笔迹。数值坐标为原网页 CSS 像素，不是缩放后图片像素。',
+    inputModality: studyPolicy.input,
+    fixedImageResource: condition && STUDY_TASKS.some(t => t.id === payload.studyTaskId && t.kind === 'module-image') ? { url: STUDY_IMAGE, note: '本轮为固定素材放置任务。使用此资源，不生成图片；只设计位置和必要样式，保留原文。' } : null,
+    imageNotes: studyPolicy.input === 'text' ? '未标记的整页截图。用户未选中任何对象，依据文字目标和合法页面证据定位；观察权限不是写入授权，方案仍须声明范围并确认。' : `${studyPolicy.input === 'selection' ? '常规矩形选择，不含手写笔迹或箭头' : '原始笔迹'}的整页缩略图和局部图。角标与界面区域序号一致，不是网页内容或动作命令。坐标为原网页CSS像素，不是缩放后图片像素。`,
     regions,
+    userCorrections: corrections.revision ? corrections : null,
     strokes: strokes.map((stroke) => ({
       id:stroke.id || '',closed:Boolean(stroke.closed),role:stroke.role || '',
       shape: stroke.shape || '',
@@ -271,21 +287,21 @@ export async function brushIntent(env, payload, { signal, onRawOutput, onProgres
       rect: target.documentRect || target.screenRect || null,
       viewportRect: target.screenRect || null,
       documentRect: target.documentRect || null,
-      context: target.context || null,
+      context: !studyPolicy.relations ? { tag:target.context?.tag } : target.context || null,
       charRects: Array.isArray(target.charRects) ? target.charRects.slice(0, 1200).map((item) => ({ index: item.index, char: item.char, rect: item.documentRect || item.screenRect || null })) : [],
       textFragments: Array.isArray(target.textFragments) ? target.textFragments.slice(0, 20) : [],
       markedRanges: Array.isArray(target.markedRanges) ? target.markedRanges.slice(0, 20) : [],
     })),
     pageText,
     userInstruction,
-    localEvidence: payload.localInterpretation?.evidence || null,
-    moduleCatalog: payload.observation?.modules || [],
-    initialEvidence: initialPlanningEvidence(payload.observation),
-    strokeEndpoints: payload.observation?.strokeEndpoints || [],
+    localEvidence: !studyPolicy.relations ? null : payload.localInterpretation?.evidence || null,
+    moduleCatalog: plannerObservation?.modules || [],
+    initialEvidence: initialPlanningEvidence(plannerObservation),
+    strokeEndpoints: plannerObservation?.strokeEndpoints || [],
     answeredClarifications: payload.answeredClarifications || [],
-    evidence: payload.evidence || null,
-    preferences,
-    behaviorMemory,
+    evidence: !studyPolicy.relations ? null : payload.evidence || null,
+    preferences: condition ? [] : preferences,
+    behaviorMemory: condition ? null : behaviorMemory,
   }
   // The system message already contains these rules. Duplicating them in the
   // user message increases vision-request latency without adding evidence.
@@ -302,7 +318,7 @@ export async function brushIntent(env, payload, { signal, onRawOutput, onProgres
   const retryBudget=Number.isInteger(payload.retryBudget) ? Math.max(0,Math.min(2,payload.retryBudget)) : 2
   try {
     const result = await withDeadline((totalSignal) => runPlanningAgent({
-      targets, observation:payload.observation, fallback:payload.localInterpretation, instruction:userInstruction,
+      targets, observation:plannerObservation, fallback:payload.localInterpretation, instruction:userInstruction, corrections,
       signal:totalSignal, repairFeedback:payload.repairFeedback,
       onProgress:(trace)=>{
         progressTrace=trace

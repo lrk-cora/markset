@@ -4,7 +4,7 @@
 
 ## 配置与地域
 
-- 私有密钥仅从服务器的 `D:/doctor/Key/阿里.txt` 读取，`.env` 只保存文件引用。
+- 迁移时开发机使用服务器私有文件引用，`.env` 不保存 Key。2026-10-08 起，新克隆默认读取项目内 `.markset-private/阿里.txt`，不依赖开发机目录；已有 `.env` 路径仍优先。安装与 Key 放置位置见 [README](../README.md#克隆后运行放好-key-即可无需-env)。
 - 地域已用官方模型列表鉴权确认：北京 `cn-beijing` 成功，列出了四个指定模型；其他已检查地域鉴权失败。日常请求固定在北京，不自动跨地域尝试。
 - 使用仍受官方支持的 `https://dashscope.aliyuncs.com`。没有业务空间 ID，未猜测或伪造专属域名。
 - `.env`、`.markset-private/`、`output/` 均已 Git 忽略。密钥不进入 VITE 变量、浏览器请求或日志。

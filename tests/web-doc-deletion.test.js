@@ -280,3 +280,15 @@ test('valid but ineffective CSS is a nonblocking design warning, not a reason to
   assert.equal(web.applyBrushPlan(valid).ok,true)
   assert.equal(auditPlanResult(valid,before,measurePlanDocument(doc())).ok,true)
 })
+
+test('semantic binding snapshots use live content, ancestry and image sources, never viewport geometry',()=>{
+  const before=web.brushBindingSnapshot(['heading','module'])
+  document.getElementById('web-doc-frame').style.width='500px';doc().documentElement.style.width='480px'
+  assert.deepEqual(web.brushBindingSnapshot(['heading','module']),before)
+  doc().getElementById('heading').textContent='已变化的内容'
+  assert.notDeepEqual(web.brushBindingSnapshot(['heading','module']),before)
+  const image=doc().createElement('img');image.setAttribute('data-markset-id','source-image');image.src='data:image/png;base64,fixture';image.setAttribute('srcset','data:image/png;base64,original 2x');doc().getElementById('module').append(image)
+  const original=web.brushBindingSnapshot(['source-image']);image.setAttribute('srcset','data:image/png;base64,changed 2x')
+  assert.notDeepEqual(web.brushBindingSnapshot(['source-image']),original)
+  assert.equal(web.brushBindingSnapshot(['missing-binding'])[0].missing,true)
+})

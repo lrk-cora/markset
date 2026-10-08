@@ -214,3 +214,22 @@ body.is-panel-collapsed .rail-icon.is-active{border-color:rgba(49,92,246,.18);ba
 @keyframes status-glow{50%{color:var(--status-end);box-shadow:0 0 0 2px var(--status-soft)}}
 @keyframes status-turn{to{transform:rotate(360deg)}}
 @media(prefers-reduced-motion:reduce){.inline-proposal[data-status],.inline-proposal[data-status]::before,.inline-proposal[data-status] .inline-proposal-kicker,.inline-status-glyph{transition:none}.inline-status-visual.is-busy .inline-status-glyph,.inline-status-visual[data-status="retry"] svg{animation:none}}
+/* Inspect/correct is optional, local and visually distinct from Apply. */
+.binding-inspector { margin: 10px 0 16px; border: 1px solid #dce3f4; border-radius: 12px; background: #f7f9ff; color: #283650; }
+.inline-proposal:has(#binding-inspector[open]) { max-height: calc(100vh - 96px); overflow-y: auto; }
+.binding-inspector summary, .research-controls summary { cursor: pointer; padding: 10px 12px; font-weight: 650; font-size: 13px; }
+.binding-inspector-body { max-height: min(380px, 45vh); overflow: auto; padding: 0 12px 12px; }
+.binding-row { border-top: 1px solid #dce3f4; padding-top: 10px; margin-top: 8px; }
+.binding-row strong { font-size: 13px; }
+.binding-help, .binding-message { font-size: 12px; line-height: 1.5; margin: 6px 0; overflow-wrap: anywhere; }
+.binding-message { color: #a93434; }
+.binding-field { display: grid; gap: 4px; font-size: 12px; margin: 8px 0; }
+.binding-field select, .binding-field input { width: 100%; min-width: 0; box-sizing: border-box; border: 1px solid #cfd8ec; border-radius: 8px; padding: 7px; background: white; color: #283650; font: inherit; }
+.binding-field :focus-visible { outline: 2px solid #4869ff; outline-offset: 2px; }
+.binding-highlight { position: fixed; pointer-events: none; z-index: 120; border: 3px solid #009b86; border-radius: 4px; background: #00ae9018; box-sizing: border-box; }
+#research-selection-layer { position:fixed; z-index:25; touch-action:none; cursor:crosshair; overflow:hidden; }
+#research-selection-layer[hidden] { display:none; }
+.research-selection-box { position:absolute; box-sizing:border-box; border:2px dashed #315cf6; background:#315cf608; pointer-events:none; }
+.research-controls textarea { min-height:70px; resize:vertical; }
+.research-controls { margin: 10px 0; border: 1px solid #dce3f4; border-radius: 10px; padding: 6px; }
+.research-buttons { display: flex; flex-wrap: wrap; gap: 12px; }

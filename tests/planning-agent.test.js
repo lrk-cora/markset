@@ -204,3 +204,19 @@ test('a batch scope disclosure applies to its own child steps and never authoriz
   batch.steps[0].targets=[{webId:'unseen',kind:'text'}]
   assert.equal(validateIntentPlan(batch,targets).reason,'batch:unknown-target')
 })
+
+test('explicit role corrections stop a conflicting model plan after one call, with no repair',async()=>{
+  let calls=0
+  const corrections={version:1,revision:1,bindings:[{regionId:'target:heading',role:'context',targetIds:['heading'],originalTargetIds:['heading']}],relations:[]}
+  await assert.rejects(runPlanningAgent({targets,observation,corrections,messages:[],instruction:'强化标题',chat:async()=>{calls++;return{role:'assistant',content:JSON.stringify({intentType:'color',suggestion:'标题改红',rationale:'强化标题',strategy:'修改前景色',targetIds:['heading'],color:'red'})}}}),error=>{
+    assert.equal(error.reason,'binding-context-write');assert.equal(error.repairsUsed,0);return true
+  })
+  assert.equal(calls,1)
+})
+
+test('corrected placement succeeds as one plan call and keeps a stable relation ID through normalization',async()=>{
+  let calls=0
+  const corrections={version:1,revision:1,bindings:[{regionId:'target:heading',role:'preserve',targetIds:['heading'],originalTargetIds:['heading']}],relations:[{regionId:'target:heading',anchorId:'description',placement:'after'}]}
+  const result=await runPlanningAgent({targets,observation,corrections,messages:[],chat:async()=>{calls++;return{role:'assistant',content:JSON.stringify({...raw,regionId:'target:heading'})}}})
+  assert.equal(result.intent.regionId,'target:heading');assert.equal(calls,1);assert.equal(result.repairsUsed,0);assert.equal(result.intent.requiresConfirmation,true)
+})

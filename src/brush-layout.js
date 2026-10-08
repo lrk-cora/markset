@@ -57,7 +57,7 @@ function relocatePlan(plan, changes, targets) {
 export function reflowBrushGroup(group, resolveRect, refreshTarget = (target) => target) {
   if (!group || group.coordinateSpace !== 'web-document') return group
   const changes = []
-  const strokes = (group.strokes || []).map((stroke) => {
+  const reproject = (stroke) => {
     const anchor = stroke.layoutAnchor
     if (!anchor || !validLayoutRect(anchor.originalRect)) return stroke
     let rect
@@ -68,12 +68,14 @@ export function reflowBrushGroup(group, resolveRect, refreshTarget = (target) =>
       layoutAnchor: { ...anchor, currentRect: { ...rect } } }
     changes.push({ before: stroke, after: next })
     return next
-  })
+  }
+  const strokes = (group.strokes || []).map(reproject)
+  const selections = (group.selections || []).map(reproject)
   if (!changes.length) return group
   const targets = (group.targets || []).map((target) => {
     try { return refreshTarget(target) || target } catch { return target }
   })
-  return { ...group, strokes, targets,
+  return { ...group, strokes, selections, targets,
     inferredIntent: relocatePlan(group.inferredIntent, changes, targets),
     localIntent: relocatePlan(group.localIntent, changes, targets),
   }

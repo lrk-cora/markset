@@ -3,7 +3,7 @@ import { applyImportedPage, createEditor, refreshDecorations, showStartGuide } f
 import { generateImage, importPage, planBrushIntent } from './api.js'
 import { aabb, classifyMarkShape, classifyStrokeShape } from './geometry.js'
 import { bindLasso, clearPaintMarks, disarmDrawing, SELECT_COLOR, setLassoMode, setPaintMarks } from './overlay.js'
-import { applyBrushPlan, attachBrushLayoutAnchor, brushOriginalImage, applyBrushColor, applyBrushDelete, applyBrushImageReplacement, applyBrushLayoutReorder, applyBrushTextDeletion, applyBrushTextReplacement, excludeBrushTargets, expandBrushTargets, exportWebDoc, hitWebDoc, insertWebText, isWebDocActive, listWebEdits, liveScreenRect, observeBrushPage, redoWebEdit, refreshBrushTargetGeometry, refreshWebDocLayout, resolveBrushLayoutRect, screenToWebDocumentPoint, screenToWebDocumentRect, webDocumentRectToScreen, webDocumentToScreenPoint, undoWebEditsSince, unmountWebDoc, verifyBrushPlan } from './web-doc.js'
+import { brushBindingSnapshot, applyBrushPlan, attachBrushLayoutAnchor, brushOriginalImage, applyBrushColor, applyBrushDelete, applyBrushImageReplacement, applyBrushLayoutReorder, applyBrushTextDeletion, applyBrushTextReplacement, excludeBrushTargets, expandBrushTargets, exportWebDoc, hitWebDoc, insertWebText, isWebDocActive, listWebEdits, liveScreenRect, observeBrushPage, redoWebEdit, refreshBrushTargetGeometry, refreshWebDocLayout, resolveBrushLayoutRect, screenToWebDocumentPoint, screenToWebDocumentRect, webDocumentRectToScreen, webDocumentToScreenPoint, undoWebEditsSince, unmountWebDoc, verifyBrushPlan } from './web-doc.js'
 import { addHistory, addPreference, clearGroup, clearPreferences, getBrushState, patchBrush, patchGroup, patchGroupAnalysis, resetBrushState, setPreferenceRecording, startGroup, subscribeBrush } from './brush-store.js'
 import { interpretGroup } from './gesture-interpreter.js'
 import { reflowBrushGroup, verifyReflowedBrushPlan } from './brush-layout.js'
@@ -25,8 +25,14 @@ import { createAgentJournal } from './agent-journal.js'
 import { initDiagnosticsPanel } from './diagnostics-panel.js'
 import { getBrushSettings, subscribeBrushSettings } from './brush-settings.js'
 import { initBrushSettingsPanel } from './brush-settings-panel.js'
+import { bindingTargetPool, normalizeBindingCorrections, checkBindingConstraints, correctionPatch, stampBindingPlan, checkBindingStamp, bindingReferenceIds, checkBindingSnapshot, correctionDescriptions, inspectionRegions } from './binding-corrections.js'
+import { initBindingPanel } from './binding-panel.js'
+import { createResearchLog, initResearchPanel } from './research-log.js'
+import { researchPolicy, researchPlanningPayload } from './research-conditions.js'
+import { initResearchSelection } from './research-selection.js'
+import { STUDY_TASKS,studyTaskHtml,injectedStudyPlan,materializeStudyResources } from './study-tasks.js'
 import { candidateForChoice, clarificationChoices, clarificationNeedsContent, formatClarificationAnswer, isAnnotationChoice, recommendedClarificationChoice, wasClarificationAnswered } from './proposal-choices.js'
-import { clearBehaviorOverrides, getAgentBehaviorContext, getBehaviorMemory, getEffectiveBehaviorProfile, markLatestEpisodeUndone, recordEditEpisode, recordExplicitPreference, removeMemory, setBehaviorLearning, setBehaviorPreference, subscribeBehaviorMemory } from './behavior-memory.js'
+import { DEFAULT_BEHAVIOR_PROFILE, clearBehaviorOverrides, getAgentBehaviorContext, getBehaviorMemory, getEffectiveBehaviorProfile, markLatestEpisodeUndone, recordEditEpisode, recordExplicitPreference, removeMemory, setBehaviorLearning, setBehaviorPreference, subscribeBehaviorMemory } from './behavior-memory.js'
 
 const editor = createEditor(document.getElementById('editor'))
 showStartGuide()
@@ -48,6 +54,79 @@ const BRUSH_MODEL_TIMEOUT_MS = MODEL_CLIENT_TIMEOUT_MS
 let strokeActive = false
 let evidenceWarmup = null
 let analysisClock = null
+const researchLog = createResearchLog()
+const researchPanel = initResearchPanel(researchLog, { canStart: () => !getBrushState().group,
+  onChange: () => { clearTimeout(analysisTimer); disarmDrawing(); patchBrush({ mode: 'browse' }); bindingPanel.render(true); renderResearchInput(); render() } })
+const researchSelection = initResearchSelection({ layer: $('research-selection-layer'), getFrame: () => $('web-doc-frame'), getGroup: () => getBrushState().group,
+  enabled: () => researchPolicy(researchLog.condition()).input === 'selection' && getBrushState().pageLoaded,
+  project: webDocumentToScreenPoint,
+  onStart: () => { clearTimeout(analysisTimer); cancelModelAnalysis(); researchEvent('input') },
+  onFinish: onResearchSelection,
+})
+function effectiveBehaviorProfile() { return researchLog.condition() ? DEFAULT_BEHAVIOR_PROFILE : getEffectiveBehaviorProfile() }
+function activeStudyTask() {
+  const session = researchLog.session(), mounted = $('web-doc-frame')?.contentDocument?.getElementById('task-root')?.getAttribute('data-markset-study-task')
+  return session && session.trial === mounted ? mounted : null
+}
+function renderResearchInput() {
+  const policy = researchPolicy(researchLog.condition())
+  $('research-text-request').hidden = policy.input !== 'text'
+  $('research-input-help').textContent = policy.input === 'text' ? '纯文字条件：不圈选对象；输入目标，点击分析，再单独确认修改。' : policy.input === 'selection' ? '矩形多选条件：在网页拖出多个矩形；用文字描述目标和关系，不画箭头。' : researchLog.condition() ? '笔迹条件：标记后主动点击开始分析；不自动分析，不使用个人习惯。' : ''
+  researchSelection.render()
+}
+function onResearchSelection(points) {
+  const current = getBrushState().group
+  const hits = hitWebDoc(points, { loose: true })
+  const targets = [...(hits?.texts?.found || []), ...(hits?.images?.found || [])]
+  const selection = attachBrushLayoutAnchor({ id: crypto.randomUUID(), points: points.map(toBrushCoordinate), targetIds: targets.map(t => String(t.webId)) }, targets)
+  const base = current || { ...createGroup(null), inputModality: 'selection', selections: [] }
+  startGroup({ ...base, revision: current ? current.revision + 1 : 1, targets: mergeHitTargets(base.targets,targets), selections: [...(base.selections || []),selection],
+    strokes: [], status:'draft', analysisPaused:true, inferredIntent:null, preview:null, modelPending:false, analysisProgress:null, bindingSnapshot:null, modelError:'',analysisIssue:null })
+  render()
+}
+const shownSuggestions = new Set()
+let inspectorObservation = null, inspectorKey = ''
+function researchEvent(event, data = {}) {
+  const group = getBrushState().group
+  researchLog.record(event, { revision: group?.revision || 0, bindingRevision: group?.bindingRevision || 0,
+    strokeCount: group?.strokes?.length || 0, targetCount: group?.targets?.length || 0, regionCount:group ? numberedBrushRegions(group).length : 0, ...data })
+  researchPanel.update()
+}
+function bindingEvidence(readFresh = false) {
+  const group = getBrushState().group
+  if (!group) return { group: null, regions: [], targets: [] }
+  if (!readFresh) return { group, regions: inspectionRegions(group,numberedBrushRegions(group)), targets: [] }
+  const key = `${group.id}:${group.revision}`
+  if (readFresh && inspectorKey !== key) { inspectorObservation = observeBrushPage(group); inspectorKey = key }
+  const observation = inspectorKey === key && inspectorObservation ? inspectorObservation : group.observation
+  return { group, regions: inspectionRegions(group,numberedBrushRegions(group)), targets: bindingTargetPool(group.targets, observation, group.bindingCorrections), observation }
+}
+const bindingPanel = initBindingPanel({ root: $('binding-inspector'), getEvidence: bindingEvidence,
+  canCorrect: () => researchPolicy(researchLog.condition()).correction,
+  onLayout: () => requestAnimationFrame(() => positionInlineProposal(getBrushState().group)),
+  onHighlight: target => {
+    const node = $('binding-highlight'), rect = target && liveScreenRect(target)
+    node.hidden = !rect
+    if (rect) Object.assign(node.style, { left: `${rect.x}px`, top: `${rect.y}px`, width: `${rect.w}px`, height: `${rect.h}px` })
+  },
+  onCorrect: (binding, relation) => {
+    const { group, regions, targets, observation } = bindingEvidence(true)
+    if (!group || group.applying || !researchPolicy(researchLog.condition()).correction) return { ok: false, reason: 'binding-plan-stale' }
+    const previous = group.bindingCorrections || { bindings: [], relations: [] }
+    const raw = { version: 1, revision: (group.bindingRevision || 0) + 1,
+      bindings: binding ? [...previous.bindings.filter(item => item.regionId !== binding.regionId), binding] : [],
+      relations: binding ? [...previous.relations.filter(item => item.regionId !== binding.regionId), ...(relation ? [relation] : [])] : [] }
+    const checked = normalizeBindingCorrections(raw, targets, regions)
+    if (!checked.ok) return checked
+    clearTimeout(analysisTimer); cancelModelAnalysis()
+    agentJournal.correction(group,binding ? `纠正区域 ${regions.find(item=>item.id===binding.regionId)?.number || ''} 的对象或角色${binding.range ? '、文字范围' : ''}${relation ? '和放置关系' : ''}。` : '清除本组全部纠正，重新确定目标。')
+    researchEvent('correction', { role: binding?.role || 'auto', changedObject: Boolean(binding && JSON.stringify(binding.targetIds) !== JSON.stringify(regions.find(item => item.id === binding.regionId)?.targetIds || [])), changedRange: Boolean(binding?.range), changedRelation: Boolean(relation) })
+    patchGroup({ ...correctionPatch(group, checked.value), observation,
+      correctionSnapshot:brushBindingSnapshot(bindingReferenceIds({bindingCorrections:checked.value},null)) })
+    toast('纠正已保存，旧方案失效。点击开始分析，不会自动调用模型。')
+    render(); return { ok: true }
+  },
+})
 
 function stopAnalysisClock() { clearInterval(analysisClock); analysisClock = null }
 function renderAnalysisProgress(group) {
@@ -99,7 +178,7 @@ function proposalAnchor(group) {
   // The card belongs to the gesture, not to the full DOM hit area. Using the
   // stroke bounds keeps it close to the brush's lower-right corner even when a
   // large heading or paragraph was hit by the same gesture.
-  const points = group?.strokes?.flatMap((stroke) => stroke.points || []) || []
+  const points = [...(group?.strokes || []), ...(group?.selections || [])].flatMap(stroke => stroke.points || [])
   const bounds = points.length ? aabb(points) : null
   if (bounds) {
     return group.coordinateSpace === 'web-document'
@@ -117,7 +196,7 @@ function proposalAnchor(group) {
     }), { x: Infinity, y: Infinity, right: -Infinity, bottom: -Infinity })
     return { x: box.x, y: box.y, w: box.right - box.x, h: box.bottom - box.y }
   }
-  return null
+  return group?.inputModality === 'text' ? { x:24,y:90,w:320,h:30 } : null
 }
 
 function proposalTargetRects(group) {
@@ -209,7 +288,7 @@ function actionChoiceLabel(type) {
 function intentChoices(intent) {
   if (intent?.clarificationAlreadyAnswered) return []
   if (clarificationNeedsContent(intent)) return []
-  if (getEffectiveBehaviorProfile().ambiguousMode === 'input') return []
+  if (effectiveBehaviorProfile().ambiguousMode === 'input') return []
   const labels = []
   // A neutral mark is not an instruction: show possible edits without claiming
   // that an annotation is the recommended outcome.
@@ -253,7 +332,7 @@ function proposalHeadline(intent, group) {
 }
 
 function renderInlineProposal(group) {
-  const manual = group?.status === 'draft' && (!getBrushSettings().autoAnalyze || group.analysisPaused)
+  const manual = group?.status === 'draft' && (Boolean(researchLog.condition()) || !getBrushSettings().autoAnalyze || group.analysisPaused)
   const pendingModel = Boolean((group?.modelPending || group?.status === 'analyzing') && !group.intentLocked && !group.applying)
   // A manual request can start before any local/AI suggestion exists. The
   // pending surface must not depend on an executable intent already arriving.
@@ -274,6 +353,10 @@ function renderInlineProposal(group) {
     return
   }
   els.inlineProposal.hidden = false
+  if (researchLog.condition() && !pendingModel && !manual && group.inferredIntent) {
+    const key = `${researchLog.session().session}:${group.id}:${group.revision}:${group.inferredIntent.suggestion?.text || ''}`
+    if (!shownSuggestions.has(key)) { shownSuggestions.add(key); researchEvent('suggestion-shown') }
+  }
   const modelError = Boolean(group.modelError)
   const issue = group.status === 'analyzing' ? null : group.imageError || group.analysisIssue
   const localFallback = intent?.source === 'local-fallback'
@@ -286,7 +369,8 @@ function renderInlineProposal(group) {
   els.inlineProposal.classList.toggle('is-ambiguous', ambiguous)
   renderProposalStatus(els.inlineProposal,$('inline-status-visual'),proposalStatus(group,{manual,pending:pendingModel,issue,wantsContent,ambiguous}))
   els.inlineKind.textContent = modelError ? '分析未完成' : pendingModel ? 'AI 正在分析' : group.status === 'analyzing' ? '正在理解' : localFallback ? '本地判断' : intent.clarificationAlreadyAnswered ? '补充最后信息' : wantsContent ? '需要补充内容' : ambiguous ? '需要确认意图' : ({ color: '颜色调整', reorder: '布局调整', replace: '文字替换', 'replace-image': '图片替换', delete: '内容移除', insert: '添加内容' })[intent.type] || '修改建议'
-  if (!pendingModel && !modelError && intent.source === 'model') els.inlineKind.textContent = `AI · ${els.inlineKind.textContent}`
+  if (intent.studyFixture && !pendingModel && !manual) els.inlineKind.textContent = '预置错误建议 · 非模型调用'
+  if (!pendingModel && !modelError && intent.source === 'model' && !intent.studyFixture) els.inlineKind.textContent = `AI · ${els.inlineKind.textContent}`
   els.inlineText.textContent = modelError ? '暂未形成可靠的修改方案' : pendingModel ? '标注已保留，正在理解修改意图…' : group.status === 'analyzing' ? '正在理解这条修改要求…' : proposalHeadline(intent, group)
   if (issue) els.inlineKind.textContent = group.imageError ? '图片任务未完成' : intent.source === 'model' ? '方案未完成' : 'AI 未完成 · 本地方案'
   if (manual) {
@@ -311,7 +395,7 @@ function renderInlineProposal(group) {
   }
   const choices = modelError ? [] : intentChoices(intent)
   const substantiveAlternatives = (intent.suggestion?.alternatives || []).filter((item) => !isAnnotationChoice(item))
-  const needsChoices = !modelError && getEffectiveBehaviorProfile().ambiguousMode !== 'input' && !wantsContent && !intent.clarificationAlreadyAnswered && choices.length > 0 && (intent.type === 'note' || intent.needsClarification || substantiveAlternatives.length > 0)
+  const needsChoices = !modelError && effectiveBehaviorProfile().ambiguousMode !== 'input' && !wantsContent && !intent.clarificationAlreadyAnswered && choices.length > 0 && (intent.type === 'note' || intent.needsClarification || substantiveAlternatives.length > 0)
   const previewing = group.status === 'previewing'
   const intentChosen = Boolean(group.intentLocked)
   els.inlineAlternatives.hidden = manual || pendingModel || previewing || intentChosen || group.status === 'analyzing' || !needsChoices
@@ -377,7 +461,7 @@ function renderInlineProposal(group) {
   const pendingWithoutInput = pendingModel && !String(group.feedbackDraft || group.replacementText || '').trim()
   els.inlinePrimary.disabled = analyzing || pendingModel || issue?.code === 'agent_plan_invalid'
   const actionable = !modelError && !intent.needsClarification && ['reorder', 'delete', 'replace', 'replace-image', 'insert', 'color', 'style', 'move', 'batch'].includes(intent.type)
-  const preferPreview = getEffectiveBehaviorProfile().clearIntentAction === 'preview' && actionable && !needsInput
+  const preferPreview = effectiveBehaviorProfile().clearIntentAction === 'preview' && actionable && !needsInput
   els.inlinePrimary.textContent = group.applying ? '正在准备修改…' : analyzing ? '正在理解…' : pendingWithoutInput ? '正在分析…' : pendingModel ? '提交要求' : previewing ? '确认应用' : preferPreview ? '预览' : '修改'
   els.inlinePrimary.dataset.action = pendingModel ? 'feedback' : previewing ? 'apply' : actionable ? (preferPreview ? 'preview' : 'direct') : 'feedback'
   els.inlineDetails.hidden = true
@@ -560,6 +644,7 @@ function renderRegionNumbers(group) {
 }
 
 function interpretSelectedTargets(group) {
+  if (group.inputModality && group.inputModality !== 'ink') return { type:'note',targets:group.targets,needsClarification:false,confidence:0.4,suggestion:{text:'已保留目标描述；等待完整方案',alternatives:[]},source:'local',evidence:{inputModality:group.inputModality} }
   return (group.excludedTargetIds?.length ? retargetSelectionPlan(group) : null) || interpretGroup(group)
 }
 
@@ -640,7 +725,7 @@ function renderPreferences() {
   const state = getBrushState()
   const preferences = state.preferences || { recording: true, items: [] }
   const memory = getBehaviorMemory()
-  const profile = getEffectiveBehaviorProfile()
+  const profile = effectiveBehaviorProfile()
   if (els.preferenceRecording) els.preferenceRecording.checked = memory.learningEnabled !== false
   if (els.preferenceStatus) {
     els.preferenceStatus.textContent = memory.learningEnabled === false ? '未学习' : '自动学习中'
@@ -761,7 +846,7 @@ function render() {
       : ''
     els.hint.textContent = intent?.hint || '停笔约 1 秒后生成建议。'
     const choices = intentChoices(intent)
-    const needsChoices = getEffectiveBehaviorProfile().ambiguousMode !== 'input' && !intent?.clarificationAlreadyAnswered && !clarificationNeedsContent(intent) && choices.length > 0 && (intent?.type === 'note' || intent?.needsClarification || (intent?.suggestion?.alternatives || []).some((item) => !isAnnotationChoice(item)))
+    const needsChoices = effectiveBehaviorProfile().ambiguousMode !== 'input' && !intent?.clarificationAlreadyAnswered && !clarificationNeedsContent(intent) && choices.length > 0 && (intent?.type === 'note' || intent?.needsClarification || (intent?.suggestion?.alternatives || []).some((item) => !isAnnotationChoice(item)))
     els.proposalAlternatives.hidden = Boolean(group.modelPending || group.modelError || group.intentLocked || !choices.length || !needsChoices)
     els.proposalAlternatives.replaceChildren()
     for (const alternative of choices) {
@@ -792,6 +877,8 @@ function render() {
   renderInlineProposal(state.group)
   renderTargetControls(state.group)
   renderRegionNumbers(state.group)
+  bindingPanel.render()
+  renderResearchInput()
   renderHistory()
   renderPreferences()
 }
@@ -808,7 +895,7 @@ function createGroup(stroke) {
     id: `group-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
     revision: 1,
     coordinateSpace: hasWebDocumentFrame() ? 'web-document' : 'viewport',
-    strokes: [stroke], targets: [], excludedTargetIds: [],
+    strokes: stroke ? [stroke] : [], targets: [], excludedTargetIds: [],
     spatialRelations: [], inferredIntent: null, suggestion: null, preview: null, status: 'draft', replacementText: '', customInstruction: '', userInstruction: '', feedbackDraft: '', selectedAlternative: '', answeredClarifications: [], localIntent: null, modelPending: false, modelError: '', analysisIssue: null, intentLocked: false,
   }
 }
@@ -901,7 +988,7 @@ async function askModelToInterpret(group, localIntent, userInstruction = '', { p
   const timings = { pauseMs, observationMs: 0, captureMs: 0, planMs: 0, verifyMs: 0, repairMs: 0 }
   let flowRetriesUsed = 0
   const requestId = ++modelRequestSeq
-  const explicitReplacement = hasBrushRegionReference(userInstruction) ? null : parseExplicitTextReplacement(userInstruction, group.targets || [])
+  const explicitReplacement = researchLog.condition() || group.bindingRevision || hasBrushRegionReference(userInstruction) ? null : parseExplicitTextReplacement(userInstruction, group.targets || [])
   const explicitIntent = explicitReplacement ? {
     ...localIntent, type: 'replace', operation: 'replace_text', targets: explicitReplacement.targets,
     targetText: explicitReplacement.targetText, replacementText: explicitReplacement.replacementText,
@@ -919,6 +1006,7 @@ async function askModelToInterpret(group, localIntent, userInstruction = '', { p
   let journalFinished = false
   const recordResult = (details) => {
     journalFinished = true
+    researchEvent(details.issue ? 'failure' : 'analysis-end', { elapsedMs: Math.round(performance.now() - analysisStarted), success: !details.issue, model: String(details.model || ''), reason: details.issue?.code || '', operation: details.intent?.type || '', modelRequests:timings.modelRequests || 0,retriesUsed:details.retriesUsed || 0,verifyMs:timings.verifyMs,captureMs:timings.captureMs,observationMs:timings.observationMs,modelMs:timings.modelMs,evidenceChars:timings.evidenceChars,imageCount:timings.imageCount,readToolCalls:timings.readToolCalls })
     agentJournal.finish(journalId, { ...details, timings: { ...timings, totalMs: Math.round(performance.now() - analysisStarted + pauseMs) } })
   }
   const requestController = new AbortController()
@@ -933,7 +1021,8 @@ async function askModelToInterpret(group, localIntent, userInstruction = '', { p
   const observeStarted = performance.now()
   let planningGroup = group
   let observation = observeBrushPage(group)
-  let availableTargets = excludeBrushTargets(planningTargets(group.targets,observation),group.excludedTargetIds || [])
+  researchEvent('analysis-start')
+  let availableTargets = excludeBrushTargets(bindingTargetPool(group.targets,observation,group.bindingCorrections),group.excludedTargetIds || [])
   const allowedIds = new Set(availableTargets.map((target)=>String(target.webId)))
   let safeObservation = observation ? { ...observation,nodes:observation.nodes.filter((node)=>allowedIds.has(String(node.webId))) } : null
   timings.observationMs = Math.round(performance.now() - observeStarted)
@@ -956,6 +1045,8 @@ async function askModelToInterpret(group, localIntent, userInstruction = '', { p
     return
   }
   try {
+    const correctedSource = checkBindingSnapshot(group.correctionSnapshot,brushBindingSnapshot(bindingReferenceIds(group,null)))
+    if (!correctedSource.ok) throw Object.assign(new Error('纠正所绑定的内容已变化'),{code:'agent_plan_invalid',status:422,validation:{ok:false,issues:[{code:correctedSource.reason}]}})
     patchGroupAnalysis(group, { modelPending: true, analysisPaused:false, analysisProgress:{ stage:'preparing', startedAt:progressStarted, draftSummary:'' } })
     const data = await runAnalysisTask(async (signal) => {
       const { captureAnnotationScene } = await import('./capture.js')
@@ -973,7 +1064,7 @@ async function askModelToInterpret(group, localIntent, userInstruction = '', { p
           regions = numberedBrushRegions(planningGroup)
           const observeStarted = performance.now()
           observation = observeBrushPage(planningGroup)
-          availableTargets = excludeBrushTargets(planningTargets(planningGroup.targets,observation),group.excludedTargetIds || [])
+          availableTargets = excludeBrushTargets(bindingTargetPool(planningGroup.targets,observation,group.bindingCorrections),group.excludedTargetIds || [])
           const allowed = new Set(availableTargets.map(target=>String(target.webId)))
           safeObservation = observation ? {...observation,nodes:observation.nodes.filter(node=>allowed.has(String(node.webId)))} : null
           timings.observationMs += Math.round(performance.now()-observeStarted)
@@ -989,12 +1080,13 @@ async function askModelToInterpret(group, localIntent, userInstruction = '', { p
         // Capture contains a full-document thumbnail and a cropped close-up,
         // not a viewport screenshot. Send both spaces; the server uses stable
         // document coordinates for geometric evidence and edit planning.
+        selections: (planningGroup.selections || []).map(({id,points,targetIds}) => ({id,points,targetIds})),
         strokes: planningGroup.strokes.map(({ layoutAnchor, ...stroke }) => ({
           ...stroke,
           points: (stroke.points || []).map(webDocumentToScreenPoint),
           documentPoints: stroke.points || [],
         })),
-        targets: planningGroup.targets.map((target) => {
+        targets: availableTargets.filter(target => target.selected !== false).map((target) => {
           const screenRect = liveScreenRect(target) || target.screenRect || target.imageRect || null
           return {
             ...target,
@@ -1011,6 +1103,7 @@ async function askModelToInterpret(group, localIntent, userInstruction = '', { p
         userInstruction,
         evidence: localIntent?.evidence || null,
         observation:safeObservation,
+        bindingCorrections:group.bindingCorrections || null,
         answeredClarifications:group.answeredClarifications || [],
         preferences: getBrushState().preferences?.recording === false ? [] : (getBrushState().preferences?.items || []).map((item) => item.text).slice(0, 8),
         behaviorMemory: getAgentBehaviorContext({
@@ -1031,8 +1124,10 @@ async function askModelToInterpret(group, localIntent, userInstruction = '', { p
       }
       const requestPlan = async (body, stage) => {
         const started = performance.now()
+        timings.imageCount = body.imageDataUrls?.length || 0
+        researchEvent('request-dispatched',{imageCount:timings.imageCount})
         updateProgress({stage:'planning',draftSummary:''})
-        try { const result = await planBrushIntent(body, { signal, onProgress:value=>{
+        try { const result = await planBrushIntent(researchPlanningPayload({...body,studyTaskId:activeStudyTask()},researchLog.condition()), { signal, onProgress:value=>{
           // Ignore legacy partial drafts. Only publish a complete checked plan.
           if (value.stage !== 'draft') updateProgress({...value,draftSummary:''})
         } }); addServerMetrics(result.timings); return result }
@@ -1053,7 +1148,8 @@ async function askModelToInterpret(group, localIntent, userInstruction = '', { p
           resolveRect:resolveBrushLayoutRect,refreshTarget:refreshBrushTargetGeometry,signal,
           verify:async(plan,strokes)=>{
             const checked = validateIntentPlan(plan,availableTargets,userInstruction)
-            const rejection = modelIntentRejectionReason(plan,localIntent,userInstruction,availableTargets)
+            const bindingCheck = checkBindingConstraints(plan,group.bindingCorrections,availableTargets)
+            const rejection = !bindingCheck.ok ? bindingCheck.reason : modelIntentRejectionReason(plan,localIntent,userInstruction,availableTargets)
             let report = rejection ? planCheckReport([{code:rejection}]) : { ok:true,checks:['schema','scope'] }
             if (report.ok && checked.actionable && !plan.needsInput && !plan.needsClarification) {
               const trial = await runAnalysisTask((checkSignal)=>verifyBrushPlan(plan,strokes,{signal:checkSignal}),{signal,timeoutMs:4_000,timeoutPhase:'verify'})
@@ -1089,7 +1185,7 @@ async function askModelToInterpret(group, localIntent, userInstruction = '', { p
     // pending ResizeObserver notification cannot scale its coordinates twice.
     const currentGeometry = reflowBrushGroup(current,resolveBrushLayoutRect,refreshBrushTargetGeometry)
     if (currentGeometry !== current) patchGroup(currentGeometry)
-    let resolvedIntent = explicitIntent || data.intent
+    let resolvedIntent = stampBindingPlan(explicitIntent || data.intent, group)
     if (!modelIntentIsUsable(resolvedIntent, localIntent, userInstruction,availableTargets)) {
       // Defensive final gate. Reject visibly; never silently turn an Agent
       // design into a local action or an unrelated correction question.
@@ -1119,6 +1215,7 @@ async function askModelToInterpret(group, localIntent, userInstruction = '', { p
     }
     patchGroupAnalysis(group, {
       inferredIntent: resolvedIntent,
+      bindingSnapshot: brushBindingSnapshot(bindingReferenceIds(group, resolvedIntent)),
       observation:data.observation,
       validation:data.validation,
       planRepairsUsed:data.repairsUsed || 0,
@@ -1163,6 +1260,7 @@ async function askModelToInterpret(group, localIntent, userInstruction = '', { p
 }
 
 function cancelModelAnalysis() {
+  if (getBrushState().group?.modelPending) researchEvent('cancel', {reason:'user-or-superseded'})
   stopAnalysisClock()
   modelRequestSeq += 1
   modelAbortController?.abort()
@@ -1216,6 +1314,8 @@ function analyzeCurrentGroup({ pauseMs = 0 } = {}) {
 }
 function scheduleAnalysis() {
   clearTimeout(analysisTimer)
+  if (researchLog.condition()) return render()
+  if (getBrushState().group?.bindingRevision && getBrushState().group?.analysisPaused) return render()
   if (!getBrushSettings().autoAnalyze) return render()
   const started = performance.now()
   analysisTimer = setTimeout(() => analyzeCurrentGroup({ pauseMs: Math.round(performance.now() - started) }), getBrushSettings().analysisDelayMs)
@@ -1227,6 +1327,7 @@ function analyzeMarkedGroup() {
   analyzeCurrentGroup()
 }
 function onStrokeStarted() {
+  researchEvent('input')
   strokeActive = true
   scheduleEvidenceWarmup()
   clearTimeout(analysisTimer)
@@ -1257,7 +1358,7 @@ function onStrokeFinished(polygon, meta) {
     revision, strokes: [...current.strokes, stroke],
     status: 'draft', preview: null, inferredIntent: null, localIntent: null, suggestion: null, applying: false, imageError: null,
     replacementText: '', customInstruction: current.customInstruction || '', userInstruction: current.userInstruction || '', feedbackDraft: current.feedbackDraft || '',
-    analysisPaused:false, analysisProgress:null,
+    analysisPaused:Boolean(current.bindingRevision), analysisProgress:null, bindingSnapshot:null,
     selectedAlternative: '', answeredClarifications: [], modelPending: false, modelError: '', analysisIssue: null, intentLocked: false,
   })
   let shape = stroke.shape
@@ -1285,6 +1386,7 @@ function onStrokeFinished(polygon, meta) {
   return { paintOwned: true, strokeId: stroke.id }
 }
 function toggleBrush(next) {
+  if (researchPolicy(researchLog.condition()).input !== 'ink') return toast('当前研究条件不使用画笔；先结束研究会话再恢复普通模式')
   if (getBrushState().group?.applying) return toast('图片任务进行中；取消当前修改后可继续画')
   const state = getBrushState(); const mode = typeof next === 'boolean' ? (next ? 'brush' : 'browse') : state.mode === 'brush' ? 'browse' : 'brush'
   if (mode === 'brush' && !state.pageLoaded) return toast('请先导入一个 HTML 网页')
@@ -1304,6 +1406,12 @@ function clearCurrentGroup() {
 }
 function validateCurrentPlan(group, intent = group?.inferredIntent) {
   if (!group || !intent) return { ok: false, reason: 'missing-plan' }
+  const stamp = checkBindingStamp(intent, group)
+  if (!stamp.ok) return stamp
+  const correctedSource = checkBindingSnapshot(group.correctionSnapshot,brushBindingSnapshot(bindingReferenceIds(group,null)))
+  if (!correctedSource.ok) return correctedSource
+  const currentPage = checkBindingSnapshot(group.bindingSnapshot, brushBindingSnapshot(bindingReferenceIds(group, intent)))
+  if (!currentPage.ok) return currentPage
   const candidate = { ...intent, replacementText: group.replacementText || intent.replacementText || '' }
   const instruction = group.customInstruction || group.userInstruction || ''
   // Local heuristics need explicit deletion evidence. A model proposal is not
@@ -1313,7 +1421,10 @@ function validateCurrentPlan(group, intent = group?.inferredIntent) {
     && !hasDeleteEvidence(candidate, group)) {
     return { ok: false, reason: 'delete-needs-explicit-mark' }
   }
-  return validateIntentPlan(candidate, excludeBrushTargets(planningTargets(group.targets || [], group.observation), group.excludedTargetIds || []), group.customInstruction || group.userInstruction || '')
+  const targets = excludeBrushTargets(bindingTargetPool(group.targets || [], group.observation, group.bindingCorrections), group.excludedTargetIds || [])
+  const bindingCheck = checkBindingConstraints(candidate, group.bindingCorrections, targets)
+  if (!bindingCheck.ok) return bindingCheck
+  return validateIntentPlan(candidate, targets, group.customInstruction || group.userInstruction || '')
 }
 
 function explicitlyRequestsMarkedText(instruction) {
@@ -1328,7 +1439,7 @@ function applyTextScopePreference(group, intent) {
   // design. In particular, never broaden a model's precise character ranges.
   if (intent.source === 'model') return intent
   if (intent.parameters?.deletionScope) return intent
-  if (getEffectiveBehaviorProfile().textScope !== 'text-object') return intent
+  if (effectiveBehaviorProfile().textScope !== 'text-object') return intent
   if (!Array.isArray(intent.targetRanges) || !intent.targetRanges.length) return intent
 
   // A current, explicit request such as “删掉这两个词” is stronger than a
@@ -1377,7 +1488,7 @@ function prepareProposal(group, intent) {
     return { ok: false, message: next.type === 'replace-image' ? '先填图片链接或选择图片。' : '先写入要添加的内容。' }
   }
   const checked = validateCurrentPlan(group,next)
-  if (!checked.ok || !checked.actionable) return { ok: false, message: next.clarifyingQuestion || '还缺少修改对象或具体内容，网页没有改变。' }
+  if (!checked.ok || !checked.actionable) return { ok: false, message: correctionDescriptions[checked.reason] || next.clarifyingQuestion || '还缺少修改对象或具体内容，网页没有改变。' }
   if (next.type === 'replace') {
     const dryRun = applyBrushTextReplacement(next.targets?.length ? next.targets : group.targets, { targetText: next.targetText, targetRanges: next.targetRanges, replacementText: next.replacementText }, { dryRun: true })
     if (!dryRun?.ok) return { ok: false, message: dryRun?.reason || '找不到唯一匹配文字，网页没有改变。' }
@@ -1404,16 +1515,18 @@ function previewProposal() {
   patchGroup({ inferredIntent: plan, replacementText: plan.replacementText, preview: { text: plan.replacementText, targetText: plan.targetText || '' }, status: 'previewing' }); render()
 }
 async function applyProposal({ direct = false } = {}) {
+  const executionStarted = performance.now()
   const group = getBrushState().group; const intent = group?.inferredIntent
   if (!group || !intent || group.applying || (!direct && !group.preview)) return
   if (group.analysisIssue?.code === 'agent_plan_invalid') return toast(group.analysisIssue.message)
   let result
   const prepared = direct ? prepareProposal(group, intent) : { ok: true, intent }
   if (!prepared.ok) {
+    researchEvent('failure', {success:false,reason:'proposal-not-ready'})
     agentJournal.execution(group.id, `未执行：${prepared.message}`, { failed: true })
     return toast(prepared.message)
   }
-  const plan = prepared.intent
+  const plan = materializeStudyResources(prepared.intent, { condition:researchLog.condition(), trial:researchLog.session()?.trial, mountedTask:activeStudyTask() })
   const planCheck = validateCurrentPlan(group, plan)
   if (!planCheck.ok || !planCheck.actionable) {
     agentJournal.execution(group.id, '未执行：修改方案尚未通过执行校验', { failed: true })
@@ -1421,6 +1534,7 @@ async function applyProposal({ direct = false } = {}) {
   }
   const targets = plan.targets?.length ? plan.targets : group.targets
   const imageExecution = []
+  if (plan !== prepared.intent) imageExecution.push('冻结任务固定图片（不调用生图模型；仅测位置与恢复）')
   const imageSteps = (plan.type === 'batch' ? plan.steps : [plan]).filter((step) => step.imagePrompt && (step.type === 'replace-image' || step.type === 'insert' && step.contentKind === 'image'))
   if (imageSteps.length) {
     const imageStartedAt = Date.now()
@@ -1464,7 +1578,10 @@ async function applyProposal({ direct = false } = {}) {
   try {
     const verified = await runAnalysisTask((signal)=>verifyReflowedBrushPlan(group,plan,{
       resolveRect:resolveBrushLayoutRect,refreshTarget:refreshBrushTargetGeometry,signal,
-      verify:(candidate,strokes)=>verifyBrushPlan(candidate,strokes,{signal}),
+      verify:(candidate,strokes)=>{
+        const bindingCheck = validateCurrentPlan(group,candidate)
+        return bindingCheck.ok ? verifyBrushPlan(candidate,strokes,{signal}) : {ok:false,issues:[{code:bindingCheck.reason}]}
+      },
     }),{timeoutMs:4_000,timeoutPhase:'verify'})
     report = planCheckReport(verified.report.issues || [],verified.report); executionGroup = verified.group; executionPlan = verified.plan
   } catch (error) {
@@ -1472,7 +1589,10 @@ async function applyProposal({ direct = false } = {}) {
   }
   const stillCurrent = getBrushState().group
   if (!stillCurrent || stillCurrent.id !== group.id || stillCurrent.revision !== group.revision) return
+  const finalBinding = executionPlan && validateCurrentPlan(stillCurrent, executionPlan)
+  if (finalBinding && !finalBinding.ok) report = {ok:false,issues:[{code:finalBinding.reason}]}
   if (!report.ok) {
+    researchEvent('failure', {success:false,reason:report.issues?.[0]?.code || 'verification-failed',elapsedMs:Math.round(performance.now()-executionStarted)})
     const issue = analysisIssue({code:'agent_plan_invalid',validation:report,repairsUsed:0})
     patchGroup({applying:false,validation:report,analysisIssue:issue})
     if (getBrushState().mode === 'brush') setLassoMode(true)
@@ -1481,6 +1601,7 @@ async function applyProposal({ direct = false } = {}) {
     return toast(issue.message)
   }
   result = applyBrushPlan({ ...executionPlan, targets: executionPlan.targets?.length ? executionPlan.targets : executionGroup.targets }, executionGroup.strokes)
+  researchEvent(result?.ok ? 'apply' : 'failure', { success: Boolean(result?.ok), operation: executionPlan.type, reason: result?.ok ? '' : 'execution-failed',elapsedMs:Math.round(performance.now()-executionStarted) })
   if (!result?.ok) {
     patchGroup({applying:false})
     if (getBrushState().mode === 'brush') setLassoMode(true)
@@ -1492,7 +1613,7 @@ async function applyProposal({ direct = false } = {}) {
   const textScope = ['replace', 'delete'].includes(plan.type) && targets.some((target) => target.kind === 'text')
     ? (Array.isArray(plan.targetRanges) && plan.targetRanges.length ? 'marked-range' : 'text-object')
     : ''
-  recordEditEpisode({
+  if (!researchLog.condition()) recordEditEpisode({
     operation: plan.type,
     gestureRoles: [...new Set((group.strokes || []).map((stroke) => stroke.shape).filter(Boolean))],
     targetKinds: [...new Set((targets || []).map((target) => target.kind).filter(Boolean))],
@@ -1502,7 +1623,7 @@ async function applyProposal({ direct = false } = {}) {
     outcome: 'applied',
     textScope,
   })
-  const preferenceRecorded = isDurablePreference(group.customInstruction)
+  const preferenceRecorded = !researchLog.condition() && isDurablePreference(group.customInstruction)
     ? (addPreference({ text: group.customInstruction, operation: plan.type }), recordExplicitPreference({ text: group.customInstruction, operation: plan.type }), true)
     : false
   toast(`${result.message || '修改已应用'}${preferenceRecorded ? '；已记录这次偏好' : ''}，可以撤销`)
@@ -1511,6 +1632,7 @@ async function applyProposal({ direct = false } = {}) {
 function undo() {
   const edits = listWebEdits().filter((edit) => edit.keep !== false)
   if (!edits.length) return
+  researchEvent('undo')
   clearCurrentGroup()
   undoWebEditsSince(); markLatestEpisodeUndone(); agentJournal.undoLatest(); toast(`已撤销「${edits[0].label}」`); render()
 }
@@ -1666,9 +1788,9 @@ function focusDetails() {
 }
 
 function handleInlinePrimary() {
-  if (getBrushState().group?.status === 'draft' && (!getBrushSettings().autoAnalyze || getBrushState().group.analysisPaused)) return analyzeMarkedGroup()
+  if (getBrushState().group?.status === 'draft' && (researchLog.condition() || !getBrushSettings().autoAnalyze || getBrushState().group.analysisPaused)) return analyzeMarkedGroup()
   const action = els.inlinePrimary.dataset.action
-  const execution = action === 'preview' || (action === 'feedback' && getEffectiveBehaviorProfile().clearIntentAction === 'preview') ? 'preview' : 'direct'
+  const execution = action === 'preview' || (action === 'feedback' && effectiveBehaviorProfile().clearIntentAction === 'preview') ? 'preview' : 'direct'
   const group = getBrushState().group
   if (!group || group.status === 'analyzing' || group.applying || strokeActive) return
   if (group.modelPending) return
@@ -1721,6 +1843,7 @@ async function interpretCustomIntent(execution = 'direct', selectedChoice = '') 
   const typed = String(group?.feedbackDraft || group?.replacementText || els.inlineCustomInput.value || els.inlineInput.value || '').trim()
   const reply = [choice, typed].filter(Boolean).join('；补充：')
   if (!group || !reply) return toast('先选择一个方向，或补充具体要求')
+  if (typed) researchEvent('text-submit', { inputChars:typed.length, supplement:Boolean(group.customInstruction || group.userInstruction || group.inferredIntent?.source === 'model') })
   clearTimeout(analysisTimer)
   cancelModelAnalysis()
   let requestEpoch = modelRequestSeq
@@ -1728,13 +1851,13 @@ async function interpretCustomIntent(execution = 'direct', selectedChoice = '') 
     const finish = () => execution === 'analyze' ? undefined : execution === 'preview' ? previewProposal() : applyProposal({ direct: true })
     const candidate = candidateForChoice(group.inferredIntent,choice)
     if (candidate && !typed) {
-      patchGroup({inferredIntent:{...candidate,requiresConfirmation:false},replacementText:candidate.replacementText || '',customInstruction:[group.customInstruction || group.userInstruction,`用户确认方案：${candidate.suggestion?.text || candidate.goal}`].filter(Boolean).join('\n'),selectedAlternative:'',intentLocked:true,feedbackDraft:'',status:'suggested'})
+      patchGroup({inferredIntent:stampBindingPlan({...candidate,requiresConfirmation:false},group),bindingSnapshot:brushBindingSnapshot(bindingReferenceIds(group,candidate)),replacementText:candidate.replacementText || '',customInstruction:[group.customInstruction || group.userInstruction,`用户确认方案：${candidate.suggestion?.text || candidate.goal}`].filter(Boolean).join('\n'),selectedAlternative:'',intentLocked:true,feedbackDraft:'',status:'suggested'})
       // This button click confirms a concrete candidate, not a tool category.
       await finish()
       return
     }
     const numberedReference = hasBrushRegionReference(typed || choice)
-    const completePlan = numberedReference ? null : inferCompleteActionPlan(typed || choice, group.targets || [], group.localIntent || group.inferredIntent || {})
+    const completePlan = researchLog.condition() || group.bindingRevision || numberedReference ? null : inferCompleteActionPlan(typed || choice, group.targets || [], group.localIntent || group.inferredIntent || {})
     const baseInstruction = group.customInstruction || group.userInstruction || ''
     const question = group.inferredIntent?.clarifyingQuestion || ''
     const answer = formatClarificationAnswer(question, choice, typed)
@@ -1750,7 +1873,7 @@ async function interpretCustomIntent(execution = 'direct', selectedChoice = '') 
     // user through another interpretation round if one marked text object gives
     // us an exact, safe source. The user has supplied the new copy and pressed
     // “修改”, which is the confirmation to replace that marked title/text.
-    if (!completePlan && !isEditInstruction(typed) && !choice && typed && clarificationNeedsContent(group.inferredIntent) && /替换|更换/u.test(question)) {
+    if (!researchLog.condition() && !group.bindingRevision && !completePlan && !isEditInstruction(typed) && !choice && typed && clarificationNeedsContent(group.inferredIntent) && /替换|更换/u.test(question)) {
       const textTargets = (group.targets || []).filter((target) => target.kind === 'text' && target.webId && !target.textTruncated && String(target.text || '').trim())
       if (textTargets.length === 1) {
         const target = textTargets[0]
@@ -1797,7 +1920,7 @@ async function interpretCustomIntent(execution = 'direct', selectedChoice = '') 
     // Model context contains labels such as “补充的信息/具体要求”. Those labels
     // are not user verbs (in particular, “补充” must not invent an insert action).
     const localInstruction = [choice, typed].filter(Boolean).join('；')
-    const explicitReplacement = numberedReference ? null : parseExplicitTextReplacement(typed || choice, group.targets || [])
+    const explicitReplacement = researchLog.condition() || group.bindingRevision || numberedReference ? null : parseExplicitTextReplacement(typed || choice, group.targets || [])
     const geometricIntent = completePlan || interpretGroup({ ...group, userInstruction: instruction })
     const localIntent = completePlan || (explicitReplacement ? {
       ...geometricIntent, type: 'replace', operation: 'replace_text', targets: explicitReplacement.targets,
@@ -1857,6 +1980,41 @@ async function interpretCustomIntent(execution = 'direct', selectedChoice = '') 
 els.inlineCustomInput.addEventListener('input', () => {
   const group = getBrushState().group
   if (group) patchGroup({ feedbackDraft: els.inlineCustomInput.value })
+})
+$('btn-research-text').addEventListener('click', () => {
+  if (researchPolicy(researchLog.condition()).input !== 'text' || !getBrushState().pageLoaded || getBrushState().group) return toast('请先导入任务页面并结束当前请求')
+  const instruction = $('research-text-input').value.trim()
+  if (!instruction) return
+  researchEvent('input', {inputChars:instruction.length})
+  startGroup({...createGroup(null), inputModality:'text',analysisPaused:true,feedbackDraft:instruction})
+  render(); analyzeMarkedGroup()
+})
+$('btn-study-load').addEventListener('click', async () => {
+  if (getBrushState().group || researchLog.condition()) return toast('先结束标记任务与研究会话，再载入固定页面')
+  const task = STUDY_TASKS.find(item => item.id === $('research-trial').value)
+  if (!task) return toast('固定任务编号为 T1A 至 T6B（每类 A/B 两个变体）')
+  disarmDrawing(); unmountWebDoc(); resetBrushState()
+  await applyImportedPage(editor,{title:task.id,snapshotHtml:studyTaskHtml(task)})
+  patchBrush({pageLoaded:true,mode:'browse'})
+  $('research-task-goal').textContent = task.goal
+  toast(`已载入 ${task.id}；这是测试页面，不覆盖你保存的导入网页`); render()
+})
+$('btn-study-inject').addEventListener('click', () => {
+  const group=getBrushState().group, session=researchLog.session()
+  if (!session || !['ink-correction','ink-no-correction'].includes(session.condition) || !group || group.modelPending || group.applying || group.bindingRevision) return toast('在纠正对照会话中先标记任务对象；不能覆盖运行中的请求或已保存的纠正')
+  const task=STUDY_TASKS.find(item=>item.id===session.trial)
+  if (!task || activeStudyTask() !== task.id) return toast('请先载入与本轮编号一致的冻结任务页')
+  const doc=$('web-doc-frame').contentDocument
+  const targets=bindingTargetPool(group.targets,observeBrushPage(group)).map(node=>({...node,studyKey:[...doc.querySelectorAll('[id]')].find(el=>el.getAttribute('data-markset-id')===String(node.webId))?.id}))
+  const plan=injectedStudyPlan(task,targets)
+  if (!plan || !validateIntentPlan(plan,targets,'预置错误恢复任务').ok) return toast('错误建议目标不在当前合法证据中；请先标记相关模块，不扩大权限注入')
+  clearTimeout(analysisTimer);cancelModelAnalysis()
+  patchGroup({inferredIntent:stampBindingPlan(plan,group),observation:observeBrushPage(group),bindingSnapshot:brushBindingSnapshot(bindingReferenceIds(group,plan)),
+    userInstruction:group.customInstruction || group.userInstruction || task.goal,
+    localIntent:interpretSelectedTargets(group),status:'suggested',analysisPaused:true,modelPending:false,modelError:'',analysisIssue:null,preview:null,model:null})
+  const entry=agentJournal.begin(group,{instruction:'固定错误恢复案例（非模型判断）',localIntent:plan})
+  agentJournal.finish(entry,{intent:plan,source:'fixture'})
+  requestAnimationFrame(()=>{ researchEvent('error-shown',{fixture:true,taskVersion:task.version}); toast('错误建议已展示；冻结目标已作为初始要求，零模型调用，未修改网页') })
 })
 els.inlineRetry.addEventListener('click', () => {
   const group = getBrushState().group

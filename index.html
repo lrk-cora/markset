@@ -182,6 +182,32 @@
             <section class="panel-section agent-record-section" id="agent-record-section" hidden>
               <div class="section-heading"><span>操作与判断</span><span id="agent-record-count" class="section-count">0</span><button id="btn-clear-agent-records" class="text-button" type="button">清空</button></div>
               <p class="diagnostics-copy">仅供查看，不会额外发送给模型。只保留本次会话最近 100 条摘要，刷新清空。</p>
+              <details class="research-controls">
+                <summary>对照评估 · 本地记录（默认关闭）</summary>
+                <p class="diagnostics-copy">仅记录事件元数据，不保存原文、输入、图片或完整笔迹；不上传日志。输入表达、直接纠正和结构证据分别比较；各条件共用检查、确认与撤销。T1 固定页使用同一测试图片，不调用生图；分析仍会请求已配置的模型。</p>
+                <label class="preference-toggle"><input id="research-consent" type="checkbox"><span>我同意在本机记录本轮研究操作</span></label>
+                <label class="binding-field"><span>对照条件（不同研究问题分别比较）</span><select id="research-condition"><option value="ink-correction">笔迹＋直接纠正</option><option value="ink-no-correction">笔迹＋文字补充（直接纠正关闭）</option><option value="text-only">纯文字</option><option value="selection-text">矩形多选＋文字</option><option value="ink-flat-evidence">笔迹＋扁平结构证据（证据消融）</option></select></label>
+                <label class="binding-field"><span>匿名任务编号（英文/数字）</span><input id="research-trial" type="text" value="pilot" maxlength="48"></label>
+                <button id="btn-study-load" class="text-button" type="button">载入固定任务页（T1A 至 T6B）</button><p id="research-task-goal" class="diagnostics-copy"></p>
+                <label class="binding-field"><span>研究编号（不填姓名，P00 仅用于试跑）</span><input id="research-participant" type="text" value="P00" maxlength="5" pattern="P[0-9]{2,4}"></label>
+                <div class="research-buttons"><button id="btn-research-start" class="text-button" type="button">开始记录</button><button id="btn-research-stop" class="text-button" type="button">停止</button><button id="btn-research-export" class="text-button" type="button">导出 JSON</button><button id="btn-research-clear" class="text-button" type="button">清空研究记录</button></div>
+                <p id="research-status" class="diagnostics-copy" role="status"></p>
+                <p id="research-input-help" class="diagnostics-copy"></p>
+                <div id="research-text-request" hidden><label class="binding-field"><span>仅用文字描述任务目标</span><textarea id="research-text-input" maxlength="1000"></textarea></label><button id="btn-research-text" class="button" type="button">分析文字请求</button></div>
+                <button id="btn-research-error-shown" class="text-button" type="button">标记错误建议已展示（观察员）</button>
+                <button id="btn-study-inject" class="text-button" type="button">展示本任务预置错误建议（不调用模型）</button>
+                <details><summary>独立结果评分与主观量表</summary>
+                  <p class="diagnostics-copy">由独立评分员按任务判据填写；不是系统自动认定成功。1–7 分，负担越高越费力，可控感越高越可控。</p>
+                  <label class="binding-field"><span>评分员编号</span><input id="research-rater" value="R01" maxlength="5"></label>
+                  <label><input id="research-goal" type="checkbox">目标效果达成</label><br>
+                  <label><input id="research-preserved" type="checkbox">应保留内容完整</label><br>
+                  <label><input id="research-placement" type="checkbox">位置或范围正确</label><br>
+                  <label><input id="research-overflow" type="checkbox">无明显溢出遮挡</label>
+                  <label class="binding-field"><span>参与者报告负担</span><select id="research-burden"><option value="0">未收集</option><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option><option>6</option><option>7</option></select></label>
+                  <label class="binding-field"><span>参与者报告可控感</span><select id="research-control"><option value="0">未收集</option><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option><option>6</option><option>7</option></select></label>
+                  <button id="btn-research-score" class="text-button" type="button">保存独立评分</button>
+                </details>
+              </details>
               <ol id="agent-record-list" class="agent-record-list" aria-label="Agent 操作记录"></ol>
             </section>
           </div>
@@ -212,6 +238,10 @@
         <p id="inline-check-warning" class="inline-analysis-progress" role="status" hidden></p>
         <p id="inline-plan-detail" class="inline-plan-detail" hidden></p>
         <div id="inline-proposal-alternatives" class="inline-proposal-alternatives" hidden></div>
+        <details id="binding-inspector" class="binding-inspector" hidden>
+          <summary>查看并纠正理解</summary>
+          <div id="binding-inspector-body" class="binding-inspector-body"></div>
+        </details>
         <div class="inline-feedback"><span class="inline-feedback-label">有补充或想调整？</span><div id="inline-custom-intent" class="inline-custom-intent"><input id="inline-custom-intent-input" type="text" placeholder="输入具体要求…" aria-label="补充具体修改要求"><button id="btn-inline-custom-intent" class="inline-custom-submit" type="button">修改</button></div></div>
         <textarea id="inline-replace-input" class="inline-replace-input" rows="2" placeholder="输入要替换的新内容…" hidden></textarea>
         <div class="inline-proposal-actions">
@@ -223,7 +253,9 @@
       </section>
     </div>
     <div id="toast" class="toast" role="status" hidden></div>
+    <div id="binding-highlight" class="binding-highlight" hidden aria-hidden="true"></div>
 
     <script type="module" src="/src/main.js"></script>
+    <div id="research-selection-layer" class="app-ui" aria-label="矩形区域选择" hidden></div>
   </body>
 </html>

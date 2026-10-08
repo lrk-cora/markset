@@ -24,6 +24,7 @@ export function normalizeBrushPlan(raw, targets, fallback = {}, instruction = ''
   const needsInput = Boolean(raw.needsInput) && !replacementText && !imagePrompt && !raw.nodes?.length
   const plan = {
     type, operation: type, confidence: Math.max(0,Math.min(1,Number(raw.confidence)||0)), targets: selected,
+    ...(raw.regionId ? { regionId: clean(raw.regionId,120) } : {}),
     goal: clean(raw.goal || raw.suggestion), rationale: clean(raw.rationale || raw.reason || (child ? '执行本组已指定的局部修改步骤。' : '')), strategy: clean(raw.strategy || strategies[type]),
     constraints: list(raw.constraints).slice(0,8).map((value) => clean(value,160)),
     impact: { scope: clean(raw.impact?.scope || `${selected.length} 个标记对象`), riskLevel: raw.impact?.riskLevel || 'medium' },
@@ -71,6 +72,7 @@ export const brushPlanContract = `只输出完整 JSON。必填 intentType:reord
 const str = { type:'string' }, strings = { type:'array',items:str }
 const object = (properties, required = Object.keys(properties)) => ({ type:'object',properties,required,additionalProperties:false })
 const fields = {
+  regionId:str,
   suggestion:str,
   intentType: { type:'string',enum:[...operations].filter((op)=>op!=='batch') },
   confidence:{type:'number'},goal:str,rationale:str,strategy:str,constraints:strings,
